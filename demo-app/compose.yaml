@@ -27,7 +27,7 @@ services:
   app:
     build: .
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       DATABASE_URL: postgres://ots:ots@db:5432/demo
       REDIS_URL: redis://cache:6379
