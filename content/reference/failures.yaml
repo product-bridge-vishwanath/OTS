@@ -1,0 +1,420 @@
+# The failure catalogue (M8.7): symptom → likely causes → how to confirm → fix.
+# ~25 entries covering the most common production failures. Concepts tag from
+# the controlled vocabulary; module points at the lesson that teaches the fix.
+failures:
+  - id: oom
+    title: Out of memory (OOM kill)
+    module: M1
+    concepts: [processes, process-supervision]
+    symptom: The app dies suddenly with no error in its own logs — sometimes mid-request (502s) — then restarts, or doesn't.
+    causes:
+      - Memory leak growing until the limit
+      - Container/instance memory limit too small for real traffic
+      - One huge request (giant file parse, unbounded query result) spiking usage
+    confirm:
+      - "Linux: `dmesg | grep -i 'killed process'` or `journalctl -k | grep -i oom`"
+      - "Docker: `docker inspect <c> --format '{{.State.OOMKilled}}'`; exit code 137"
+      - Memory graph sawtooths up to a ceiling, then cliff-drops at each crash
+    fix:
+      - Short term — restart, raise the limit one notch, or scale out
+      - Real fix — find the growth (heap snapshot, memory profiler); bound the big request (pagination, streaming, upload limits)
+      - Alert at 80% memory so the next one isn't a surprise
+
+  - id: disk-full
+    title: Disk full
+    module: M1
+    concepts: [servers]
+    symptom: "Weird, scattered failures: logs stop, DB writes error, deploys fail, sessions break — anything that writes starts dying."
+    causes:
+      - Log files growing unbounded (no rotation)
+      - Docker images/volumes accumulating over months of deploys
+      - Database WAL/temp files, old backups stored on the same disk
+    confirm:
+      - "`df -h` — any filesystem at 100%"
+      - "`du -h --max-depth=1 / 2>/dev/null | sort -h` to walk to the culprit; usual suspects /var/log and /var/lib/docker"
+    fix:
+      - Free space NOW (compress/delete old logs, `docker system prune -a`), then restart whatever wedged
+      - Install log rotation (logrotate, Docker log limits)
+      - Alert at 80% disk — this failure gives you weeks of warning and people still hit 100%
+
+  - id: port-in-use
+    title: Port already in use (EADDRINUSE)
+    module: M1
+    concepts: [ports, processes]
+    symptom: "App won't start: 'EADDRINUSE: address already in use :::3000'."
+    causes:
+      - A previous instance didn't die (orphaned process, failed graceful shutdown)
+      - Two services configured onto the same port
+      - A supervisor (pm2/systemd) already running the app you're starting by hand
+    confirm:
+      - "`lsof -i :3000` or `ss -tlnp | grep 3000` — see exactly which PID holds it"
+    fix:
+      - If it's an orphan, `kill <PID>` (then find out why shutdown didn't)
+      - If it's a supervisor copy, stop starting it manually — use the supervisor
+      - Make port configurable via env var instead of hardcoding
+
+  - id: expired-cert
+    title: Expired TLS certificate
+    module: M5
+    concepts: [tls]
+    symptom: "Browsers show NET::ERR_CERT_DATE_INVALID; API clients throw certificate errors. Started at an exact minute."
+    causes:
+      - Auto-renewal (Let's Encrypt/certbot) silently failing for the last 30 days
+      - Renewal worked but the server never reloaded the new cert
+      - A forgotten cert on a secondary domain (api., www.)
+    confirm:
+      - "`echo | openssl s_client -connect myapp.com:443 2>/dev/null | openssl x509 -noout -dates`"
+      - "`curl -vI https://myapp.com 2>&1 | grep -i expire`"
+    fix:
+      - Renew and reload now (`certbot renew && systemctl reload nginx`, or your platform's re-issue)
+      - Find why auto-renew failed (changed DNS, blocked port 80 challenge, cron removed)
+      - Monitor expiry with an external check at 14 days out
+
+  - id: missing-env-var
+    title: Missing or wrong environment variable
+    module: M4
+    concepts: [env-vars, config]
+    symptom: "App crashes on boot, or a feature fails with 'undefined' / 'null' creeping into URLs and keys — right after a deploy or environment change."
+    causes:
+      - Variable set in dev but never in prod (or in the wrong environment/branch scope)
+      - Typo in the name; value with stray quotes or whitespace
+      - New code reads a var nobody added to the platform dashboard
+    confirm:
+      - Diff what the code reads (grep for process.env/os.environ) against what the platform dashboard defines
+      - "On a server: `cat /proc/<PID>/environ | tr '\\0' '\\n'` — what the process ACTUALLY got"
+    fix:
+      - Set the var in the right environment, redeploy/restart (env is read at process start)
+      - Validate required env at boot and fail loudly with the missing NAME
+      - Keep .env.example in the repo as the contract
+
+  - id: db-connections-exhausted
+    title: Database connections exhausted
+    module: M6
+    concepts: [connection-pooling]
+    symptom: "Intermittent 500s: 'too many connections' or pool-timeout errors. Some requests fine, others dead — worse under load."
+    causes:
+      - Serverless functions each opening their own connections (no shared pool)
+      - A batch job or leak holding connections
+      - Pool size × instance count exceeding the database's max_connections
+    confirm:
+      - "`SELECT count(*), state FROM pg_stat_activity GROUP BY state;` vs `SHOW max_connections;`"
+      - Connection count graph flat-lining at a ceiling exactly when errors start
+    fix:
+      - Short term — restart the hoarder, or raise the cap one notch
+      - Real fix — pooler (PgBouncer/Supabase pooler/Neon pooling) especially for serverless; bound every job's connection budget
+      - Alert on connections > 80% of max
+
+  - id: dns-misconfig
+    title: DNS misconfiguration
+    module: M5
+    concepts: [dns]
+    symptom: Site unreachable for some users but not others; or traffic still hitting the OLD server after a migration.
+    causes:
+      - Record pointing at the old IP; wrong record type (A vs CNAME)
+      - High TTL meaning resolvers cache the old answer for hours
+      - Nameservers changed but the new ones serve an incomplete zone
+    confirm:
+      - "`dig +short myapp.com` vs what you expect; `dig @8.8.8.8` vs `dig @1.1.1.1` to compare resolvers"
+      - "`dig myapp.com NS` — are the nameservers the ones you think?"
+    fix:
+      - Correct the record; lower TTL to 300s BEFORE future migrations
+      - Keep the old server answering until the old TTL has fully expired
+      - '"Propagation delay" is mostly old TTL still being honored — plan around it, don''t wait on it'
+
+  - id: bad-deploy
+    title: Bad deploy
+    module: M2
+    concepts: [deployment, rollback]
+    symptom: Errors or broken behavior starting at the exact minute of a deploy.
+    causes:
+      - The change itself; a dependency bump with breaking changes
+      - Build succeeded but a runtime-only difference (env, node version) bites in prod
+      - Half-applied deploy (new code, old config — or old code, new migration)
+    confirm:
+      - Timeline — error start time vs deploy history. If they match, it's the deploy until proven otherwise
+    fix:
+      - ROLL BACK FIRST (platform 'redeploy previous' or git revert + deploy); diagnose on restored service
+      - Then diff the bad release and find the mechanism before re-shipping
+      - Staging that mirrors prod env catches most of these
+
+  - id: cors
+    title: CORS blocking the frontend
+    module: M5
+    concepts: [cors, http]
+    symptom: "Browser console: 'blocked by CORS policy'. Works in curl/Postman, fails only in the browser."
+    causes:
+      - API's allowed-origins list missing the frontend's exact origin (scheme + domain + port)
+      - Preflight (OPTIONS) not handled, or needed headers/methods not allowed
+      - Credentials mode requiring a specific origin while the server sends *
+    confirm:
+      - "Network tab: find the OPTIONS request; compare Access-Control-Allow-Origin in the response with the page's actual origin"
+      - "`curl -s -X OPTIONS -H 'Origin: https://app.example.com' -D- https://api.example.com/x`"
+    fix:
+      - Add the exact origin (per environment — localhost:3000 AND the prod domain)
+      - Handle OPTIONS before auth middleware (preflights carry no cookies)
+      - CORS is browser-only protection — it is not API security (that's auth)
+
+  - id: proxy-502-504
+    title: 502 / 504 from the proxy
+    module: M5
+    concepts: [reverse-proxy]
+    symptom: Platform/proxy error page instead of your app. 502 = app gave broken/no response; 504 = app too slow.
+    causes:
+      - "502: app crashed, wrong port, bound to localhost instead of 0.0.0.0, OOM-killed mid-request"
+      - "504: slow query, hung third-party call, proxy timeout shorter than real work"
+    confirm:
+      - Is the process up? Can you curl the app directly on its own port from inside the server/network?
+      - "504: app logs show requests starting and never finishing"
+    fix:
+      - "502: restart/fix the process; make the app listen on the port and interface the proxy expects"
+      - "504: find the slow layer (DB, third party) — raising the proxy timeout just hides it longer"
+
+  - id: crash-loop
+    title: Crash loop
+    module: M1
+    concepts: [process-supervision]
+    symptom: "Service flaps up and down; 'Restarting' status; a storm of restart lines in the supervisor's view."
+    causes:
+      - Error at boot (missing env/config, DB unreachable, syntax error) — supervisor restarts it into the same wall
+      - Failing health check killing a healthy-but-slow-to-start app
+    confirm:
+      - "Read the FIRST lines of a start attempt: `journalctl -u myapp -n 100` or `docker logs --tail 100`"
+      - "`systemctl status` shows the restart counter climbing"
+    fix:
+      - Fix the boot error the log names — the loop is a symptom of whatever line one says
+      - Give slow starters a startup grace period in the health check
+      - Backoff on restart policies so loops don't burn CPU and logs
+
+  - id: slow-query-missing-index
+    title: Slow query / missing index
+    module: M6
+    concepts: [indexes, relational-model]
+    symptom: A page or endpoint gets slower month over month — fine in dev, painful in prod. Eventually 504s.
+    causes:
+      - Query scanning a whole table that grew (no index on the filtered/joined column)
+      - Index exists but unusable (function on the column, type mismatch, leading wildcard LIKE)
+    confirm:
+      - "`EXPLAIN ANALYZE <query>` — look for Seq Scan on a large table"
+      - "Postgres: `pg_stat_statements` ranks queries by total time — hunt the top, not your guess"
+    fix:
+      - Add the index CONCURRENTLY (no table lock) for the actual filter/join columns
+      - Rewrite queries that defeat indexes
+      - Dev with prod-sized data at least occasionally — 100 rows hides everything
+
+  - id: lock-wait-deadlock
+    title: Lock wait / deadlock
+    module: M7
+    concepts: [locks, deadlock, transactions]
+    symptom: "Queries randomly slow or failing with 'deadlock detected'; everything queued behind something invisible."
+    causes:
+      - A long transaction holding row/table locks while others queue
+      - Two code paths locking the same rows in opposite orders (deadlock)
+      - A migration (ALTER TABLE) waiting for a lock and blocking everyone behind it
+    confirm:
+      - "Postgres: `SELECT * FROM pg_stat_activity WHERE wait_event_type='Lock';` and `pg_blocking_pids(pid)` to find the blocker"
+      - Deadlocks are in the Postgres log with both queries printed
+    fix:
+      - Kill the blocking transaction (`SELECT pg_terminate_backend(<pid>)`) to unwedge now
+      - Shorten transactions (no network calls inside them); lock rows in one consistent order
+      - "Migrations: set lock_timeout so they fail fast instead of blocking the world"
+
+  - id: cron-didnt-run
+    title: Cron job silently stopped
+    module: M7
+    concepts: [cron]
+    symptom: "Nobody noticed for days: the nightly report/cleanup/billing job just… hasn't run."
+    causes:
+      - Server rebooted and cron/service wasn't enabled; crontab lost in a migration
+      - Job errors instantly (env differences under cron) and nothing reports it
+      - Platform cron disabled with a plan change, or schedule timezone surprise
+    confirm:
+      - "`grep CRON /var/log/syslog` or `journalctl -u cron` — did it even fire?"
+      - Check the job's own last-run marker (log line, DB timestamp, output file date)
+    fix:
+      - "Dead man's switch: the job pings a monitor (Healthchecks.io etc.) on success; the monitor alerts when pings STOP — this is the fix that catches every variant"
+      - Log start AND finish with timestamps; write a last_run row
+
+  - id: cron-ran-twice
+    title: Cron ran twice (duplicate sends/charges)
+    module: M7
+    concepts: [cron, idempotency]
+    symptom: Customers got two emails / two charges; a batch processed twice.
+    causes:
+      - Two instances/servers each running the same crontab after scaling out
+      - Previous run still going when the next fired (overlap)
+      - DST or timezone change making an hour repeat
+    confirm:
+      - Job's own logs show two interleaved runs (log a run-ID at start)
+      - Two servers' crontabs both define the job
+    fix:
+      - One elected runner, or a distributed lock so one wins (Postgres advisory lock / Redis lock)
+      - Make the work idempotent — record what was processed; skip already-done items (survives EVERY variant of this)
+      - "Prevent overlap: flock in the crontab line, or check-and-exit at start"
+
+  - id: webhook-replayed
+    title: Webhook fired twice / replayed
+    module: M7
+    concepts: [idempotency, queues]
+    symptom: Duplicate orders/records appearing; a provider's event processed more than once.
+    causes:
+      - Providers deliver at-least-once by design — timeouts cause redelivery
+      - Your handler was slow, the provider retried, both attempts eventually succeeded
+    confirm:
+      - Provider dashboard's delivery log shows the retries
+      - Two records share one external event ID
+    fix:
+      - Store the event ID with a unique constraint; insert-or-skip makes redelivery a no-op
+      - Acknowledge fast (enqueue, return 200), process async
+      - This is expected behavior to design for, not a provider bug
+
+  - id: cache-stale
+    title: Cache serving stale data
+    module: M6
+    concepts: [caching, cache-invalidation]
+    symptom: "Users see old prices/content after an update. 'It's fixed for me' — because your cache copy differs from theirs."
+    causes:
+      - Write path updates the DB but never invalidates the cached key
+      - CDN caching HTML/API responses longer than intended (Cache-Control set carelessly)
+      - Multiple cache layers (browser → CDN → Redis) each with their own idea of fresh
+    confirm:
+      - Read the same key/URL at each layer (DB directly, Redis GET, curl with cache-busting query) — find which layer disagrees
+      - "Response headers: Age, X-Cache/CF-Cache-Status say whether the CDN answered"
+    fix:
+      - Invalidate on write (delete the key in the same transaction/path) or accept a short TTL as the staleness budget
+      - Set explicit Cache-Control per route — especially 'no-store' on personalized/API responses
+      - Purge the CDN after content deploys
+
+  - id: rate-limited-by-provider
+    title: Rate-limited by a provider (429s)
+    module: M4
+    concepts: [quotas, rate-limiting]
+    symptom: Third-party calls (LLM, payment, email) failing in bursts with 429; feature works, then doesn't, then does.
+    causes:
+      - A loop or retry storm multiplying calls; a batch job with no throttle
+      - Growth past your tier's requests/tokens-per-minute
+      - Several environments sharing one API key's quota
+    confirm:
+      - Count outbound calls per minute in your logs vs the provider's published limit
+      - Provider dashboard usage graphs; rate-limit headers on responses
+    fix:
+      - Client-side throttle/queue below the limit; exponential backoff with jitter on 429 (never tight-loop retry)
+      - Separate keys per environment; cache repeated identical calls
+      - Upgrade the tier only after the waste is gone
+
+  - id: provider-outage
+    title: Third-party provider outage
+    module: M14
+    concepts: [incident-response]
+    symptom: One feature (payments, email, AI) fails with timeouts/5xx from the provider's domain; everything else healthy.
+    causes:
+      - The provider is down or degraded — it happens to all of them
+    confirm:
+      - Their status page (seconds — do this before touching your code), their X/community
+      - Your logs show failures only on calls to their endpoints
+    fix:
+      - Short term — degrade gracefully (queue the work, show 'temporarily unavailable'), don't crash the whole request
+      - Timeouts on EVERY third-party call so their hang can't become your 504
+      - For revenue-critical paths, decide in calm times whether you need a fallback provider
+
+  - id: clock-skew
+    title: Clock skew
+    module: M7
+    concepts: [time]
+    symptom: "Auth randomly failing ('token expired' on fresh tokens), signature verification errors, events timestamped in the future."
+    causes:
+      - A server's clock drifted (NTP not running) — JWT/OAuth/webhook signatures are time-sensitive
+    confirm:
+      - "`timedatectl` — 'System clock synchronized: yes'? Compare `date -u` across servers"
+    fix:
+      - Enable NTP sync (chrony/systemd-timesyncd)
+      - Allow small clock tolerance in token verification (libraries support leeway)
+
+  - id: timezone-bug
+    title: Timezone / DST bug
+    module: M7
+    concepts: [time]
+    symptom: Jobs firing an hour off twice a year; dates shifting by one day for some users; "yesterday's" report containing the wrong window.
+    causes:
+      - Mixing local time and UTC; storing naive timestamps without zone
+      - Server timezone ≠ DB timezone ≠ user timezone, each converting differently
+      - DST transitions where an hour repeats or vanishes
+    confirm:
+      - Print the same moment from app, DB (`SHOW timezone;`), and server (`date`) — they should agree on UTC
+    fix:
+      - UTC everywhere internally (store timestamptz); convert to local only at display
+      - Schedule crons in UTC, or in the user's zone deliberately and handle DST
+      - Never parse '2024-03-10' into a datetime without saying which zone you mean
+
+  - id: wrong-region
+    title: Wrong region (app far from DB or users)
+    module: M9
+    concepts: [latency-percentiles, scaling]
+    symptom: Every page slow (hundreds of ms each query) despite low load; or one geography complains while another is fine.
+    causes:
+      - App deployed in one region, database in another — every query pays an ocean round trip
+      - Serverless functions defaulting to us-east while your DB is in eu-west
+    confirm:
+      - "Ping/time from app host to DB host: >50ms per round trip × queries per page = your slowness"
+      - Check each service's region in its dashboard — don't assume
+    fix:
+      - Co-locate app and DB in the same region/provider zone — this is the whole fix
+      - Users far away? CDN for static, and consider region choice relative to your real user base
+
+  - id: cold-starts
+    title: Serverless cold starts
+    module: M9
+    concepts: [scaling]
+    symptom: First request after idle takes 2–10s, then everything is fast — p99 terrible, median fine. Worst each morning.
+    causes:
+      - Function spun down after idle; next request pays boot + init (big bundle, many imports, DB connect)
+      - Every scale-up event creates new cold instances
+    confirm:
+      - Platform metrics distinguish cold vs warm invocations; p99 vs p50 gap with low traffic is the fingerprint
+    fix:
+      - Shrink init (lazy-import heavy deps, smaller bundle, pooled/HTTP DB drivers)
+      - Provisioned/min-instances for latency-critical paths — costs money, buys consistency
+      - Or move the hot path to an always-on process (see D3)
+
+  - id: n-plus-1
+    title: N+1 queries
+    module: M9
+    concepts: [relational-model, latency-percentiles]
+    symptom: A list page issuing one query for the list, then one PER ROW — fine with 10 rows in dev, 3 seconds with 500 in prod.
+    causes:
+      - ORM lazy-loading relations inside a loop (the default in most ORMs)
+      - GraphQL resolvers fetching per item
+    confirm:
+      - Query log during one page load — hundreds of near-identical queries differing only in ID
+      - ORM debug mode or APM showing query count per request
+    fix:
+      - Eager-load the relation (include/join/prefetch) or batch with IN (…) / a dataloader
+      - Watch query count per request as a metric; alert when a page needs more than ~10
+
+  - id: memory-leak
+    title: Memory leak
+    module: M9
+    concepts: [processes]
+    symptom: Memory climbs steadily over hours/days, never returns after GC, ends in OOM — the sawtooth with a rising floor.
+    causes:
+      - Unbounded in-process cache or map; listeners/timers accumulating; per-request data kept in module scope
+    confirm:
+      - Memory graph rising across days independent of traffic
+      - Heap snapshots (two, an hour apart) diffed to show what's growing
+    fix:
+      - Bound every in-process cache (LRU with max size/TTL); clean up listeners
+      - Until found, scheduled restarts are an honest mitigation — but they're a tourniquet, not a cure
+
+  - id: secret-leaked
+    title: Secret/API key leaked (e.g. pushed to GitHub)
+    module: M4
+    concepts: [secrets, key-rotation]
+    symptom: Provider warning email, surprise usage on your bill, or you just spotted a key in a public repo/client bundle.
+    causes:
+      - .env committed (missing from .gitignore); key pasted into code/docs; key bundled into frontend JavaScript
+    confirm:
+      - "`git log -p -S 'sk_live' --all` style searches; check the built client bundle for key prefixes"
+      - Provider dashboard for usage you don't recognize
+    fix:
+      - ROTATE FIRST — issue a new key, deploy it, revoke the old one. Deleting the commit does not unleak it; assume copied
+      - Then audit what the key could do and what it did (provider logs)
+      - "Prevent: .gitignore .env, secret scanning (gitleaks/GitHub push protection), server-side only secrets — NEVER in client code"

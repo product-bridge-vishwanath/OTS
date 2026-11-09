@@ -1,0 +1,112 @@
+# Cloud concept mapping (M12): same pieces, different names.
+# Rows are the CONCEPT; columns are what each provider calls it.
+# "paas" is the indie/PaaS-world equivalent the learner probably already uses.
+rows:
+  - concept: Virtual machine (a rented computer)
+    what: A Linux box you fully control — install anything, keep processes running yourself.
+    aws: EC2
+    gcp: Compute Engine
+    azure: Virtual Machines
+    paas: "DigitalOcean Droplet · Hetzner VPS · Lightsail"
+  - concept: Managed app hosting
+    what: Push code, platform builds and runs it — the thing most vibe-coded apps deploy on.
+    aws: App Runner · Elastic Beanstalk
+    gcp: Cloud Run (also containers)
+    azure: App Service
+    paas: "Vercel · Render · Railway · Fly.io · Heroku"
+  - concept: Serverless functions
+    what: Code that runs per-request and scales to zero; you pay per invocation.
+    aws: Lambda
+    gcp: Cloud Run functions
+    azure: Azure Functions
+    paas: "Vercel Functions · Netlify Functions · Cloudflare Workers"
+  - concept: Container orchestration
+    what: Runs many containers across machines — scheduling, restarts, scaling.
+    aws: ECS / EKS (Kubernetes)
+    gcp: GKE (Kubernetes) · Cloud Run
+    azure: AKS (Kubernetes) · Container Apps
+    paas: "Fly.io Machines · Render services (hidden from you)"
+  - concept: Container registry
+    what: Where built images live between build and run.
+    aws: ECR
+    gcp: Artifact Registry
+    azure: ACR
+    paas: "Docker Hub · GitHub Container Registry (ghcr.io)"
+  - concept: Managed Postgres / relational DB
+    what: Postgres/MySQL run for you — backups, patches, failover included.
+    aws: RDS / Aurora
+    gcp: Cloud SQL / AlloyDB
+    azure: Azure Database for PostgreSQL
+    paas: "Supabase · Neon · Railway Postgres · PlanetScale (MySQL)"
+  - concept: NoSQL document/KV database
+    what: Schema-flexible storage scaled by key — different trade-offs, not "better" (see D1).
+    aws: DynamoDB
+    gcp: Firestore / Bigtable
+    azure: Cosmos DB
+    paas: "MongoDB Atlas"
+  - concept: Cache / in-memory store
+    what: Redis-shaped memory for caching, sessions, rate limits, queues.
+    aws: ElastiCache
+    gcp: Memorystore
+    azure: Azure Cache for Redis
+    paas: "Upstash · Railway Redis · Dragonfly Cloud"
+  - concept: Message queue
+    what: A buffer between producers and workers so spikes and failures don't cascade.
+    aws: SQS (queue) · SNS (fan-out)
+    gcp: Pub/Sub
+    azure: Service Bus / Storage Queues
+    paas: "BullMQ on Redis · Inngest · Trigger.dev · CloudAMQP (RabbitMQ)"
+  - concept: Object storage
+    what: Files by URL — uploads, images, backups. Not a filesystem, not a database.
+    aws: S3
+    gcp: Cloud Storage (GCS)
+    azure: Blob Storage
+    paas: "Cloudflare R2 · Supabase Storage · Backblaze B2 · Vercel Blob"
+  - concept: CDN
+    what: Copies of your static content at the network edge, close to users.
+    aws: CloudFront
+    gcp: Cloud CDN
+    azure: Front Door / Azure CDN
+    paas: "Cloudflare · Vercel/Netlify edge (built in)"
+  - concept: DNS hosting
+    what: Where your domain's records live and are served from.
+    aws: Route 53
+    gcp: Cloud DNS
+    azure: Azure DNS
+    paas: "Cloudflare DNS · your registrar's DNS"
+  - concept: Load balancer
+    what: Spreads traffic across instances; health-checks and removes dead ones.
+    aws: ALB / NLB
+    gcp: Cloud Load Balancing
+    azure: Application Gateway / Load Balancer
+    paas: "Built into your PaaS (you see it as 502/503 pages)"
+  - concept: Secrets manager
+    what: Stores API keys and credentials outside code, with access control and audit.
+    aws: Secrets Manager · SSM Parameter Store
+    gcp: Secret Manager
+    azure: Key Vault
+    paas: "Platform env-var dashboard · Doppler · 1Password · Vault"
+  - concept: Logs & metrics
+    what: Where stdout goes and where graphs come from.
+    aws: CloudWatch
+    gcp: Cloud Logging / Monitoring
+    azure: Azure Monitor / Log Analytics
+    paas: "Platform log tab · Sentry · Grafana Cloud · Datadog · Axiom"
+  - concept: Identity & access (IAM)
+    what: Which person/service may do what — the permission system around everything above.
+    aws: IAM
+    gcp: Cloud IAM
+    azure: Microsoft Entra ID (RBAC)
+    paas: "Team roles in the dashboard · scoped API tokens"
+  - concept: Scheduled jobs (cron)
+    what: Run something on a schedule without a terminal open.
+    aws: EventBridge Scheduler
+    gcp: Cloud Scheduler
+    azure: Logic Apps / Functions timers
+    paas: "Vercel Cron · Render Cron Jobs · GitHub Actions schedule · pg_cron"
+  - concept: Private network
+    what: The fence around your resources — what can reach the DB besides the app.
+    aws: VPC + security groups
+    gcp: VPC + firewall rules
+    azure: VNet + NSGs
+    paas: "Private networking toggle (Railway/Render/Fly) · Tailscale"

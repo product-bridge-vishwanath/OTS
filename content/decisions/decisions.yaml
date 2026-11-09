@@ -1,0 +1,91 @@
+# Decision library index (M11). Each entry becomes a full decision page
+# (content wave 3) with the fixed structure: question → options → how each
+# works → cost → trade-offs → pick this if → when to switch → migration cost
+# → questions to ask. Until then the index carries the question, the options,
+# and the honest default.
+decisions:
+  - id: D1
+    title: SQL vs NoSQL
+    question: Where does my core data live?
+    options: "Postgres / MySQL vs MongoDB / DynamoDB / Firestore"
+    default: "Postgres. Relational + JSONB covers almost every product at this stage; switch only for a proven access pattern it can't serve."
+  - id: D2
+    title: Which Postgres
+    question: Who runs my Postgres?
+    options: "Supabase vs Neon vs RDS vs self-hosted"
+    default: "A managed one (Supabase or Neon) until you have a person whose job is databases."
+  - id: D3
+    title: Serverless vs servers vs containers
+    question: What shape of compute runs my code?
+    options: "Lambda/Vercel functions vs a long-running process vs containers"
+    default: "Functions for spiky request/response work; a long-running process the moment you need websockets, background work, or stable DB connections."
+  - id: D4
+    title: PaaS vs VPS vs cloud
+    question: Where does it all run?
+    options: "Vercel/Render/Railway/Fly vs a VPS (Hetzner/DO) vs AWS/GCP"
+    default: "PaaS while your time is worth more than the margin; the cost curve crossover comes later than Twitter says."
+  - id: D5
+    title: Monolith vs services
+    question: One deployable or many?
+    options: "Monolith vs microservices vs modular monolith"
+    default: "Monolith first. Split when a team or a scaling boundary demands it — not when a diagram does."
+  - id: D6
+    title: Cache or not
+    question: Is Redis worth the moving part?
+    options: "Redis vs in-process cache vs CDN vs DB-level caching vs nothing"
+    default: "No cache until a measured query/page justifies it; then the simplest layer that fixes that measurement."
+  - id: D7
+    title: Which queue
+    question: How does async work get done?
+    options: "BullMQ vs SQS vs RabbitMQ vs Kafka vs a DB table as a queue"
+    default: "A Postgres table with SELECT … FOR UPDATE SKIP LOCKED, or BullMQ if Redis already exists. Kafka is a company-sized decision."
+  - id: D8
+    title: Auth build vs buy
+    question: Who owns login?
+    options: "Clerk vs Auth0 vs Supabase Auth vs roll-your-own with a library"
+    default: "Buy (or use your platform's) unless auth IS the product. Password storage mistakes are unrecoverable reputation damage."
+  - id: D9
+    title: File storage
+    question: Where do uploads live?
+    options: "S3 vs R2 vs GCS vs Supabase Storage vs Vercel Blob"
+    default: "R2 if egress-heavy (no egress fees), S3 for the deepest ecosystem, your platform's storage for convenience."
+  - id: D10
+    title: Search
+    question: How do users search my data?
+    options: "Postgres full-text vs Meilisearch/Typesense vs Elasticsearch vs Algolia"
+    default: "Postgres full-text first — it's already there. Dedicated engines when relevance tuning or typo-tolerance becomes a real complaint."
+  - id: D11
+    title: Vector store
+    question: Where do embeddings live?
+    options: "pgvector vs Pinecone vs Qdrant vs Weaviate vs Chroma"
+    default: "pgvector in the Postgres you already run, until collection size or latency proves otherwise."
+  - id: D12
+    title: LLM provider and model
+    question: Which model, and what happens when it's down or slow?
+    options: "Capability vs cost vs latency tiers; routing; fallback; self-hosting"
+    default: "A capable hosted model with a cheaper routed fallback; self-hosting is almost never worth it below serious scale."
+  - id: D13
+    title: Observability stack
+    question: Where do I look when it breaks?
+    options: "Platform-native vs Sentry + Grafana vs Datadog"
+    default: "Platform logs + Sentry on day one. Datadog-class tools when the bill is cheaper than the blindness."
+  - id: D14
+    title: CDN / WAF
+    question: What stands in front of my app?
+    options: "Cloudflare vs platform CDN vs nothing"
+    default: "Cloudflare in front of anything public — cache, WAF and bot protection in one free-tier move."
+  - id: D15
+    title: Region and multi-region
+    question: Where in the world does it run?
+    options: "One region near users vs near the team vs multi-region"
+    default: "One region, app and DB co-located, chosen for your real users. Multi-region is a different product."
+  - id: D16
+    title: Email / SMS / payments providers
+    question: Which comms and payment rails?
+    options: "Resend/Postmark/SES · Twilio · Stripe"
+    default: "Chosen for debuggability: Stripe for payments, Resend or Postmark for email — their logs will save you during incidents."
+  - id: D17
+    title: Decision record template (ADR-lite)
+    question: How do I remember why we chose this?
+    options: "The template every decision above gets recorded with"
+    default: "Context → options considered → choice → cost accepted → revisit-when trigger. Five lines, kept in the repo."

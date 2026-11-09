@@ -1,0 +1,202 @@
+# Command cheat sheet. Grouped by the QUESTION you're trying to answer,
+# not alphabetically (teaching principle: taught by task).
+# Every entry: cmd (copyable), does (plain language), example, note (gotcha).
+groups:
+  - title: "Where am I, and what's here?"
+    commands:
+      - cmd: pwd
+        does: Print the directory you're standing in.
+        example: pwd
+        note: Every relative path in every command is resolved from here. Half of "file not found" is being in the wrong directory.
+      - cmd: ls -la
+        does: List everything here, including hidden files, with permissions, owner, size and date.
+        example: ls -la /var/www/myapp
+        note: Files starting with a dot (.env, .ssh) are hidden from plain ls — that's why you "don't see" your .env.
+      - cmd: cd
+        does: Move to another directory.
+        example: cd /var/log
+        note: "`cd -` jumps back to where you just were. `cd` alone goes home (~)."
+      - cmd: find
+        does: Search for files by name, size or age, recursively.
+        example: find / -name "*.log" -size +100M 2>/dev/null
+        note: The example answers "which giant log file is eating my disk?" — a real incident (see failure catalogue, disk full).
+      - cmd: which
+        does: Show which binary actually runs when you type a command.
+        example: which node
+        note: '"Works in my terminal, not in cron" is often two different node binaries. Compare `which node` in both contexts.'
+
+  - title: "Read files and logs"
+    commands:
+      - cmd: cat
+        does: Print a whole file to the terminal.
+        example: cat .env.example
+        note: Fine for small files. For big ones use less — cat-ing a 2GB log will flood your terminal.
+      - cmd: less
+        does: Open a file for scrolling and searching without loading it all.
+        example: less /var/log/syslog
+        note: Inside less — `/error` searches forward, `n` repeats, `G` jumps to the end, `q` quits. `less +F` behaves like tail -f until you press Ctrl-C.
+      - cmd: tail -f
+        does: Show the end of a file and keep streaming new lines live.
+        example: tail -f /var/log/myapp/app.log
+        note: The default way to watch logs during a deploy. `tail -n 200` shows the last 200 lines first.
+      - cmd: head
+        does: Show the first lines of a file.
+        example: head -n 50 migration.sql
+        note: Pairs with the debugging method — the FIRST error in a window matters more than the last.
+      - cmd: grep
+        does: Search text for a pattern, in a file or piped from another command.
+        example: grep -iE "error|fatal" app.log | head -20
+        note: "-i ignores case, -E enables regex alternation, -r searches directories, -v inverts (everything EXCEPT the pattern), -n shows line numbers, -A3/-B3 show lines after/before the match — that's how you see a stack trace around an error."
+      - cmd: journalctl
+        does: Read logs for systemd-managed services (most Linux VPS setups).
+        example: journalctl -u myapp -S "1 hour ago" --no-pager
+        note: "-u filters to one service, -S/-U bound the time window, -f follows live. If your process runs under systemd, its stdout is HERE, not in a file."
+      - cmd: docker logs
+        does: Read a container's stdout/stderr.
+        example: docker logs --since 30m --timestamps myapp
+        note: Logs vanish when the container is removed. `--timestamps` matters when building an incident timeline.
+
+  - title: "What is running, and what is it consuming?"
+    commands:
+      - cmd: ps aux
+        does: List every running process with its CPU, memory and full command line.
+        example: ps aux | grep node
+        note: The second column is the PID — you need it for kill. A process you expect that's missing here = it crashed.
+      - cmd: top / htop
+        does: Live view of CPU and memory per process.
+        example: htop
+        note: Sort by memory (M in htop) to find a leak; by CPU (P) to find a spin. `load average` above your CPU core count means the machine is saturated.
+      - cmd: kill
+        does: Send a signal to a process by PID — politely ask it to exit, or force it.
+        example: kill 12345
+        note: Plain kill sends SIGTERM (graceful). `kill -9` is the last resort — the process gets no chance to clean up (close DB connections, finish requests).
+      - cmd: systemctl
+        does: Start, stop, restart and inspect systemd services.
+        example: systemctl status myapp
+        note: "`status` shows the last few log lines and whether it's crash-looping (look for 'Restart counter'). `systemctl restart myapp` after a config change."
+      - cmd: free -h
+        does: Show total, used and available memory.
+        example: free -h
+        note: "Look at 'available', not 'free' — Linux uses spare RAM for cache and gives it back. Near-zero available = OOM killer territory."
+      - cmd: df -h
+        does: Show disk space per filesystem.
+        example: df -h
+        note: 100% on / is a classic silent killer — databases and logs start failing in weird ways long before anything says "disk full".
+      - cmd: du
+        does: Show how much space a directory tree uses.
+        example: du -h --max-depth=1 /var | sort -h
+        note: Run it where df says the space went. Usual suspects — /var/log, /var/lib/docker, node_modules, old backups.
+
+  - title: "Ports and network: who's listening, can I reach it?"
+    commands:
+      - cmd: lsof -i
+        does: Show which process is listening on which port.
+        example: lsof -i :3000
+        note: 'The answer to "EADDRINUSE: port already in use" — find the PID squatting on the port, then decide whether to kill it.'
+      - cmd: ss -tlnp
+        does: List all listening TCP ports with their processes (Linux).
+        example: ss -tlnp
+        note: Your app "deployed fine" but the proxy 502s? Check it's actually listening, and on 0.0.0.0 (all interfaces) not 127.0.0.1 (localhost only).
+      - cmd: curl
+        does: Make an HTTP request from the terminal — your layer-isolation scalpel.
+        example: curl -sv https://myapp.com/api/health
+        note: "-v shows DNS resolution, TLS handshake, request and response headers — each stage that succeeds eliminates a layer. `-o /dev/null -w '%{http_code} %{time_total}'` gives just status + timing."
+      - cmd: dig
+        does: Ask DNS what a name resolves to, record by record.
+        example: dig +short myapp.com A
+        note: "`dig @8.8.8.8 myapp.com` asks Google's resolver specifically — comparing resolvers is how you see 'propagation' (really: old TTLs still cached)."
+      - cmd: ping
+        does: Check basic reachability of a host and round-trip latency.
+        example: ping -c 4 myapp.com
+        note: Many clouds block ping (ICMP) — a failed ping with a working curl means nothing is wrong. Trust curl.
+      - cmd: nc (netcat)
+        does: Test whether a specific TCP port is reachable.
+        example: nc -zv db.internal 5432
+        note: The fastest way to answer "can this server reach the database at all?" — separates network/firewall problems from credential problems.
+
+  - title: "Connect and copy: SSH"
+    commands:
+      - cmd: ssh
+        does: Open a shell on a remote machine, authenticated with your key.
+        example: ssh deploy@203.0.113.7
+        note: "`ssh -i ~/.ssh/mykey user@host` picks a specific key. 'Permission denied (publickey)' = your public key isn't in the server's ~/.ssh/authorized_keys, or its permissions are wrong."
+      - cmd: scp
+        does: Copy files to or from a remote machine over SSH.
+        example: scp backup.sql deploy@203.0.113.7:/tmp/
+        note: Remote side is host:path. For big or resumable transfers, `rsync -avz` is the stronger tool.
+      - cmd: ssh-keygen
+        does: Create an SSH key pair.
+        example: ssh-keygen -t ed25519 -C "you@example.com"
+        note: The .pub file is the shareable half (goes on servers, GitHub). The other file is the secret — it never leaves your machine.
+
+  - title: "Environment variables"
+    commands:
+      - cmd: env / printenv
+        does: Show the environment variables of the current shell.
+        example: printenv | grep -i database
+        note: 'This is what YOUR SHELL sees — not necessarily what your app sees. An app under systemd/PaaS gets its env from the unit file / dashboard, not your shell.'
+      - cmd: export
+        does: Set an environment variable for this shell session and its children.
+        example: export LOG_LEVEL=debug
+        note: Gone when the terminal closes. Permanent values live in the platform dashboard, a .env file, or the systemd unit — know which one your process actually reads.
+      - cmd: printenv inside the process
+        does: Check what a RUNNING process actually received.
+        example: cat /proc/<PID>/environ | tr '\0' '\n' | grep DATABASE
+        note: The ground truth when "but I set the variable!" — compare what you set with what the process got. (On a PaaS, use its run/exec command instead.)
+
+  - title: "Permissions and ownership"
+    commands:
+      - cmd: chmod
+        does: Change what the owner, group and everyone else may do with a file.
+        example: chmod 600 ~/.ssh/id_ed25519
+        note: "600 = only the owner reads/writes. SSH refuses keys with looser permissions. For scripts: `chmod +x deploy.sh` makes it executable."
+      - cmd: chown
+        does: Change which user and group own a file.
+        example: sudo chown -R www-data:www-data /var/www/myapp
+        note: '"Permission denied" writing uploads/logs is usually this — the app runs as one user, the files are owned by another (often root, because you once ran something with sudo).'
+      - cmd: whoami / id
+        does: Show which user you currently are and your groups.
+        example: whoami
+        note: The first question when permissions misbehave. Deploys-as-root + runs-as-service-user is the classic mismatch.
+      - cmd: sudo
+        does: Run one command as root.
+        example: sudo systemctl restart nginx
+        note: If a command only works with sudo, understand WHY before making that permanent — the fix is usually ownership, not more root.
+
+  - title: "Keeping things running"
+    commands:
+      - cmd: systemctl enable
+        does: Make a service start automatically on boot.
+        example: sudo systemctl enable --now myapp
+        note: Without enable, your app dies with the next server reboot and you find out from users. `--now` also starts it immediately.
+      - cmd: pm2
+        does: Node-world process manager — restarts on crash, keeps logs.
+        example: pm2 start dist/server.js --name myapp && pm2 save
+        note: "`pm2 save` + `pm2 startup` is what makes it survive reboots. `pm2 logs myapp` for output, `pm2 monit` for live CPU/mem."
+      - cmd: crontab
+        does: Edit or list this user's scheduled jobs.
+        example: crontab -l
+        note: "Five fields: minute hour day-of-month month day-of-week. Cron's environment is nearly empty — no PATH, no .env — which is why jobs 'work in the terminal but not in cron'. See M7."
+      - cmd: nohup / &
+        does: Keep a command running after you disconnect (quick-and-dirty).
+        example: nohup node server.js > out.log 2>&1 &
+        note: A stopgap, not an answer — it won't restart on crash or reboot. Real services belong under systemd, pm2, or a platform.
+
+  - title: "Docker quick reference"
+    commands:
+      - cmd: docker ps
+        does: List running containers (add -a to include stopped/crashed ones).
+        example: docker ps -a
+        note: "A container in 'Restarting' status is a crash loop; 'Exited (137)' usually means it was OOM-killed."
+      - cmd: docker exec
+        does: Run a command inside a running container.
+        example: docker exec -it myapp sh
+        note: Your way "inside the box" to check env vars, files and connectivity as the app sees them.
+      - cmd: docker compose
+        does: Start/stop a multi-container setup defined in compose.yaml.
+        example: docker compose up -d && docker compose logs -f
+        note: "`up -d --build` rebuilds after code changes. `down -v` also deletes volumes — that's your local database, so mean it."
+      - cmd: docker stats
+        does: Live CPU/memory per container.
+        example: docker stats
+        note: Containers hit their memory LIMIT before the host runs out — a container OOM is invisible in the host's free -h.

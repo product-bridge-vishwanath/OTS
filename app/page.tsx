@@ -36,6 +36,12 @@ export default function Home() {
           >
             Browse the curriculum
           </Link>
+          <Link
+            href="/reference/failures"
+            className="rounded-lg border border-border px-5 py-2.5 text-sm font-semibold text-fg-muted hover:text-fg"
+          >
+            Something&apos;s broken right now →
+          </Link>
         </div>
       </section>
 

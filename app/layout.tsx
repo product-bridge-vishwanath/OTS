@@ -25,6 +25,9 @@ export default function RootLayout({
               <Link href="/#curriculum" className="hover:text-fg">
                 Curriculum
               </Link>
+              <Link href="/reference" className="hover:text-fg">
+                Reference
+              </Link>
               <Link href="/scenarios" className="hover:text-fg">
                 Scenarios
               </Link>

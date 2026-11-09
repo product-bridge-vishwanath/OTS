@@ -1,40 +1,223 @@
 # Site-wide glossary. Terms get hover definitions anywhere a lesson uses
-# <Term k="slug">displayed text</Term>. Keep definitions to one or two
-# sentences, plain language, no circular definitions.
+# <Term k="slug">displayed text</Term>, and the full list renders at
+# /reference/glossary. Keep definitions to one or two sentences, plain
+# language, no circular definitions.
 terms:
-  stack-trace:
-    name: Stack trace
-    def: The list of function calls that were active when an error happened, printed innermost first. The top lines of it tell you the exact file and line where things went wrong.
+  # --- requests and the journey ---
+  api:
+    name: API
+    def: The set of URLs and rules by which one program asks another to do things. Your frontend talks to your backend through one; your backend talks to Stripe through theirs.
+  client:
+    name: Client
+    def: Whatever sends the request — a browser, a mobile app, another server. The half of every conversation you don't control.
   reverse-proxy:
     name: Reverse proxy
     def: A server that sits in front of your app and forwards requests to it — handling TLS, routing, and buffering. Nginx, Caddy, and your PaaS's edge are all reverse proxies.
   upstream:
     name: Upstream
     def: From a proxy's point of view, the server it forwards requests to — your app. "Upstream timed out" means the proxy gave up waiting for your app to answer.
-  correlation-id:
-    name: Correlation ID
-    def: A unique ID attached to a request and carried through every service and log line it touches, so you can follow one user's request across the whole system.
-  connection-pool:
-    name: Connection pool
-    def: A kept-alive set of database connections that requests borrow and return, because opening a fresh connection per request is slow and databases cap how many they allow.
+  load-balancer:
+    name: Load balancer
+    def: A traffic cop that spreads requests across multiple copies of your app and stops sending to copies that fail health checks.
+  cdn:
+    name: CDN
+    def: A network of servers around the world holding copies of your static content, so users load it from nearby instead of from your one server.
+  five-oh-two:
+    name: "502 Bad Gateway"
+    def: The proxy reached out to your app and got a broken or no response — the app is down, crashed mid-request, or not listening on the expected port. The problem is behind the proxy.
+  dns:
+    name: DNS
+    def: The phone book that turns a name (myapp.com) into an address (an IP). Resolvers cache answers for the record's TTL, which is why changes seem to "propagate" slowly.
+  ttl:
+    name: TTL (time to live)
+    def: How long a cached answer may be reused before asking again. Applies to DNS records and cache entries alike — a high TTL means changes take that long to be seen everywhere.
+  tls:
+    name: TLS / HTTPS
+    def: The encryption layer under HTTPS. A certificate proves you own the domain; browsers refuse expired or mismatched ones, which is how cert problems take sites down.
+  certificate:
+    name: Certificate
+    def: A signed statement that a public key belongs to a domain, issued by an authority browsers trust (e.g. Let's Encrypt). It expires — renewal is the part that breaks.
+  cors:
+    name: CORS
+    def: The browser's rule set for which websites may call which APIs with scripts. A CORS error means the API didn't explicitly allow the page's origin — it protects users, not your API.
+  webhook:
+    name: Webhook
+    def: A provider calling YOUR server when something happens (payment succeeded, email bounced). Delivered at-least-once, so duplicates are normal and your handler must tolerate them.
+
+  # --- the machine ---
+  process:
+    name: Process
+    def: A running program with its own memory and environment. Your "app being up" means a process exists, is listening on a port, and hasn't crashed.
+  port:
+    name: Port
+    def: A numbered door on a machine that one process listens behind (80 HTTP, 443 HTTPS, 5432 Postgres). "Port already in use" means another process got there first.
+  env-var:
+    name: Environment variable
+    def: A named value handed to a process at start (like DATABASE_URL). Each environment sets its own values, which is how the same code talks to different databases in dev and prod.
   oom:
     name: OOM (out of memory)
     def: The operating system killing a process because it asked for more memory than the machine (or its container limit) has. Shows up as a process that vanishes without an error from your code.
   crash-loop:
     name: Crash loop
     def: A process that dies on startup, gets restarted by its supervisor, and dies again — forever. The restart hides the crash unless you read the logs from the first seconds of a start.
-  p95:
-    name: p95
-    def: The latency that 95% of requests beat. Averages hide pain; percentiles show what your slowest real users experience.
-  rollback:
-    name: Rollback
-    def: Putting the previous known-good version back into production. It is the first fix in an incident because it restores service without you yet knowing the cause.
+  container:
+    name: Container
+    def: A packaged process with its own filesystem and dependencies, so it runs the same everywhere. Lighter than a virtual machine — it shares the host's kernel.
+  image:
+    name: Image (Docker)
+    def: The frozen template a container starts from — your code plus its runtime and dependencies, built once, run anywhere.
+  serverless:
+    name: Serverless
+    def: Compute where the platform starts your code per request and stops it after — no process for you to keep alive, but also no memory between requests and cold starts when idle.
+  cold-start:
+    name: Cold start
+    def: The extra seconds a serverless function takes when no warm copy exists — boot, load code, connect. Hits the first user after idle, and p99 latency.
+  ssh:
+    name: SSH
+    def: An encrypted terminal connection into another machine, authenticated by a key pair. The private key stays on your laptop; the public half sits on the server.
+
+  # --- data ---
+  index:
+    name: Index (database)
+    def: A sorted lookup structure that lets the database find rows without reading the whole table. The difference between 5ms and 5s on the same query at production size.
+  transaction:
+    name: Transaction
+    def: A group of database operations that succeed or fail as one — nobody ever sees half of it. The tool that makes "charge the card AND create the order" safe.
+  connection-pool:
+    name: Connection pool
+    def: A kept-alive set of database connections that requests borrow and return, because opening a fresh connection per request is slow and databases cap how many they allow.
+  migration:
+    name: Migration (schema)
+    def: A versioned script that changes the database's shape (add a column, create a table). Runs once per environment, in order — and unlike code, can't always be rolled back.
+  deadlock:
+    name: Deadlock
+    def: Two transactions each holding a lock the other needs — neither can proceed. The database kills one; your log shows "deadlock detected" with both queries.
+  race-condition:
+    name: Race condition
+    def: A bug that appears only when two things run at the same time and interleave in an unlucky order — like two users booking the last seat because both checked availability before either wrote.
   idempotent:
     name: Idempotent
     def: An operation that is safe to run twice — doing it again changes nothing. Retries and replayed webhooks make this a survival property, not a nicety.
-  env-var:
-    name: Environment variable
-    def: A named value handed to a process at start (like DATABASE_URL). Each environment sets its own values, which is how the same code talks to different databases in dev and prod.
-  five-oh-two:
-    name: "502 Bad Gateway"
-    def: The proxy reached out to your app and got a broken or no response — the app is down, crashed mid-request, or not listening on the expected port. The problem is behind the proxy.
+  cache:
+    name: Cache
+    def: A faster copy of data kept closer to where it's needed. Every cache trades freshness for speed — the bugs live in that trade (see "cache invalidation").
+  queue:
+    name: Queue
+    def: A line of pending work that producers add to and workers take from — so a spike becomes a backlog instead of an outage, and failures can be retried.
+  worker:
+    name: Worker
+    def: A process that takes jobs from a queue and does them outside the request — sending emails, generating reports, anything too slow or too flaky to do while a user waits.
+  object-storage:
+    name: Object storage
+    def: File storage addressed by key and served by URL (S3, R2). Infinitely large and cheap to store — the egress (download) is where cost hides.
+  signed-url:
+    name: Signed URL
+    def: A temporary link to a private file, cryptographically stamped with an expiry — how you let a user download their invoice without making the bucket public.
+  backup-pitr:
+    name: PITR (point-in-time recovery)
+    def: Restoring a database to any chosen moment, not just the nightly snapshot — the difference between losing one minute and losing one day of data.
+
+  # --- shipping ---
+  ci-cd:
+    name: CI/CD
+    def: Automation that runs on every push — tests and build (CI), then deployment (CD). The pipeline is just a scripted checklist a machine executes.
+  staging:
+    name: Staging
+    def: A production-shaped environment where changes run before real users see them. Only works as a safety net if its config and data shape genuinely mirror production.
+  rollback:
+    name: Rollback
+    def: Putting the previous known-good version back into production. It is the first fix in an incident because it restores service without you yet knowing the cause.
+  canary:
+    name: Canary deploy
+    def: Shipping a new version to a small slice of traffic first, watching error rates, then widening. The blast radius control for risky changes.
+  feature-flag:
+    name: Feature flag
+    def: A runtime switch that turns a feature on or off without deploying. Doubles as a kill switch during incidents — flipping a flag is faster than any rollback.
+
+  # --- observability ---
+  stack-trace:
+    name: Stack trace
+    def: The list of function calls that were active when an error happened, printed innermost first. The top lines of it tell you the exact file and line where things went wrong.
+  structured-logging:
+    name: Structured logging
+    def: Logging key=value / JSON instead of prose, so logs can be filtered and counted ("all 5xx for user 123 in the last hour") rather than just read.
+  correlation-id:
+    name: Correlation ID
+    def: A unique ID attached to a request and carried through every service and log line it touches, so you can follow one user's request across the whole system.
+  p95:
+    name: p95
+    def: The latency that 95% of requests beat. Averages hide pain; percentiles show what your slowest real users experience.
+  golden-signals:
+    name: Four golden signals
+    def: "Latency, traffic, errors, saturation — the four graphs that describe almost any service's health. If you dashboard only four things, dashboard these."
+  tracing:
+    name: Tracing
+    def: Recording the tree of calls one request makes (app → DB → third party) with timings, so you can see WHERE the time went, not just that it was slow.
+
+  # --- security ---
+  jwt:
+    name: JWT
+    def: A signed token carrying claims (who you are, when it expires) that a server can verify without a database lookup. Can't be revoked early without extra machinery — that's the trade.
+  session:
+    name: Session
+    def: Server-remembered login state, referenced by a cookie. The server can kill it instantly (unlike a JWT), at the cost of a lookup per request.
+  oauth:
+    name: OAuth / OIDC
+    def: The protocol behind "Sign in with Google" — your app receives proof of identity from a provider without ever seeing the password.
+  idor:
+    name: IDOR
+    def: "Insecure direct object reference: /orders/1234 works for ANY logged-in user, not just the owner — the most common real-world authorization bug in shipped apps."
+  waf:
+    name: WAF
+    def: A web application firewall — a filter in front of your app that blocks known-bad request patterns and bots before they reach your code.
+  least-privilege:
+    name: Least privilege
+    def: Every key, user, and service gets only the permissions its job needs — so a leak or compromise is contained to that job's blast radius.
+
+  # --- scale and money ---
+  stateless:
+    name: Stateless
+    def: A server that keeps nothing between requests (state lives in the DB/cache). Any copy can serve any request — which is what makes scaling horizontally trivial.
+  autoscaling:
+    name: Autoscaling
+    def: The platform adding or removing copies of your app based on load. It can't fix a slow database or a memory leak — it just multiplies whatever you gave it.
+  read-replica:
+    name: Read replica
+    def: A continuously-synced copy of the database that serves reads, taking load off the primary. Writes still go to one place; replicas lag by moments.
+  sharding:
+    name: Sharding
+    def: Splitting one database into several by key (users A–M here, N–Z there). The last resort of database scaling — enormous complexity, taken on only when everything else is exhausted.
+  egress:
+    name: Egress
+    def: Data leaving a cloud — the direction providers charge for. Storing a terabyte is cheap; serving it out repeatedly is the bill surprise.
+  n-plus-1:
+    name: N+1 queries
+    def: Fetching a list with one query, then one more query per item — invisible with 10 dev rows, catastrophic with 5,000 production rows.
+
+  # --- AI systems ---
+  token-llm:
+    name: Token (LLM)
+    def: The unit models read and write — roughly ¾ of a word. It's the unit of cost AND latency, which is why long prompts are slow and expensive.
+  embedding:
+    name: Embedding
+    def: A list of numbers representing a text's meaning, placed so similar meanings land near each other — the geometry that powers semantic search and RAG.
+  rag:
+    name: RAG
+    def: "Retrieval-augmented generation: fetch the most relevant documents for a question and hand them to the model as context, so it answers from your data instead of memory."
+  context-window:
+    name: Context window
+    def: The maximum amount a model can consider at once — prompt plus history plus retrieved documents plus its answer. Everything beyond it is simply not seen.
+  prompt-injection:
+    name: Prompt injection
+    def: Malicious instructions hidden in content a model reads (a document, a web page) that try to override what you asked it to do — the SQL injection of the LLM era.
+
+  # --- operating ---
+  runbook:
+    name: Runbook
+    def: A written, tested procedure for one operational situation — "DB connections exhausted → do this, in this order." Written calm, used panicked.
+  postmortem:
+    name: Postmortem
+    def: The blameless write-up after an incident — timeline, contributing causes, action items. Its job is making the same surprise impossible twice.
+  incident-severity:
+    name: Severity (SEV)
+    def: "A shared scale for how bad it is (SEV1: everyone's down → SEV4: cosmetic), deciding who gets woken and how often updates go out."

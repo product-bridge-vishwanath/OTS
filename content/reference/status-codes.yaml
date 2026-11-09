@@ -1,0 +1,200 @@
+# HTTP status code reference. For each code: what it means, which layer to
+# suspect (ties into the debugging method's layer isolation), common causes
+# in shipped products, and how to confirm.
+families:
+  - family: "2xx — Success"
+    note: The request worked. Still worth knowing the flavors — agents and SDKs branch on them.
+    codes:
+      - code: 200
+        name: OK
+        means: Standard success; the body carries the result.
+        layer: "—"
+        causes: []
+        confirm: ""
+      - code: 201
+        name: Created
+        means: Something new now exists (usually after POST); Location header often points at it.
+        layer: "—"
+        causes: []
+        confirm: ""
+      - code: 204
+        name: No Content
+        means: Success, deliberately empty body.
+        layer: "—"
+        causes:
+          - Frontends that try to JSON.parse an empty 204 body throw — a classic "success that looks like an error".
+        confirm: ""
+      - code: 206
+        name: Partial Content
+        means: A byte range was served — video streaming and resumable downloads.
+        layer: "—"
+        causes: []
+        confirm: ""
+
+  - family: "3xx — Redirection"
+    note: "The answer is elsewhere. Redirect loops and lost request bodies live here."
+    codes:
+      - code: 301
+        name: Moved Permanently
+        means: Use the new URL from Location, forever. Browsers and CDNs cache this aggressively.
+        layer: app / proxy config
+        causes:
+          - A cached 301 to the wrong place keeps "redirecting" users long after you fixed the config.
+        confirm: "curl -sI http://yourapp.com | grep -i location"
+      - code: 302
+        name: Found (temporary)
+        means: Use the new URL for now; keep the old one.
+        layer: app
+        causes:
+          - Login flows — unauthenticated users get 302 to /login; an API client that doesn't follow redirects sees "nothing".
+        confirm: "curl -v and read the Location header"
+      - code: 304
+        name: Not Modified
+        means: Your cached copy is still valid (conditional request matched ETag/Last-Modified).
+        layer: "—"
+        causes: []
+        confirm: ""
+      - code: 307
+        name: Temporary Redirect
+        means: Like 302 but the method and body are preserved (a POST stays a POST).
+        layer: app / proxy
+        causes:
+          - HTTP→HTTPS upgrades. If a POST webhook hits http:// and gets redirected, some senders retry as GET and your handler never fires — use 307/308 or fix the URL.
+        confirm: "curl -v -X POST http://… and watch what comes back"
+      - code: 308
+        name: Permanent Redirect
+        means: Like 301 but method and body preserved.
+        layer: app / proxy
+        causes: []
+        confirm: ""
+
+  - family: "4xx — The client did something the server rejects"
+    note: "The request reached your app and was refused. The fault can still be yours — bad docs, wrong CORS, expired tokens you issued."
+    codes:
+      - code: 400
+        name: Bad Request
+        means: The server couldn't parse or accept the request as sent.
+        layer: client (or your validation)
+        causes:
+          - Malformed JSON, missing required field, wrong Content-Type header.
+        confirm: "Read the response body — good APIs say which field. Reproduce with curl using the exact payload from the browser's network tab."
+      - code: 401
+        name: Unauthorized
+        means: "No valid credentials — really means 'unauthenticated'."
+        layer: client / auth config
+        causes:
+          - Expired or missing token/session cookie; API key not sent; key for the wrong environment (test key against live).
+        confirm: "curl with the Authorization header copied from a failing request; check the token's expiry claim."
+      - code: 403
+        name: Forbidden
+        means: "Authenticated, but not allowed to do this."
+        layer: app authorization / platform
+        causes:
+          - Role/permission checks; IP allow-lists; cloud WAF or bot protection blocking a legitimate client; S3 bucket policy.
+        confirm: "Same request as an admin user — if it works, it's authorization. Also check the WAF/firewall event log."
+      - code: 404
+        name: Not Found
+        means: No route or resource at this URL.
+        layer: client / app routing / proxy
+        causes:
+          - Typo'd path; route exists locally but the deploy didn't include it; proxy stripping or adding a path prefix (/api); resource deleted.
+        confirm: "Hit the route on the app server directly (bypass the proxy) — if it works there, the proxy is rewriting paths."
+      - code: 405
+        name: Method Not Allowed
+        means: The route exists but not for this verb (e.g. GET where only POST is defined).
+        layer: client / app routing
+        causes:
+          - Forms submitting GET instead of POST; a redirect that converted POST to GET (see 307).
+        confirm: "Check the Allow header in the response — it lists the verbs the route accepts."
+      - code: 408
+        name: Request Timeout
+        means: The client took too long to send the request.
+        layer: client / network
+        causes:
+          - Huge uploads on slow connections; a client that opened a connection and stalled.
+        confirm: ""
+      - code: 409
+        name: Conflict
+        means: The request collides with current state.
+        layer: app / data
+        causes:
+          - Unique constraint hit (email already registered); optimistic-concurrency version mismatch (see M7) — someone else wrote first.
+        confirm: "Check the DB constraint named in your app's error log."
+      - code: 410
+        name: Gone
+        means: Deliberately removed, permanently — stronger than 404.
+        layer: app
+        causes: []
+        confirm: ""
+      - code: 413
+        name: Content Too Large
+        means: The body exceeds a size limit.
+        layer: proxy / app config
+        causes:
+          - "Nginx's default client_max_body_size is 1MB — file uploads die at the proxy before your app ever sees them."
+        confirm: "If your app logs show no request at all, the limit is at the proxy/platform layer."
+      - code: 415
+        name: Unsupported Media Type
+        means: The Content-Type isn't accepted.
+        layer: client
+        causes:
+          - Sending form-encoded data to a JSON endpoint or vice versa; missing Content-Type on a POST.
+        confirm: ""
+      - code: 422
+        name: Unprocessable Content
+        means: Parseable, but semantically invalid — validation failed.
+        layer: client (payload)
+        causes:
+          - Field-level validation errors; many frameworks (Rails, FastAPI) use this where others use 400.
+        confirm: "The body usually enumerates the failing fields."
+      - code: 429
+        name: Too Many Requests
+        means: Rate limit exceeded. Retry-After header may say when to try again.
+        layer: provider / your own limiter
+        causes:
+          - A loop hammering a third-party API; traffic spike or bot hitting your own limiter; LLM provider quota (requests or tokens per minute).
+        confirm: "Count requests per minute in logs, grouped by IP or API key; read the provider's rate-limit response headers."
+      - code: 451
+        name: Unavailable For Legal Reasons
+        means: Blocked for legal/compliance reasons (geo-blocks, takedowns).
+        layer: platform / CDN
+        causes: []
+        confirm: ""
+
+  - family: "5xx — The server side failed"
+    note: "The request was valid; something on your side broke. The specific code tells you WHERE behind the front door. These four (500/502/503/504) are the most diagnostic signals in this whole table."
+    codes:
+      - code: 500
+        name: Internal Server Error
+        means: Your application code threw an unhandled error while processing the request.
+        layer: app (your code reached, then crashed)
+        causes:
+          - Unhandled exception; missing env var read at request time; null from a query the code didn't expect; a dependency's API changed.
+        confirm: "The app logs have the stack trace — the request REACHED your code. Find the first occurrence, not the latest (debugging method step 2–3)."
+      - code: 501
+        name: Not Implemented
+        means: The server doesn't support this method at all.
+        layer: app / proxy
+        causes: []
+        confirm: ""
+      - code: 502
+        name: Bad Gateway
+        means: The proxy/load balancer contacted your app and got a broken response or none at all.
+        layer: app process (behind the proxy)
+        causes:
+          - App crashed or is crash-looping; app listening on the wrong port or on localhost instead of 0.0.0.0; app killed mid-request (OOM); deploy briefly swapped processes.
+        confirm: "Is the process alive (systemctl status / docker ps / platform dashboard)? Can you curl the app directly on its own port from the server?"
+      - code: 503
+        name: Service Unavailable
+        means: "The server exists but is deliberately refusing: overloaded, draining, in maintenance, or failing health checks."
+        layer: platform / capacity
+        causes:
+          - Autoscaler at max with a full queue; health check failing so the LB pulled every instance; platform maintenance mode; connection limits reached.
+        confirm: "Platform dashboard: instance count, health-check status, and whether YOU enabled maintenance mode and forgot."
+      - code: 504
+        name: Gateway Timeout
+        means: The proxy reached your app, but the app didn't answer within the timeout.
+        layer: app is ALIVE but SLOW — look one layer deeper
+        causes:
+          - A slow database query (missing index, lock wait); a third-party call with no timeout; an N+1 query loop; the proxy timeout (often 30–60s) shorter than real work needs.
+        confirm: "App logs show the request arriving and… nothing finishing. Check slow-query logs and in-flight third-party calls. 502 = dead app; 504 = stuck app."

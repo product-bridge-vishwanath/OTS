@@ -8,7 +8,7 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 
 ## Status
 
-Phase 1, build-order step 1 complete:
+Phase 1, build-order steps 1–2 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
 - **One complete template lesson** — `M8.6 The debugging method` at `/lessons/m08-l06` —
@@ -17,6 +17,12 @@ Phase 1, build-order step 1 complete:
   checklist, 5-question quiz).
 - `overview` / `operator` depth toggle (persisted), glossary hover terms, copyable code
   blocks, localStorage progress + quiz scores.
+- **Reference layer, fully written** (content as YAML in `/content/reference`, each page
+  searchable): command cheat sheet (43 commands by task, copyable), HTTP status codes
+  (27 codes with layer-to-suspect + how to confirm), failure catalogue (26 entries:
+  symptom → causes → confirm → fix), glossary (67 terms, also powering lesson hovers),
+  cloud concept map (18 concepts across AWS/GCP/Azure/PaaS), decision library index
+  (D1–D17 with honest defaults; full pages come with M11).
 - Phase 2 hooks: `scenario_ids` + `lab` frontmatter, `/content/scenarios/*.yaml` rendered
   read-only at `/scenarios`, Drizzle schema includes `scenario_attempts`.
 - Content lint: `npm run lint:content` (frontmatter schema, controlled vocabularies,
@@ -24,7 +30,7 @@ Phase 1, build-order step 1 complete:
 
 Not wired yet (deliberately): auth + server-side persistence (schema is ready in `/db`;
 progress lives in localStorage until a Postgres instance is chosen — see PLAN §7 open
-decisions), search, reference pages, demo repo.
+decisions), site-wide full-text search (each reference page has its own), demo repo.
 
 ## Run it
 
@@ -64,7 +70,5 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-2. Reference layer: command cheat sheet, status codes, failure catalogue, glossary page,
-   cloud map, decision index.
 3. Demo app with planted anti-patterns + break/load scripts.
 4. Content wave 1: M0, M1, rest of M8.

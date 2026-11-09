@@ -11,8 +11,15 @@
  */
 import {
   getAllLessons,
+  getCloudRows,
+  getCommandGroups,
   getConceptVocab,
+  getDecisions,
+  getFailures,
+  getGlossary,
+  getModules,
   getScenarios,
+  getStatusFamilies,
 } from "../lib/content";
 
 const PLATFORM_VOCAB = new Set([
@@ -91,6 +98,53 @@ for (const l of lessons) {
   seen.set(key, l.id);
 }
 
+// ---- reference layer ----
+const moduleIds = new Set(getModules().map((m) => m.id));
+
+const failures = getFailures();
+for (const f of failures) {
+  if (!moduleIds.has(f.module)) {
+    errors.push(`failure ${f.id}: module "${f.module}" does not exist`);
+  }
+  for (const c of f.concepts) {
+    if (!concepts.has(c)) {
+      errors.push(`failure ${f.id}: concept "${c}" is not in the vocabulary`);
+    }
+  }
+  for (const [field, v] of Object.entries({
+    symptom: f.symptom,
+    causes: f.causes,
+    confirm: f.confirm,
+    fix: f.fix,
+  })) {
+    if (!v || (Array.isArray(v) && v.length === 0)) {
+      errors.push(`failure ${f.id}: "${field}" is empty`);
+    }
+  }
+}
+
+const glossary = getGlossary();
+for (const [k, t] of Object.entries(glossary)) {
+  if (!t.name || !t.def) errors.push(`glossary "${k}": missing name or def`);
+}
+
+// Lessons may only hover-reference terms that exist.
+const termKeys = new Set(Object.keys(glossary));
+for (const l of lessons) {
+  for (const m of l.content.matchAll(/<Term k="([^"]+)"/g)) {
+    if (!termKeys.has(m[1])) {
+      errors.push(`${l.id}: <Term k="${m[1]}"> has no glossary entry`);
+    }
+  }
+}
+
+const commands = getCommandGroups().reduce((n, g) => n + g.commands.length, 0);
+const codes = getStatusFamilies().reduce((n, f) => n + f.codes.length, 0);
+const cloudRows = getCloudRows().length;
+const decisions = getDecisions().length;
+if (decisions !== 17) errors.push(`decision library has ${decisions} entries, expected 17 (D1–D17)`);
+if (failures.length < 25) errors.push(`failure catalogue has ${failures.length} entries, plan requires ~25`);
+
 if (errors.length) {
   console.error(`✗ content lint failed (${errors.length}):\n`);
   for (const e of errors) console.error("  -", e);
@@ -98,5 +152,7 @@ if (errors.length) {
 }
 
 console.log(
-  `✓ content lint passed: ${lessons.length} lesson(s), ${scenarioIds.size} scenario(s), ${concepts.size} concepts in vocab`
+  `✓ content lint passed: ${lessons.length} lesson(s), ${scenarioIds.size} scenario(s), ` +
+    `${failures.length} failures, ${commands} commands, ${codes} status codes, ` +
+    `${Object.keys(glossary).length} glossary terms, ${cloudRows} cloud rows, ${decisions} decisions`
 );

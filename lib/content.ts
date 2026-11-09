@@ -113,6 +113,94 @@ export function getConceptVocab(): string[] {
   return parsed.concepts;
 }
 
+// ---------- reference pages ----------
+
+export type CommandEntry = {
+  cmd: string;
+  does: string;
+  example: string;
+  note?: string;
+};
+export type CommandGroup = { title: string; commands: CommandEntry[] };
+
+export function getCommandGroups(): CommandGroup[] {
+  const raw = fs.readFileSync(
+    path.join(CONTENT_DIR, "reference", "commands.yaml"),
+    "utf8"
+  );
+  return (yaml.load(raw) as { groups: CommandGroup[] }).groups;
+}
+
+export type StatusCode = {
+  code: number;
+  name: string;
+  means: string;
+  layer: string;
+  causes: string[];
+  confirm: string;
+};
+export type StatusFamily = { family: string; note: string; codes: StatusCode[] };
+
+export function getStatusFamilies(): StatusFamily[] {
+  const raw = fs.readFileSync(
+    path.join(CONTENT_DIR, "reference", "status-codes.yaml"),
+    "utf8"
+  );
+  return (yaml.load(raw) as { families: StatusFamily[] }).families;
+}
+
+export type FailureEntry = {
+  id: string;
+  title: string;
+  module: string;
+  concepts: string[];
+  symptom: string;
+  causes: string[];
+  confirm: string[];
+  fix: string[];
+};
+
+export function getFailures(): FailureEntry[] {
+  const raw = fs.readFileSync(
+    path.join(CONTENT_DIR, "reference", "failures.yaml"),
+    "utf8"
+  );
+  return (yaml.load(raw) as { failures: FailureEntry[] }).failures;
+}
+
+export type CloudRow = {
+  concept: string;
+  what: string;
+  aws: string;
+  gcp: string;
+  azure: string;
+  paas: string;
+};
+
+export function getCloudRows(): CloudRow[] {
+  const raw = fs.readFileSync(
+    path.join(CONTENT_DIR, "reference", "cloud-map.yaml"),
+    "utf8"
+  );
+  return (yaml.load(raw) as { rows: CloudRow[] }).rows;
+}
+
+export type DecisionEntry = {
+  id: string;
+  title: string;
+  question: string;
+  options: string;
+  default: string;
+};
+
+export function getDecisions(): DecisionEntry[] {
+  const raw = fs.readFileSync(
+    path.join(CONTENT_DIR, "decisions", "decisions.yaml"),
+    "utf8"
+  );
+  return (yaml.load(raw) as { decisions: DecisionEntry[] }).decisions;
+}
+
 // ---------- scenarios (Phase 2 definitions, read-only in Phase 1) ----------
 
 export type ScenarioSummary = {
