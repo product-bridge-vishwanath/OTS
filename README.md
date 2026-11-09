@@ -8,7 +8,7 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 
 ## Status
 
-Phase 1, build-order steps 1–2 complete:
+Phase 1, build-order steps 1–3 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
 - **One complete template lesson** — `M8.6 The debugging method` at `/lessons/m08-l06` —
@@ -23,6 +23,14 @@ Phase 1, build-order steps 1–2 complete:
   symptom → causes → confirm → fix), glossary (67 terms, also powering lesson hovers),
   cloud concept map (18 concepts across AWS/GCP/Azure/PaaS), decision library index
   (D1–D17 with honest defaults; full pages come with M11).
+- **Demo app** (`/demo-app` — "Riverside Studios"): a real full-stack teaching app
+  (Next.js + Postgres + Redis + cron worker + webhook endpoint + AI assistant) that runs
+  with one command (`docker compose up --build`). It deliberately contains 9 planted
+  anti-patterns (double-booking race, single-cell jsonb notes with lost updates, no
+  indexes/FKs, non-idempotent webhooks, unlocked cron, stale cache, uncached LLM calls)
+  plus `scripts/break/*` and `scripts/load/*` to trigger each one — see
+  `demo-app/README.md` for the full map. These are drill material for the lessons and
+  Phase 2 scenarios.
 - Phase 2 hooks: `scenario_ids` + `lab` frontmatter, `/content/scenarios/*.yaml` rendered
   read-only at `/scenarios`, Drizzle schema includes `scenario_attempts`.
 - Content lint: `npm run lint:content` (frontmatter schema, controlled vocabularies,
@@ -70,5 +78,5 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-3. Demo app with planted anti-patterns + break/load scripts.
 4. Content wave 1: M0, M1, rest of M8.
+5. Content wave 2: M7, M6, M4, M5, M2.

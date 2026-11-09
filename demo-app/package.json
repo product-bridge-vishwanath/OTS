@@ -1,0 +1,27 @@
+{
+  "name": "riverside-studios",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Teaching app for Own the System. Deliberately contains planted anti-patterns — see README before 'fixing' anything.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "worker": "node worker/cron.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.70.0",
+    "ioredis": "^5.6.1",
+    "next": "^15.5.4",
+    "pg": "^8.16.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.0",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "typescript": "^5.8.3"
+  }
+}

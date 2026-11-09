@@ -1,0 +1,54 @@
+# One command runs the whole stack:   docker compose up --build
+# App:    http://localhost:3000
+# Health: http://localhost:3000/api/health
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ots
+      POSTGRES_PASSWORD: ots
+      POSTGRES_DB: demo
+    ports:
+      - "5432:5432" # exposed so psql and the break scripts work from your machine
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ots -d demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  cache:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://ots:ots@db:5432/demo
+      REDIS_URL: redis://cache:6379
+      POOL_MAX: "10"
+      # Optional — the assistant runs in offline mode without it.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+  worker:
+    build: .
+    command: ["node", "worker/cron.js"]
+    environment:
+      DATABASE_URL: postgres://ots:ots@db:5432/demo
+      REPORT_EVERY_MINUTES: "10"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  dbdata:

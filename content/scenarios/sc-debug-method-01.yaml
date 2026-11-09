@@ -8,7 +8,7 @@ environment:
   base: demo-app@v1
   breakage:
     - type: job
-      apply: scripts/break/connection-hungry-backfill.sql   # long-running backfill holding pool connections
+      apply: scripts/break/connection-hungry-backfill.js   # long-running backfill holding pool connections
     - type: traffic
       apply: scripts/load/steady-browse-and-order.js
 agent:
