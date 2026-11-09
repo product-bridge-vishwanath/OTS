@@ -1,0 +1,177 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #fafaf9;
+  --bg-raised: #ffffff;
+  --bg-inset: #f1f0ee;
+  --fg: #1c1b1a;
+  --fg-muted: #57534e;
+  --fg-faint: #a8a29e;
+  --border: #e4e2df;
+  --accent: #b45309;
+  --accent-soft: #fef3e2;
+  --good: #15803d;
+  --good-soft: #ecfdf3;
+  --bad: #b91c1c;
+  --bad-soft: #fef2f2;
+  --info: #1d4ed8;
+  --info-soft: #eff6ff;
+  --code-bg: #1c1b1a;
+  --code-fg: #e7e5e4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131211;
+    --bg-raised: #1c1b1a;
+    --bg-inset: #0d0c0b;
+    --fg: #e7e5e4;
+    --fg-muted: #a8a29e;
+    --fg-faint: #6b6560;
+    --border: #2e2c29;
+    --accent: #f59e0b;
+    --accent-soft: #2a2010;
+    --good: #4ade80;
+    --good-soft: #0d2017;
+    --bad: #f87171;
+    --bad-soft: #2a1414;
+    --info: #60a5fa;
+    --info-soft: #121a2a;
+    --code-bg: #0d0c0b;
+    --code-fg: #d6d3d1;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #131211;
+  --bg-raised: #1c1b1a;
+  --bg-inset: #0d0c0b;
+  --fg: #e7e5e4;
+  --fg-muted: #a8a29e;
+  --fg-faint: #6b6560;
+  --border: #2e2c29;
+  --accent: #f59e0b;
+  --accent-soft: #2a2010;
+  --good: #4ade80;
+  --good-soft: #0d2017;
+  --bad: #f87171;
+  --bad-soft: #2a1414;
+  --info: #60a5fa;
+  --info-soft: #121a2a;
+  --code-bg: #0d0c0b;
+  --code-fg: #d6d3d1;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-raised: var(--bg-raised);
+  --color-bg-inset: var(--bg-inset);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-faint: var(--fg-faint);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-good: var(--good);
+  --color-good-soft: var(--good-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-code-bg: var(--code-bg);
+  --color-code-fg: var(--code-fg);
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------- prose: article typography for MDX ------- */
+.prose {
+  max-width: 46rem;
+  line-height: 1.7;
+  font-size: 1.0rem;
+}
+.prose > * + * { margin-top: 1em; }
+.prose h2 { font-size: 1.35rem; font-weight: 700; margin-top: 2.2em; letter-spacing: -0.01em; }
+.prose h3 { font-size: 1.1rem; font-weight: 650; margin-top: 1.8em; }
+.prose h4 { font-size: 1rem; font-weight: 650; margin-top: 1.5em; }
+.prose a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.prose strong { font-weight: 650; }
+.prose ul { list-style: disc; padding-left: 1.4em; }
+.prose ol { list-style: decimal; padding-left: 1.4em; }
+.prose li { margin-top: 0.35em; }
+.prose blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 1em;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.prose code {
+  font-size: 0.875em;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+.prose pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  border-radius: 8px;
+  padding: 1em 1.2em;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+}
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  display: block;
+  overflow-x: auto;
+}
+.prose th, .prose td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+.prose th { background: var(--bg-inset); font-weight: 650; }
+.prose hr { border: none; border-top: 1px solid var(--border); margin: 2.5em 0; }
+
+/* ------- inline SVG diagrams (theme-aware) ------- */
+.diagram {
+  width: 100%;
+  height: auto;
+  margin: 1.5em 0;
+}
+.diagram rect {
+  fill: var(--bg-raised);
+  stroke: var(--border);
+  stroke-width: 1.5;
+}
+.diagram text {
+  fill: var(--fg);
+  font: 600 13px ui-sans-serif, system-ui, sans-serif;
+}
+.diagram text.sub {
+  fill: var(--fg-muted);
+  font-weight: 400;
+  font-size: 11px;
+}
+.diagram .arrow {
+  stroke: var(--fg-faint);
+  stroke-width: 1.5;
+  fill: none;
+}
+.diagram .arrowhead {
+  fill: var(--fg-faint);
+}

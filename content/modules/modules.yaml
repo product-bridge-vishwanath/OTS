@@ -1,0 +1,78 @@
+# Module registry. Order here is curriculum order.
+# `dir` is the folder under /content/modules that holds the lessons.
+modules:
+  - id: M0
+    dir: M00-map
+    title: Map your own product
+    tagline: Build the mental map everything else zooms into.
+    wave: 1
+  - id: M1
+    dir: M01-server
+    title: The server is just a computer
+    tagline: Demystify every command the agent ever made you run.
+    wave: 1
+  - id: M2
+    dir: M02-git-shipping
+    title: Git and shipping
+    tagline: Read diffs you didn't write. Deploy ≠ works.
+    wave: 2
+  - id: M3
+    dir: M03-docker
+    title: Docker and where code runs
+    tagline: Your PaaS is hiding this from you.
+    wave: 4
+  - id: M4
+    dir: M04-config-secrets
+    title: Config, secrets and keys
+    tagline: Leaked keys and exploding provider bills.
+    wave: 2
+  - id: M5
+    dir: M05-networking
+    title: "Networking: DNS, HTTP, TLS"
+    tagline: 502s, CORS, expired certs, DNS "propagation".
+    wave: 2
+  - id: M6
+    dir: M06-data
+    title: "Data: databases, cache, storage, queues"
+    tagline: The layer most vibe-coded apps get wrong.
+    wave: 2
+  - id: M7
+    dir: M07-concurrency
+    title: Concurrency, jobs and time
+    tagline: Cron, batches, locks, race conditions, many users writing at once.
+    wave: 2
+  - id: M8
+    dir: M08-observability
+    title: Observability and the debugging method
+    tagline: The core skill of the whole program.
+    wave: 1
+  - id: M9
+    dir: M09-scaling-cost
+    title: Scaling and cost
+    tagline: What breaks first at 10x, and what the bill says.
+    wave: 3
+  - id: M10
+    dir: M10-security
+    title: Security and abuse
+    tagline: Auth, OWASP, bots, and supply chain from agent-installed packages.
+    wave: 3
+  - id: M11
+    dir: M11-decisions
+    title: Choosing your stack (decision library)
+    tagline: SQL vs NoSQL, PaaS vs VM, build vs buy — and when to switch.
+    wave: 3
+  - id: M12
+    dir: M12-clouds
+    title: Clouds mapped to concepts
+    tagline: Same pieces, different names.
+    wave: 4
+  - id: M13
+    dir: M13-ai-systems
+    title: AI systems in production
+    tagline: Tokens, RAG, embeddings, cost, evals, agents.
+    wave: 3
+  - id: M14
+    dir: M14-operating
+    title: "Operating a product: incidents"
+    tagline: Rollback first, runbooks, comms, briefing an agent safely.
+    wave: 3

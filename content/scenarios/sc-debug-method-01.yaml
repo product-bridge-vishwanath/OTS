@@ -1,0 +1,43 @@
+id: sc-debug-method-01
+module: M8
+lesson: m08-l06
+title: "Orders API failing for a third of requests"
+difficulty: realistic
+symptom: "Since ~14:00, roughly 1 in 3 requests to /api/orders return a 500. Support tickets are coming in."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: job
+      apply: scripts/break/connection-hungry-backfill.sql   # long-running backfill holding pool connections
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+agent:
+  context: "You recently added retry logic elsewhere in this codebase and consider it a reliable pattern."
+  bias: "proposes retrying the failing endpoint before examining the database layer"
+  tools: [read, edit, shell]
+  denied: []
+evidence:
+  logs: true
+  metrics: [db.connections, db.pool.waiting, http.5xx]
+  db_console: true
+grading:
+  probes:
+    - orders-endpoint-health          # p95 < 1s, 0 5xx over 2 min of load
+    - backfill-still-completes        # the business job must not simply be deleted
+  root_cause_markers:
+    - backfill throttled or given a bounded connection budget
+    - pool starvation alerting added OR pool sizing corrected with rationale
+  symptom_only_markers:
+    - retry-wrapper-added-without-pool-change
+    - pool size raised with backfill left unbounded
+hints:
+  - "Which layer does the stack trace itself name?"
+  - "What do db.connections and db.pool.waiting do at 13:58? What started at 13:40?"
+  - "The web requests and the backfill are competing for the same thing. What is it?"
+  - "Reveal: the backfill starves the connection pool. Throttle/chunk it and bound its connections; retries only add demand."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

@@ -1,0 +1,325 @@
+---
+id: m08-l06
+module: M8
+title: "The debugging method: find the cause, not the symptom"
+order: 6
+difficulty: 2
+depth: both
+platforms: [vercel, render, railway, supabase, sentry, grafana, postgres]
+concepts: [debugging-method, layer-isolation, timeline-reconstruction, logs, failure-triage]
+prerequisites: []
+lab: self
+scenario_ids: [sc-debug-method-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+Friday, 6:40 pm. A founder ships a small copy change through her AI agent and goes to dinner. At 7:15 the first customer email arrives: *"checkout is broken."* She opens the site — it loads. She tries checkout — spinner, then an error page. She pastes the error into her agent. It confidently replaces the payment library call. Checkout is still broken. She pastes the new error. The agent adds a retry. Still broken, now slower. By 9 pm she has made four deploys, each one a guess, and checkout has been down for two hours.
+
+The actual cause: the 6:40 deploy picked up a new environment, and one variable — `STRIPE_WEBHOOK_SECRET` — wasn't set there. The first error message said so, on line 14 of the <Term k="stack-trace">stack trace</Term>. Nobody read line 14. The agent only ever saw the one line she pasted.
+
+Two hours of outage, zero of which were spent debugging. All of it was spent *guessing*.
+
+</Section>
+
+<Section kind="already-did">
+
+You have done some version of this: an error appears, you copy the last red line, paste it into the agent, and apply whatever it suggests. Sometimes that works — the agent is good at recognising common errors. But notice what you were actually doing: you were using the agent as a **slot machine**. Pull the lever, hope the fix comes out. When it works you learn nothing, and when it doesn't you pull again.
+
+What was missing isn't intelligence — the agent has plenty, and so do you. What was missing is a **method**: a fixed sequence that turns "it's broken" into "I know which layer it's in, what changed, and what evidence I have." Engineers who look like wizards during incidents aren't smarter. They just refuse to skip steps.
+
+This lesson is the method. Every other lesson in this module gives you the instruments (logs, metrics, traces); this one tells you the order in which to use them.
+
+</Section>
+
+<Section kind="mental-model">
+
+The method is eight steps. The first five are diagnosis, and you are not allowed to touch the fix until they're done.
+
+<svg viewBox="0 0 780 240" role="img" aria-label="The debugging method: reproduce, read the actual error, build a timeline, isolate the layer, ask what changed, fix the cause, confirm, write it down" className="diagram">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <rect x="8" y="18" width="175" height="62" rx="10" />
+  <text x="95" y="44" textAnchor="middle">1 · Reproduce</text>
+  <text x="95" y="63" textAnchor="middle" className="sub">see it fail yourself</text>
+  <rect x="203" y="18" width="175" height="62" rx="10" />
+  <text x="290" y="44" textAnchor="middle">2 · Read the error</text>
+  <text x="290" y="63" textAnchor="middle" className="sub">the whole thing</text>
+  <rect x="398" y="18" width="175" height="62" rx="10" />
+  <text x="485" y="44" textAnchor="middle">3 · Build a timeline</text>
+  <text x="485" y="63" textAnchor="middle" className="sub">when did it start?</text>
+  <rect x="593" y="18" width="175" height="62" rx="10" />
+  <text x="680" y="44" textAnchor="middle">4 · Isolate the layer</text>
+  <text x="680" y="63" textAnchor="middle" className="sub">client · net · app · data · 3rd&#8209;party</text>
+  <rect x="593" y="152" width="175" height="62" rx="10" />
+  <text x="680" y="178" textAnchor="middle">5 · What changed?</text>
+  <text x="680" y="197" textAnchor="middle" className="sub">deploys · config · data · traffic</text>
+  <rect x="398" y="152" width="175" height="62" rx="10" />
+  <text x="485" y="178" textAnchor="middle">6 · Fix the cause</text>
+  <text x="485" y="197" textAnchor="middle" className="sub">not the symptom</text>
+  <rect x="203" y="152" width="175" height="62" rx="10" />
+  <text x="290" y="178" textAnchor="middle">7 · Confirm</text>
+  <text x="290" y="197" textAnchor="middle" className="sub">same repro, now passing</text>
+  <rect x="8" y="152" width="175" height="62" rx="10" />
+  <text x="95" y="178" textAnchor="middle">8 · Write it down</text>
+  <text x="95" y="197" textAnchor="middle" className="sub">future-you says thanks</text>
+  <path d="M 183 49 L 199 49" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 378 49 L 394 49" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 573 49 L 589 49" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 680 80 L 680 148" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 589 183 L 577 183" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 394 183 L 382 183" className="arrow" markerEnd="url(#arr)" />
+  <path d="M 199 183 L 187 183" className="arrow" markerEnd="url(#arr)" />
+</svg>
+
+**The analogy.** A good doctor doesn't prescribe from the first word of your complaint. They take a history (*timeline*), examine you (*reproduce, read the evidence*), rule out systems one by one (*isolate the layer*), and ask what's new — travel, food, medication (*what changed?*). Prescribing on the first symptom is malpractice. It's malpractice in production too.
+
+### The steps
+
+1. **Reproduce.** Make it fail in front of you, ideally with one `curl` or one click. If you can't reproduce it, you can't confirm any fix — you can only re-deploy and pray. "Sometimes" failures get a frequency instead: *3 of 10 attempts fail*.
+2. **Read the actual error — all of it.** Not the toast in the UI, not the summary, not the last line. The real error in the logs, with its full <Term k="stack-trace">stack trace</Term>. The cause is usually stated in plain text and is routinely ignored: `ECONNREFUSED`, `relation "orders" does not exist`, `is not defined`. The UI shows the costume; the log shows the actor.
+3. **Build a timeline.** When did it *start*? Error trackers and log timestamps answer this precisely. "It started at 18:42" is the single most valuable fact you can collect, because step 5 lives or dies by it.
+4. **Isolate the layer.** Every request passes through the same five neighbourhoods: **client → network → app → data → third party**. Evidence tells you which one to search. You don't need to know *what* is broken yet — only *where*.
+5. **What changed?** Systems that worked yesterday don't break spontaneously. Something changed: a deploy, a config or env var, a dependency, the data (growth, a weird record), the traffic, or a third party's side. Cross-reference the change list against the timeline from step 3.
+6. **Fix the cause, not the symptom.** A retry around a failing call, a `try/catch` that swallows the error, a bigger timeout — these make dashboards greener while the disease spreads. The test: *can you explain, in one sentence, why the system failed and why this fix stops that mechanism?* If not, it's a patch.
+7. **Confirm.** Run the exact reproduction from step 1 and watch it pass. Then check you didn't break the neighbours (the surrounding pages, the logs staying quiet).
+8. **Write it down.** Three lines: symptom, cause, fix. This becomes your incident log, your runbook seed, and — in this program — your personal <Term k="rollback">failure catalogue</Term>.
+
+<Callout type="key">
+The order is the method. Diagnosis (1–5) before treatment (6–8), always. Every production horror story in this course is someone running step 6 first.
+</Callout>
+
+### Isolating the layer: what the evidence says
+
+| Evidence you see | Layer to search | Why |
+|---|---|---|
+| Error in the browser console, network tab shows **no request sent** | Client | The code in the browser failed before calling anyone |
+| Request sent, response is <Term k="five-oh-two">502</Term>/504 from the proxy | App (behind the <Term k="reverse-proxy">proxy</Term>) | The proxy is fine — its <Term k="upstream">upstream</Term> didn't answer |
+| Request sent, times out, *some* users affected by region | Network / DNS / CDN | The app never saw the request |
+| App logs show the request arriving, then a DB error | Data | The app is fine; its dependency refused |
+| App logs show a slow or failing call to `api.stripe.com` etc. | Third party | Check their status page *before* touching your code |
+| Started at the exact minute of a deploy | App (what shipped) | Timeline beats intuition |
+
+<Operator>
+
+The five questions, as commands. Run them top to bottom and the layer falls out:
+
+```bash
+# Is it reachable at all? (network vs app)
+curl -sv https://yourapp.com/api/health -o /dev/null
+
+# What does the edge say vs the app itself? (proxy vs upstream)
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" https://yourapp.com/api/checkout
+
+# What is the app actually logging right now?
+#   PaaS: open the log tab, or stream:
+vercel logs --follow        # Vercel
+railway logs                # Railway
+#   VPS / systemd:
+journalctl -u myapp -S "18:30" --no-pager | tail -50
+#   Docker:
+docker logs --since 30m myapp 2>&1 | grep -iE "error|fatal" | tail -20
+
+# When did it start? (timeline)
+journalctl -u myapp --no-pager | grep -i error | head -5   # first occurrence, not last
+
+# What changed? (deploys + config)
+git log --oneline --since="6 hours ago"
+vercel ls   # or your platform's deploy history, next to the env-var change log
+```
+
+Habit worth stealing: find the **first** error in the window, not the most recent. Later errors are usually fallout from the first one.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+The method is tool-independent — these just make steps 2–3 faster. You met most of them earlier in this module.
+
+| Tool | What it gives the method | Step it accelerates | Typical setup |
+|---|---|---|---|
+| Platform log tab (Vercel / Render / Railway) | The actual error text, zero setup | 2 · Read the error | Built in |
+| Sentry (error tracking) | First-seen time, frequency, full stack trace, release that introduced it | 2 & 3 & 5 | One SDK line |
+| Grafana / platform metrics | "When did latency/errors jump?" as a picture | 3 · Timeline | Dashboards per service |
+| `curl -v` | Layer isolation from your own terminal | 4 · Isolate | Nothing |
+| Deploy history + env-var audit log | The change list | 5 · What changed | Built into your platform |
+
+What good looks like: when something breaks, you can get from symptom to *layer + timeline* in under ten minutes using only the tools above. If any step needs a tool you don't have (no error tracker, no deploy history), that's a gap to close this week, not during the next incident.
+
+</Section>
+
+<Section kind="hands-on">
+
+Do this on a product you actually run (or the demo repo if you prefer).
+
+1. **Break it on purpose.** In a non-production environment, rename one required environment variable (e.g. `DATABASE_URL` → `DATABASE_URL_X`) and restart/redeploy.
+2. **Run the method, writing each step down as you go:**
+   - Reproduce: which URL or action fails? What exactly do you see?
+   - Read: find the *full* error in the logs — not the browser. Copy the line that names the cause.
+   - Timeline: find the first occurrence timestamp.
+   - Layer: which of the five layers is it in, and which single piece of evidence told you?
+   - What changed: your own change, found via the platform's deploy/config history — *pretend you don't remember doing it* and locate the change the way you'd have to in a real incident.
+3. **Fix it, confirm with the same reproduction, and write the three-line writeup**: symptom / cause / fix.
+4. Put the writeup somewhere permanent. That's entry #1 of your personal failure catalogue.
+
+The exercise feels artificial exactly once. The first real incident after it will not.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** since about 14:00, roughly a third of requests to `/api/orders` return a 500. The rest are fine. The AI agent, shown one error message, has proposed "adding retry logic to the orders endpoint." Before you let it: run the method on the evidence below.
+
+<Evidence title="app logs (excerpt, 14:02–14:04)">
+
+```text
+14:02:11 INFO  req_8f21 GET /api/orders 200 212ms
+14:02:14 INFO  req_8f22 GET /api/orders 200 198ms
+14:02:19 ERROR req_8f25 GET /api/orders 500 30004ms
+  Error: Connection terminated due to connection timeout
+      at Connection.<anonymous> (node_modules/pg/lib/client.js:132)
+      at Timeout._onTimeout (node_modules/pg-pool/index.js:45)
+14:02:23 INFO  req_8f26 GET /api/orders 200 201ms
+14:02:31 ERROR req_8f29 GET /api/orders 500 30001ms
+  Error: Connection terminated due to connection timeout
+      at Connection.<anonymous> (node_modules/pg/lib/client.js:132)
+14:02:40 INFO  req_8f2b GET /api/orders 200 189ms
+```
+
+</Evidence>
+
+<Evidence title="metrics panel">
+
+```text
+http.5xx            flat at ~0 until 13:58, then ~33% of /api/orders requests
+db.connections      steady climb from 13:40, flat-lines at 60 from 13:58
+db.pool.waiting     0 until 13:58, then sawtooth 5–12
+deploys             none today
+cron                13:40  monthly-invoice-backfill  STARTED (still running)
+```
+
+</Evidence>
+
+Work the steps: the error names its layer in plain text. The timeline has a sharp corner at 13:58 and an event at 13:40. There was no deploy. What changed?
+
+<Reveal label="Reveal the cause — after you've committed to an answer">
+
+**Layer:** data. The stack trace says so twice — `pg` and `pg-pool` are the Postgres client and its <Term k="connection-pool">connection pool</Term>. The app is healthy; it's waiting for a database connection that never arrives.
+
+**Timeline:** errors start at 13:58. `db.connections` flat-lines at exactly 60 — the pool's ceiling — at the same moment. The climb started at 13:40.
+
+**What changed at 13:40:** the `monthly-invoice-backfill` cron started, and it's still running. It has been steadily taking database connections and not releasing them fast enough. At 13:58 it had starved the pool: now any web request that can't grab a connection waits 30 seconds and dies. Two out of three requests sneak in when a connection frees up — which is why the failure is intermittent.
+
+**Why "add retry logic" is the wrong fix:** retries would add *more* demand for connections to a starved pool — the same mechanism, made worse, plus hidden latency. It treats the symptom (a request failed) while feeding the cause (connection exhaustion). The agent wasn't wrong about the error; it was answering with one line of context instead of the timeline you now have.
+
+**Cause-level fixes:** stop or throttle the backfill now (mitigation), then make it use a small dedicated connection budget and process in chunks (M7 covers this pattern), and alert on `db.pool.waiting > 0`.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+The method changes *how you brief the agent*: you hand it evidence and a layer, not a lone error line, and you verify against the reproduction.
+
+<AgentTask prompt={"Production incident. Evidence: [paste the FULL stack trace, the first-occurrence timestamp, and the deploy/config history around it]. Based on this evidence only, which layer is failing — client, network, app, data, or third party — and what are the top 2 candidate causes? Do not propose a fix yet."}>
+A good answer names the layer **and cites which line of your evidence says so**. If it proposes a fix anyway, or its layer contradicts the stack trace, push back — you've caught it pattern-matching.
+</AgentTask>
+
+<AgentTask prompt={"Here is the cause we identified: [cause]. Propose the smallest fix that addresses this mechanism, and tell me: (1) exactly which files you will change, (2) what could break as a side effect, (3) the command or request I can run to confirm the fix."}>
+Before applying anything, read the diff: does it touch only the files it named? Then run its step (3) yourself — and also re-run **your own** reproduction from step 1. If the agent's confirmation and yours disagree, yours wins.
+</AgentTask>
+
+<AgentTask prompt={"Review this fix you just made: does it address the cause or suppress the symptom? Explain the failure mechanism in one sentence and why this change stops it. If you cannot, say so."}>
+This is the one-sentence test from the mental model, turned on the agent. A real cause-fix survives this question; a patch produces a paragraph of hedging. Watch for the smell words: "should help", "adds resilience", "handles the edge case gracefully".
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Questions to ask (yourself, your agent, or your engineer) during any incident:
+
+- "What is the reproduction?" — if nobody can state it, you're guessing.
+- "What does the **first** error in the logs say, in full?"
+- "When exactly did it start, and what changed within an hour of that?"
+- "Which layer, and which evidence says so?"
+- "Does this fix stop the mechanism, or hide the signal?" — demand the one-sentence explanation.
+- "How do we know it's fixed?" — the answer must be the reproduction passing, not "the errors stopped."
+
+What good looks like on a team (or a one-person company): every incident produces a three-line writeup; nobody deploys a fix they can't explain; "let's add a retry" is a decision made *after* the cause is known, never instead of knowing it.
+
+Red flag you can now catch in anyone — human, agent, or vendor support: a fix proposed before a layer is named.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l06"
+  questions={[
+    {
+      q: "Checkout is failing. Your agent reads the error you pasted and immediately proposes swapping the payment library. According to the method, what's wrong with this moment?",
+      options: [
+        "Nothing — the agent recognised the error, and speed matters in an incident",
+        "Treatment is being proposed before diagnosis: no reproduction, no full error, no timeline, no layer",
+        "The agent should have proposed a retry first, which is lower-risk than a library swap",
+        "Libraries should never be swapped during an incident"
+      ],
+      answer: 1,
+      explain: "The method's one rule: steps 1–5 (diagnose) before step 6 (fix). A proposal that arrives before a layer is named is a guess, however confident it sounds."
+    },
+    {
+      q: "Requests to your API return 502 from the platform's edge. The browser's network tab shows the request was sent. Which layer do you search first?",
+      options: [
+        "Client — the browser triggered the error",
+        "Network/DNS — 5xx errors are connectivity problems",
+        "The app behind the proxy — a 502 means the proxy's upstream gave a broken or no response",
+        "Third party — 502s usually come from external APIs"
+      ],
+      answer: 2,
+      explain: "A 502 is the reverse proxy saying 'I'm fine, but the thing behind me didn't answer properly.' The request made it through client and network; the app (crashed, not listening, wrong port) is where to look."
+    },
+    {
+      q: "Why does the method insist on finding the FIRST error in the time window rather than the most recent one?",
+      options: [
+        "Older log entries are more detailed than newer ones",
+        "Later errors are often fallout from the first failure, so the first one points at the cause",
+        "Log retention means early errors will be deleted soon",
+        "The first error is always in the data layer"
+      ],
+      answer: 1,
+      explain: "Failures cascade: one starved connection pool produces hundreds of downstream errors that all look different. The earliest error sits closest to the mechanism."
+    },
+    {
+      q: "In the break-fix, why was 'add retry logic to the orders endpoint' a symptom patch rather than a cause fix?",
+      options: [
+        "Retries are always bad practice in production systems",
+        "The endpoint was fine — retrying would add demand to an exhausted connection pool, feeding the actual mechanism",
+        "Retry logic belongs in the database, not the app",
+        "It was proposed by an AI agent, so it can't address the cause"
+      ],
+      answer: 1,
+      explain: "The mechanism was connection starvation from a long-running backfill. Retries create more connection demand — greener-looking at first, worse underneath. (Retries are a fine tool elsewhere — M7 covers where.)"
+    },
+    {
+      q: "Your agent applied a fix and says the error is gone. What does the method require before you consider the incident resolved?",
+      options: [
+        "Run your own original reproduction and watch it pass, check nothing nearby broke, then write down symptom/cause/fix",
+        "Wait 24 hours of clean dashboards, then close it",
+        "Ask the agent to write tests for the affected code",
+        "Roll back anyway, since agent fixes need human re-implementation"
+      ],
+      answer: 0,
+      explain: "Confirm (step 7) means the exact reproduction from step 1 now passes — verified by you, not reported by the agent — plus a check for side effects. Then step 8: the three-line writeup."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,40 @@
+# Site-wide glossary. Terms get hover definitions anywhere a lesson uses
+# <Term k="slug">displayed text</Term>. Keep definitions to one or two
+# sentences, plain language, no circular definitions.
+terms:
+  stack-trace:
+    name: Stack trace
+    def: The list of function calls that were active when an error happened, printed innermost first. The top lines of it tell you the exact file and line where things went wrong.
+  reverse-proxy:
+    name: Reverse proxy
+    def: A server that sits in front of your app and forwards requests to it — handling TLS, routing, and buffering. Nginx, Caddy, and your PaaS's edge are all reverse proxies.
+  upstream:
+    name: Upstream
+    def: From a proxy's point of view, the server it forwards requests to — your app. "Upstream timed out" means the proxy gave up waiting for your app to answer.
+  correlation-id:
+    name: Correlation ID
+    def: A unique ID attached to a request and carried through every service and log line it touches, so you can follow one user's request across the whole system.
+  connection-pool:
+    name: Connection pool
+    def: A kept-alive set of database connections that requests borrow and return, because opening a fresh connection per request is slow and databases cap how many they allow.
+  oom:
+    name: OOM (out of memory)
+    def: The operating system killing a process because it asked for more memory than the machine (or its container limit) has. Shows up as a process that vanishes without an error from your code.
+  crash-loop:
+    name: Crash loop
+    def: A process that dies on startup, gets restarted by its supervisor, and dies again — forever. The restart hides the crash unless you read the logs from the first seconds of a start.
+  p95:
+    name: p95
+    def: The latency that 95% of requests beat. Averages hide pain; percentiles show what your slowest real users experience.
+  rollback:
+    name: Rollback
+    def: Putting the previous known-good version back into production. It is the first fix in an incident because it restores service without you yet knowing the cause.
+  idempotent:
+    name: Idempotent
+    def: An operation that is safe to run twice — doing it again changes nothing. Retries and replayed webhooks make this a survival property, not a nicety.
+  env-var:
+    name: Environment variable
+    def: A named value handed to a process at start (like DATABASE_URL). Each environment sets its own values, which is how the same code talks to different databases in dev and prod.
+  five-oh-two:
+    name: "502 Bad Gateway"
+    def: The proxy reached out to your app and got a broken or no response — the app is down, crashed mid-request, or not listening on the expected port. The problem is behind the proxy.

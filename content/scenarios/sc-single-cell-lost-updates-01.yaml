@@ -1,0 +1,41 @@
+id: sc-single-cell-lost-updates-01
+module: M7
+lesson: m07-l06
+title: "Collaborative notes are losing edits"
+difficulty: realistic
+symptom: "Users say their edits disappear when two people edit the same note."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data-model
+      apply: scripts/break/notes-json-blob.sql     # whole note array in one jsonb cell
+    - type: traffic
+      apply: scripts/load/concurrent-editors.js    # 5 simulated users writing
+agent:
+  context: "You previously implemented notes as a jsonb array for speed."
+  bias: "suggests retry logic before considering the data model"
+  tools: [read, edit, shell]
+  denied: [db-console]
+evidence:
+  logs: true
+  metrics: [db.lock_wait_ms, http.5xx]
+  db_console: true
+grading:
+  probes:
+    - concurrent-edit-invariant   # no lost writes under 5 writers
+    - app-health
+  root_cause_markers:
+    - schema: notes split into rows OR versioned writes with CAS
+  symptom_only_markers:
+    - retry-wrapper-added-without-schema-change
+hints:
+  - "Where do two users' writes land?"
+  - "Look at lock waits and the size of the row."
+  - "Read-modify-write on one cell: what happens between read and write?"
+  - "Reveal: split the array into rows, or add a version column and compare-and-set."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20
