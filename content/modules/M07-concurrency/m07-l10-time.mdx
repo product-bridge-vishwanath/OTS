@@ -1,0 +1,508 @@
+---
+id: m07-l10
+module: M7
+title: "Time itself: UTC, timezones, DST and clock skew"
+order: 10
+difficulty: 2
+depth: both
+platforms: [postgres, vercel, render, docker]
+concepts: [time, cron, env-vars]
+prerequisites: [m07-l08]
+lab: demo-repo
+scenario_ids: [sc-dst-shift-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A booking platform in London added a Sydney studio. Within a week, three Australian customers arrived to locked doors — their 09:00 bookings had been recorded as 09:00 London time, 19:00 in Sydney.
+
+The team fixed it by storing a timezone per studio. Reasonable, and incomplete. Two months later, on the last Sunday in October, every booking in their daily report shifted by an hour, and two customers were double-booked into the same slot — because the UK's clocks went back, 01:00–02:00 happened twice, and their "hours since midnight" arithmetic had been computed in local time.
+
+Four months after that, a customer's payment failed with `token expired` on a freshly-issued token, intermittently, for one afternoon. One of their servers had drifted 94 seconds ahead after an NTP misconfiguration.
+
+Three incidents, three different mechanisms, one root cause: **time had been treated as a number instead of as a thing with rules.**
+
+</Section>
+
+<Section kind="already-did">
+
+You have stored a date and had it come back a day earlier. You've seen `2026-11-10T00:00:00.000Z` in an API response and wondered whose midnight that was. You've written `new Date()` and `now()` interchangeably without checking whether they agreed.
+
+And if you worked through M1.5's break-fix, you've already met the worst version: a `TZ` variable set on one service and not another, producing reports for the wrong day with no error anywhere. That lesson diagnosed it as an environment-divergence problem. This one is about the time rules underneath it.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The one rule
+
+<Callout type="key">
+**Store and compute in <Term k="utc">UTC</Term>. Convert to local time only at the moment of display, using the relevant timezone *name*.** Every bug in the story is a violation of this sentence. UTC has no daylight saving, so every instant occurs exactly once and arithmetic on it is always valid.
+</Callout>
+
+### A timestamp and a date are different kinds of thing
+
+This distinction causes more confusion than any other:
+
+| Kind | Means | Postgres type | Example |
+|---|---|---|---|
+| **An instant** | A specific moment, the same for everyone | `timestamptz` | "the payment succeeded" |
+| **A local date/time** | Wall-clock digits with no absolute meaning | `date`, `time`, `timestamp` | "the studio opens at 09:00" |
+
+"Mara booked Studio A for 10:00 on 12 March" is **not** an instant — it's a local wall-clock intention, and it means a different absolute moment in London than in Sydney. The demo app stores `date` plus `start_hour` integers for precisely this reason, which is a defensible design: it records what a human agreed to.
+
+The error is mixing them. If you store an instant and display it as a local date without converting, or store a local date and treat it as an instant, you get the off-by-one-day bugs.
+
+### `timestamptz` vs `timestamp` in Postgres
+
+A naming trap worth knowing: **`timestamptz` does not store a timezone.** It stores an absolute instant (normalised to UTC) and renders it in the session's timezone on read. `timestamp` (without tz) stores digits and does no conversion at all — which means two services in different timezones writing "now" to a `timestamp` column produce values that cannot be compared.
+
+**Use `timestamptz` for every instant.** There is almost no reason to use plain `timestamp`.
+
+```sql
+SHOW timezone;                      -- the session's display timezone
+SELECT now();                       -- an instant, rendered in session tz
+SELECT now() AT TIME ZONE 'UTC';    -- the same instant as UTC digits
+SELECT now() AT TIME ZONE 'Australia/Sydney';   -- the same instant, Sydney digits
+```
+
+### <Term k="dst">DST</Term>: the two days a year that break everything
+
+In regions with daylight saving, twice a year local time is not a continuous line:
+
+- **Autumn (clocks back):** 01:00–02:00 happens **twice**. A job scheduled at 01:30 local runs twice (L7.8's break-fix). A duration computed across it is an hour wrong.
+- **Spring (clocks forward):** 02:00–03:00 **never happens**. A job scheduled at 02:30 local never runs. A date like "2026-03-29 02:30" in that zone is *not a valid instant* — some libraries throw, some silently shift it.
+
+<svg viewBox="0 0 780 250" role="img" aria-label="Local time is not continuous: in autumn the hour from one to two repeats, and in spring it is skipped entirely, while UTC runs straight through both" className="diagram">
+  <text x="12" y="20" className="sub">AUTUMN — clocks go back: the local hour 01:00–02:00 happens TWICE</text>
+  <text x="12" y="46" className="sub">UTC</text>
+  <rect x="70" y="30" width="110" height="26" rx="4" />
+  <text x="125" y="48" textAnchor="middle" className="sub">00:00</text>
+  <rect x="186" y="30" width="110" height="26" rx="4" />
+  <text x="241" y="48" textAnchor="middle" className="sub">01:00</text>
+  <rect x="302" y="30" width="110" height="26" rx="4" />
+  <text x="357" y="48" textAnchor="middle" className="sub">02:00</text>
+  <text x="12" y="86" className="sub">local</text>
+  <rect x="70" y="70" width="110" height="26" rx="4" />
+  <text x="125" y="88" textAnchor="middle" className="sub">01:00 BST</text>
+  <rect x="186" y="70" width="110" height="26" rx="4" />
+  <text x="241" y="88" textAnchor="middle" className="sub">01:00 GMT ←again</text>
+  <rect x="302" y="70" width="110" height="26" rx="4" />
+  <text x="357" y="88" textAnchor="middle" className="sub">02:00</text>
+  <text x="430" y="88" className="sub">a job at 01:30 local runs twice</text>
+
+  <text x="12" y="134" className="sub">SPRING — clocks go forward: the local hour 02:00–03:00 NEVER HAPPENS</text>
+  <text x="12" y="160" className="sub">UTC</text>
+  <rect x="70" y="144" width="110" height="26" rx="4" />
+  <text x="125" y="162" textAnchor="middle" className="sub">00:00</text>
+  <rect x="186" y="144" width="110" height="26" rx="4" />
+  <text x="241" y="162" textAnchor="middle" className="sub">01:00</text>
+  <rect x="302" y="144" width="110" height="26" rx="4" />
+  <text x="357" y="162" textAnchor="middle" className="sub">02:00</text>
+  <text x="12" y="200" className="sub">local</text>
+  <rect x="70" y="184" width="110" height="26" rx="4" />
+  <text x="125" y="202" textAnchor="middle" className="sub">00:00 GMT</text>
+  <rect x="186" y="184" width="110" height="26" rx="4" />
+  <text x="241" y="202" textAnchor="middle" className="sub">02:00 BST ←skipped 01</text>
+  <rect x="302" y="184" width="110" height="26" rx="4" />
+  <text x="357" y="202" textAnchor="middle" className="sub">03:00</text>
+  <text x="430" y="202" className="sub">a job at 01:30 local never runs</text>
+
+  <text x="12" y="238" className="sub">UTC is continuous through both. That is the entire argument for storing and scheduling in it.</text>
+</svg>
+
+Consequences worth naming:
+
+- **"Midnight" is ambiguous** on those days, so "bookings for today" can cover 23 or 25 hours.
+- **Adding 24 hours is not the same as adding a day.** `now() + interval '1 day'` in Postgres is DST-aware when the session timezone is set; `Date.now() + 86400000` in JavaScript is not.
+- **Never store a timezone as an offset.** `+01:00` is only true for part of the year; `Europe/London` is true always. Offsets are a rendering of a zone at an instant, not a substitute for it.
+
+### Clock skew
+
+Servers' clocks drift. When they do:
+
+- **JWTs and OAuth tokens fail** — `exp`/`nbf` are absolute times, so a server 94 seconds ahead rejects freshly-issued tokens as expired.
+- **Webhook signatures fail** — most providers include a timestamp and reject anything outside a tolerance window (Stripe: 5 minutes).
+- **Logs across services can't be ordered**, making incident timelines wrong in a way that misleads you (L8.2).
+
+The fix is NTP, enabled and verified (`timedatectl`), plus a small leeway in token verification. Managed platforms handle this; your VPS is your responsibility.
+
+### Where time goes wrong in each layer
+
+| Layer | Trap |
+|---|---|
+| Browser | `new Date()` uses the *user's* timezone — fine for display, wrong for computing business days |
+| App process | `TZ` env var changes what `new Date()` renders; a per-service divergence is invisible (M1.5) |
+| Database | Session `timezone` affects rendering and `CURRENT_DATE`; the *server's* default may differ from your app's |
+| Cron | Platform crons are UTC; system crontab is machine-local, hence the DST double-run |
+| Third parties | Each has its own convention; Stripe uses Unix seconds, others ISO strings with offsets |
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── 1. Do all your components agree on the time? ─────────────────────
+docker compose exec -T app sh -c 'date -u; echo "TZ=${TZ:-unset}"'
+docker compose exec -T worker sh -c 'date -u; echo "TZ=${TZ:-unset}"'
+docker compose exec -T db psql -U ots -d demo -c "SHOW timezone; SELECT now(), CURRENT_DATE;"
+date -u
+#   All four should agree on the UTC instant. Any TZ override is a divergence
+#   you must reason about (this is M1.5's break-fix mechanism).
+
+# ── 2. timestamptz vs timestamp: the comparison trap ─────────────────
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+CREATE TABLE IF NOT EXISTS tz_demo (
+  label text, as_tz timestamptz, as_plain timestamp);
+TRUNCATE tz_demo;
+SET timezone='Europe/London';
+INSERT INTO tz_demo VALUES ('written in London', now(), now());
+SET timezone='Australia/Sydney';
+INSERT INTO tz_demo VALUES ('written in Sydney', now(), now());
+SET timezone='UTC';
+SELECT label, as_tz, as_plain FROM tz_demo;
+SELECT 'tz difference (correct)' AS what, (max(as_tz)-min(as_tz)) AS diff FROM tz_demo
+UNION ALL
+SELECT 'plain difference (wrong)', (max(as_plain)-min(as_plain)) FROM tz_demo;
+SQL
+#   The timestamptz values are seconds apart (they are the same moment).
+#   The plain timestamp values differ by ~11 hours — the digits were stored
+#   as written, so they cannot be compared across sessions.
+
+# ── 3. DST: prove the hour that happens twice, and the one that doesn't ─
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+-- Autumn: 01:30 London occurs twice (BST then GMT)
+SELECT '2026-10-25 01:30:00 BST'::timestamptz AS first_pass,
+       '2026-10-25 01:30:00 GMT'::timestamptz AS second_pass,
+       '2026-10-25 01:30:00 GMT'::timestamptz
+         - '2026-10-25 01:30:00 BST'::timestamptz AS apart;
+-- Spring: 02:30 London does not exist on 29 March 2026
+SELECT timezone('Europe/London', '2026-03-29 02:30:00'::timestamp) AS nonexistent_local;
+-- A "day" is not always 24 hours
+SET timezone='Europe/London';
+SELECT '2026-10-25 00:00'::timestamptz + interval '1 day'  AS plus_one_day,
+       '2026-10-25 00:00'::timestamptz + interval '24 hours' AS plus_24_hours;
+SET timezone='UTC';
+SQL
+#   plus_one_day and plus_24_hours DIFFER across the DST boundary.
+
+# ── 4. "Today" depends on who is asking ─────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT 'UTC' AS zone, (now() AT TIME ZONE 'UTC')::date AS today
+  UNION ALL SELECT 'Europe/London', (now() AT TIME ZONE 'Europe/London')::date
+  UNION ALL SELECT 'Australia/Sydney', (now() AT TIME ZONE 'Australia/Sydney')::date
+  UNION ALL SELECT 'America/Los_Angeles', (now() AT TIME ZONE 'America/Los_Angeles')::date;"
+#   Several different dates for the same instant. A report for "today"
+#   must say WHOSE today — this is M1.5's empty-report bug.
+
+# ── 5. The demo app's own date handling ─────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT column_name, data_type FROM information_schema.columns
+   WHERE table_name='bookings' ORDER BY ordinal_position;"
+#   date + integer hours = a local wall-clock intention (defensible),
+#   created_at as timestamptz = an instant (correct).
+#   What's missing: a timezone per room, needed the moment you add a
+#   studio in another city.
+
+# ── 6. Clock skew check ─────────────────────────────────────────────
+docker compose exec -T app sh -c 'date +%s' | xargs echo "app epoch:"
+date +%s | xargs echo "host epoch:"
+#   More than a second or two apart is a problem for tokens and signatures.
+#   On a VPS: timedatectl | grep -iE "synchronized|NTP"
+
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE IF EXISTS tz_demo;" >/dev/null
+```
+
+Block 2 is the one to run if you remember nothing else: the same moment, written from two sessions, comparable as `timestamptz` and 11 hours apart as `timestamp`.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Store an instant | Postgres `timestamptz`; never plain `timestamp` |
+| Store a local intention | `date` + `time`, plus a **timezone name** column |
+| Timezone-correct arithmetic in JS | **Temporal** (now shipping) or `date-fns-tz` / Luxon. Avoid raw `Date` maths |
+| Format for a user | `Intl.DateTimeFormat` with the user's timezone |
+| Zone data | IANA names (`Europe/London`), never offsets |
+| Verify server clocks | `timedatectl`, `chronyc tracking` |
+| Schedule reliably | UTC, always (`CRON_TZ=UTC`) |
+| Test DST behaviour | Run tests with `TZ=Pacific/Chatham` or `America/Santiago` — unusual offsets expose assumptions |
+
+The modern JavaScript answer is worth knowing because it removes a whole class of bug:
+
+```ts
+// Temporal distinguishes the kinds of time in its type system.
+const instant  = Temporal.Now.instant();                      // absolute moment
+const zoned    = instant.toZonedDateTimeISO("Australia/Sydney");
+const plainDay = Temporal.PlainDate.from("2026-03-12");        // a date, no instant
+
+// DST-aware: adding a day is not adding 24 hours.
+zoned.add({ days: 1 });
+```
+
+If you're on raw `Date`, the two rules that prevent most damage: never do arithmetic by adding milliseconds across a day boundary, and never build a date from string parts without stating the zone.
+
+And a testing habit that catches real bugs cheaply: **run your test suite with an exotic `TZ`**. `TZ=Pacific/Chatham` (+12:45) and `TZ=America/Santiago` (southern-hemisphere DST) break code that assumes whole-hour offsets or northern DST dates.
+
+What good looks like: every instant is `timestamptz`; every local intention carries an IANA timezone name; all schedules are UTC; no code adds 86400000 to a timestamp; and your tests pass under a non-UTC, non-whole-hour timezone.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Check for divergence** (Operator block 1). All four components should agree. This is the check that would have caught M1.5's break-fix in seconds.
+
+2. **Run the `timestamptz` vs `timestamp` comparison** (block 2). The 11-hour discrepancy in the plain column is the single most convincing demonstration in this lesson.
+
+3. **Prove DST's two anomalies** (block 3): the hour that happens twice, the local time that doesn't exist, and `+1 day` ≠ `+24 hours`.
+
+4. **See that "today" is ambiguous** (block 4). Four zones, different dates, same instant. Then re-read what the demo app's worker does: `WHERE b.date = CURRENT_DATE`. Whose today is that, and what should it be?
+
+5. **Reproduce the M1.5 bug deliberately**, now that you know the mechanism. Add `TZ: "Australia/Sydney"` to the worker in `compose.yaml`, recreate it, and compare:
+   ```bash
+   docker compose up -d --force-recreate worker
+   docker compose exec -T worker sh -c 'date; date -u'
+   docker compose exec -T db psql -U ots -d demo -c "SELECT CURRENT_DATE;"
+   ```
+   The worker now believes it's a different day from the database. Remove the override and recreate.
+
+6. **Fix the demo app for a second city.** Add a timezone to rooms and make "today's bookings" explicit about whose day it is:
+   ```sql
+   ALTER TABLE rooms ADD COLUMN IF NOT EXISTS timezone text NOT NULL DEFAULT 'Europe/London';
+   UPDATE rooms SET timezone='Australia/Sydney' WHERE id=4;
+   -- "today" per room, rather than per database session:
+   SELECT r.name, r.timezone, (now() AT TIME ZONE r.timezone)::date AS local_today
+     FROM rooms r;
+   ```
+   Then decide: should the report cover the studio's local day or the company's? That's a product question the code must answer explicitly.
+
+7. **Check for clock skew** (block 6).
+
+8. **Clean up:**
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "ALTER TABLE rooms DROP COLUMN IF EXISTS timezone; DROP TABLE IF EXISTS tz_demo;"
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A fitness studio platform runs a job that cancels unpaid bookings 24 hours before the class. On 29 March, 61 customers had confirmed, paid bookings cancelled. On 25 October, a different 48 customers were charged a late-cancellation fee twice.
+
+<Evidence title="the cancellation job">
+
+```ts
+// Runs hourly: cancel unpaid bookings for classes starting in <24h
+const cutoff = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+const due = await db.query(
+  `SELECT id, customer_id, starts_at FROM bookings
+    WHERE status='unpaid' AND starts_at < $1`, [cutoff]);
+
+for (const b of due.rows) {
+  await db.query("UPDATE bookings SET status='cancelled' WHERE id=$1", [b.id]);
+  await chargeLateFee(b.customer_id);          // no idempotency key
+}
+```
+
+</Evidence>
+
+<Evidence title="the schema and the schedule">
+
+```text
+bookings(
+  id serial, customer_id int,
+  starts_at timestamp,              -- ← note: NOT timestamptz
+  status text, ...
+)
+
+# crontab on the app server (Europe/London)
+0 * * * *  app  /srv/app/bin/cancel-unpaid.sh
+
+Server: single VPS, Europe/London, NTP synced
+Postgres: SHOW timezone → 'Europe/London'
+App process: TZ unset (inherits Europe/London)
+
+Booking creation path (web form):
+  starts_at written as: new Date(`${date}T${time}:00`)   // local, no zone
+```
+
+</Evidence>
+
+<Evidence title="the two incidents">
+
+```text
+29 March 2026 (clocks forward 01:00→02:00 GMT→BST):
+  61 bookings with status='paid' were set to 'cancelled' at 02:00 run
+  All 61 had starts_at between 2026-03-30 01:00 and 02:00
+
+25 October 2026 (clocks back 02:00→01:00 BST→GMT):
+  cron log shows the 01:00 job running TWICE (pids 3 min apart)
+  48 customers have two late_fee charges, ~1 hour apart
+  All 48 had starts_at in the 24h window at both invocations
+```
+
+</Evidence>
+
+Three defects compound here. Name each, say which incident it caused, and give the fix.
+
+<Reveal label="Reveal the cause">
+
+**Three defects: a wrong column type, local-time scheduling, and a non-idempotent side effect. Each caused a different part of the damage.**
+
+**Defect 1 — `starts_at` is `timestamp`, not `timestamptz`.** It stores wall-clock digits with no absolute meaning, written from a `new Date(...)` call that concatenates the date and time strings with no zone — so it parses in whatever zone the process happens to be in, and then loses that information. So the column holds London digits, and `Date.now() + 24h` produces an instant. Comparing an instant against digits is only coincidentally correct, and it stops being correct whenever the offset changes.
+
+On 29 March the UK offset moved from +00:00 to +01:00. The `cutoff` instant shifted relative to the stored digits by an hour, so the job's 24-hour window swept up a band of bookings an hour outside its intended range — the 61 bookings between 01:00 and 02:00 the following day. *This caused the March incident.* And note they were `status='paid'`: the `WHERE status='unpaid'` filter should have protected them, which tells you the query matched on the time condition and the status condition was satisfied too — meaning these were bookings whose payment had been recorded after the row was selected, in the window between the `SELECT` and the `UPDATE` (a check-then-act race, L7.2, and a fourth latent defect).
+
+*Fix:* `starts_at timestamptz`, written from an explicit zone:
+```sql
+ALTER TABLE bookings ALTER COLUMN starts_at TYPE timestamptz
+  USING starts_at AT TIME ZONE 'Europe/London';
+```
+```ts
+// Build the instant explicitly from the studio's zone, not the process's.
+starts_at = Temporal.PlainDateTime.from(`${date}T${time}`)
+              .toZonedDateTime(studio.timezone).toInstant();
+```
+
+**Defect 2 — the cron is scheduled in local time.** `0 * * * *` in a `Europe/London` crontab means the 01:00 run happened **twice** on 25 October, exactly as in L7.8's break-fix. *This caused the double invocation.*
+
+*Fix:* `CRON_TZ=UTC` (or set the server to UTC). UTC has no repeated or missing hours.
+
+**Defect 3 — `chargeLateFee` is not idempotent.** Given defect 2, two invocations both selected the same 48 bookings and both charged. Even without the DST double-run, a retry, a manual re-run, or an overlapping slow run would have done the same. *This turned a duplicate job run into 48 duplicate charges.*
+
+*Fix:* an idempotency key plus a guarded state transition, so the charge can only happen once per booking:
+```ts
+// The UPDATE is the claim: only one run can transition this row.
+const claim = await db.query(
+  `UPDATE bookings SET status='cancelled'
+    WHERE id=$1 AND status='unpaid' RETURNING id`, [b.id]);
+if (claim.rowCount === 0) continue;             // someone else did it (or it got paid)
+
+await chargeLateFee(b.customer_id, { idempotencyKey: `late-fee:booking:${b.id}` });
+```
+This simultaneously fixes the check-then-act race: `AND status='unpaid'` in the `UPDATE` means a booking paid between the `SELECT` and the `UPDATE` is no longer cancelled.
+
+**Order of work:** refund the 48 duplicate fees and reinstate/compensate the 61 wrongly cancelled bookings (customer-facing, first); then `CRON_TZ=UTC` (one line, stops the recurrence); then the idempotency key and guarded transition; then the column migration, which needs care on a large table (M6.3).
+
+**The transferable lesson:** these three defects are independently survivable and jointly catastrophic. **A wrong type made the comparison fragile, local scheduling pulled the trigger, and a missing idempotency key multiplied the damage.** That layering is typical: time bugs rarely act alone, which is why the single rule — UTC everywhere, convert only at the edges, schedule in UTC — is worth following even where it feels like overkill.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit time handling in this codebase: every date/time column with its type (flagging any plain `timestamp` that should be `timestamptz`), every place a Date is constructed from string parts without an explicit timezone, any arithmetic that adds milliseconds or seconds to cross a day boundary, every cron schedule and whether it is UTC or local, and any TZ environment variable set on one service but not others."}>
+The `timestamp`-vs-`timestamptz` column list is the highest-value output — it's a schema problem that produces intermittent, seasonal bugs. Also check the TZ divergence question specifically: that's M1.5's break-fix, and the audit should name which services differ rather than just listing values.
+</AgentTask>
+
+<AgentTask prompt={"My product now operates in multiple timezones. Show me how to model a booking that a human agreed to in local terms: which columns to store, where the timezone name lives, how to compute the absolute instant for reminders, and how to define 'today's bookings' for a report. Be explicit about whether my report should use the venue's local day or the company's, and what each choice means for a venue near the date line."}>
+The last clause is the test of whether it has thought it through — a Sydney venue and a London company disagree about what day it is for most of the London working day. The answer must state the choice explicitly rather than quietly using `CURRENT_DATE`, which is M1.5's empty-report bug.
+</AgentTask>
+
+<AgentTask prompt={"Write tests that would have caught a DST bug in this code: one for the autumn transition where a local hour repeats, one for the spring transition where a local hour does not exist, and one asserting that adding one day is not the same as adding 24 hours across a boundary. Use real IANA zones and real 2026 transition dates, and show me how to run the suite under TZ=Pacific/Chatham."}>
+Chatham's +12:45 offset catches code that assumes whole-hour offsets, and a southern-hemisphere zone catches code that assumes northern DST dates. Verify the transition dates it uses are real for 2026 — agents confuse the US and EU changeover weekends, which differ by a week or two.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The rule, and its consequences:
+
+- **Store instants as `timestamptz`.** Never plain `timestamp`.
+- **Store local intentions** as `date`/`time` **plus an IANA timezone name** — never an offset.
+- **Convert only at display**, using the relevant zone.
+- **Schedule everything in UTC.**
+
+Then check:
+
+- Does every component agree on the current instant? (app, worker, database, host)
+- Is `TZ` set on some services and not others?
+- Does any code add milliseconds or seconds to cross a day boundary?
+- Does any report say "today" without specifying whose?
+- Is any `where date = CURRENT_DATE` depending on the session's timezone by accident?
+- Are server clocks NTP-synced, and does token verification allow small leeway?
+- Do your tests pass under a non-UTC, non-whole-hour timezone?
+
+What good looks like: DST weekends pass without incident; a venue in another country is a configuration change rather than a rewrite; and incident timelines across services can be trusted.
+
+Red flags: a `timestamp` column holding instants; `new Date(string)` with no zone; a crontab in local time; an offset stored where a zone name belongs; "it was fine until the clocks changed".
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l10"
+  questions={[
+    {
+      q: "What does Postgres's `timestamptz` actually store?",
+      options: [
+        "The timestamp plus the timezone it was written in",
+        "An absolute instant normalised to UTC, rendered in the session's timezone on read — it does not store a zone at all",
+        "Wall-clock digits with an offset suffix",
+        "A Unix epoch integer with no timezone semantics"
+      ],
+      answer: 1,
+      explain: "The name misleads. It stores a moment; `timestamp` stores digits. That's why two services in different zones writing 'now' to a plain `timestamp` produce values 11 hours apart that cannot be compared."
+    },
+    {
+      q: "Why is \"Mara booked Studio A for 10:00 on 12 March\" not an instant?",
+      options: [
+        "Because the booking hasn't been confirmed yet",
+        "Because it's a local wall-clock intention that corresponds to different absolute moments in different timezones",
+        "Because dates before the current year are stored differently",
+        "Because 10:00 could be AM or PM"
+      ],
+      answer: 1,
+      explain: "It needs a timezone to become an instant. This is why storing `date` + hours plus a zone name is defensible — it records what the human agreed to, and the absolute moment is derived."
+    },
+    {
+      q: "A cron scheduled `30 1 * * *` in a local-timezone crontab. What happens on the two DST days?",
+      options: [
+        "Nothing — cron adjusts automatically for DST",
+        "In autumn it runs twice (the local hour repeats); in spring it may not run at all (the local hour doesn't exist)",
+        "It runs an hour late in autumn and an hour early in spring",
+        "The cron daemon logs a warning and skips the run"
+      ],
+      answer: 1,
+      explain: "Both failure modes from one misconfiguration — duplicate runs and silent non-runs. UTC has no repeated or missing hours, which is why `CRON_TZ=UTC` is the fix."
+    },
+    {
+      q: "Why store `Europe/London` rather than `+01:00`?",
+      options: [
+        "Offsets are limited to whole hours",
+        "`+01:00` is only correct for part of the year, while the zone name encodes the full set of rules including future DST changes",
+        "Zone names compress better in the database",
+        "Offsets are deprecated in the ISO 8601 standard"
+      ],
+      answer: 1,
+      explain: "An offset is a *rendering* of a zone at a particular instant, not a substitute for it. Governments also change DST rules, and zone databases get updated; a stored offset can't track that."
+    },
+    {
+      q: "A server's clock drifts 94 seconds ahead. What breaks first?",
+      options: [
+        "Database queries begin returning stale data",
+        "Token and webhook-signature verification — JWT `exp` and provider signature windows are absolute times, so freshly-issued credentials look expired or invalid",
+        "Cron jobs stop firing entirely",
+        "Log files are written with duplicate timestamps"
+      ],
+      answer: 1,
+      explain: "Intermittent `token expired` on a brand-new token is the signature. It also silently corrupts cross-service incident timelines, which misleads you during the diagnosis of something else."
+    }
+  ]}
+/>
+
+</Section>

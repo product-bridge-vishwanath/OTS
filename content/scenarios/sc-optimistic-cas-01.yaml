@@ -1,0 +1,49 @@
+id: sc-optimistic-cas-01
+module: M7
+lesson: m07-l05
+title: "Two agents on one ticket, and a 31% conflict rate"
+difficulty: hard
+symptom: "Agents sometimes work the same ticket and send duplicate replies. Separately, 31% of saves are rejected with 'ticket changed, please reload'."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/ignored-rowcount-cas.patch     # CAS implemented, result discarded
+    - type: code
+      apply: scripts/break/heartbeat-bumps-version.patch  # presence writes bump the version
+    - type: traffic
+      apply: scripts/load/two-agents-one-record.js
+evidence:
+  logs: true
+  metrics: [claims.succeeded, saves.conflicted, saves.total]
+  db_console: true
+agent:
+  context: "You added optimistic concurrency to this table last month and consider it protected."
+  bias: "proposes removing the version column because conflicts are too frequent"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - one-claim-per-record-under-race
+    - conflict-rate-below-2-pct
+    - independent-field-edits-do-not-conflict
+  root_cause_markers:
+    - affected row count checked on every conditional update
+    - claim expressed as an atomic conditional write on the business rule
+    - non-semantic writes no longer bump the version
+    - partial updates send only changed fields
+  symptom_only_markers:
+    - version column removed
+    - conflict message softened or auto-retried without resolving the cause
+    - heartbeat interval lengthened
+hints:
+  - "The claim does a compare-and-set. What does the code do with its result?"
+  - "A conditional update that matches nothing is not an error. Who is supposed to notice?"
+  - "What else writes to this row, and how often? Does it represent a user edit?"
+  - "Reveal: the row count is ignored, and a 15-second heartbeat bumps the version. Fix both."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 20
+  agent_verification: 25

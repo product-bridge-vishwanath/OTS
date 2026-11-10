@@ -1,0 +1,483 @@
+---
+id: m07-l05
+module: M7
+title: "Optimistic vs pessimistic: who waits, and who retries"
+order: 5
+difficulty: 3
+depth: both
+platforms: [postgres, redis, supabase]
+concepts: [optimistic-concurrency, locks, race-conditions]
+prerequisites: [m07-l04]
+lab: demo-repo
+scenario_ids: [sc-optimistic-cas-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A studio's admin panel let staff edit room details. Two members of staff, Priya and Tomás, both opened Studio A at 14:02 to fix different things: Priya corrected the hourly rate from £80 to £95; Tomás updated the equipment list and capacity.
+
+Priya saved at 14:04. Tomás saved at 14:05.
+
+The rate went back to £80.
+
+Tomás's form had loaded at 14:02, when the rate was still £80. His save submitted *every* field, including the stale rate, overwriting Priya's change. Neither of them saw anything unusual — both got "Saved successfully". Priya noticed three weeks later when a customer queried their invoice, and the studio had been undercharging every booking for Studio A since.
+
+Nothing raced in the database. There was no lock contention, no error, no simultaneity to speak of — three minutes apart. The bug was that Tomás's save said *"set the rate to 80"* when what he meant was *"don't touch the rate"*, and the system had no way to tell the difference between a deliberate value and a stale one.
+
+</Section>
+
+<Section kind="already-did">
+
+You've been on both sides of this. You've edited something in a dashboard, saved, and had a colleague ask why their change disappeared. You've also used a tool that said *"this record has changed since you opened it — reload"*, and found it mildly annoying. That annoyance was a system protecting you.
+
+And if you've built an edit form with an agent, you almost certainly built the Tomás shape: `SELECT` the row to populate the form, submit all fields, `UPDATE` every column. It's the obvious design, and it's a <Term k="lost-update">lost update</Term> waiting for a second editor.
+
+</Section>
+
+<Section kind="mental-model">
+
+Two strategies, and the choice is simply **who absorbs the cost of a conflict.**
+
+<svg viewBox="0 0 780 300" role="img" aria-label="Pessimistic locking makes the second writer wait before working, while optimistic concurrency lets both work and rejects the second write if the row changed" className="diagram">
+  <defs>
+    <marker id="arrop" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <text x="12" y="20" className="sub">PESSIMISTIC — assume conflict; take the lock first</text>
+  <rect x="8" y="30" width="170" height="48" rx="8" />
+  <text x="93" y="50" textAnchor="middle" className="sub">A: lock the row</text>
+  <text x="93" y="68" textAnchor="middle" className="sub">SELECT … FOR UPDATE</text>
+  <rect x="196" y="30" width="170" height="48" rx="8" />
+  <text x="281" y="50" textAnchor="middle" className="sub">A: read, change, write</text>
+  <text x="281" y="68" textAnchor="middle" className="sub">COMMIT → lock freed</text>
+  <rect x="384" y="30" width="180" height="48" rx="8" />
+  <text x="474" y="50" textAnchor="middle" className="sub">B: waited the whole time</text>
+  <text x="474" y="68" textAnchor="middle" className="sub">then reads FRESH data</text>
+  <rect x="582" y="30" width="190" height="48" rx="8" />
+  <text x="677" y="50" textAnchor="middle" className="sub">B: writes safely</text>
+  <text x="677" y="68" textAnchor="middle" className="sub">cost: B waited</text>
+  <path d="M 178 54 L 192 54" className="arrow" markerEnd="url(#arrop)" />
+  <path d="M 366 54 L 380 54" className="arrow" markerEnd="url(#arrop)" />
+  <path d="M 564 54 L 578 54" className="arrow" markerEnd="url(#arrop)" />
+
+  <text x="12" y="126" className="sub">OPTIMISTIC — assume no conflict; verify at write time</text>
+  <rect x="8" y="136" width="170" height="48" rx="8" />
+  <text x="93" y="156" textAnchor="middle" className="sub">both read row</text>
+  <text x="93" y="174" textAnchor="middle" className="sub">version = 7</text>
+  <rect x="196" y="136" width="170" height="48" rx="8" />
+  <text x="281" y="156" textAnchor="middle" className="sub">A writes WHERE v=7</text>
+  <text x="281" y="174" textAnchor="middle" className="sub">1 row → ok, v becomes 8</text>
+  <rect x="384" y="136" width="180" height="48" rx="8" />
+  <text x="474" y="156" textAnchor="middle" className="sub">B writes WHERE v=7</text>
+  <text x="474" y="174" textAnchor="middle" className="sub">0 rows → refused</text>
+  <rect x="582" y="136" width="190" height="48" rx="8" />
+  <text x="677" y="156" textAnchor="middle" className="sub">B reloads and retries</text>
+  <text x="677" y="174" textAnchor="middle" className="sub">cost: B redid the work</text>
+  <path d="M 178 160 L 192 160" className="arrow" markerEnd="url(#arrop)" />
+  <path d="M 366 160 L 380 160" className="arrow" markerEnd="url(#arrop)" />
+  <path d="M 564 160 L 578 160" className="arrow" markerEnd="url(#arrop)" />
+
+  <text x="12" y="222" className="sub">Nobody waits in the optimistic case — but somebody may have to redo their work.</text>
+  <text x="12" y="248" className="sub">Pessimistic suits short, machine-speed critical sections (seconds).</text>
+  <text x="12" y="274" className="sub">Optimistic suits long, human-speed edits (minutes) — you cannot hold a lock while someone types.</text>
+</svg>
+
+### Pessimistic: lock first
+
+`SELECT … FOR UPDATE` (L7.4). The second writer **waits**.
+
+- Good when: the critical section is short and machine-paced — decrementing inventory, claiming a job, moving money between rows.
+- Bad when: a human is in the loop. You cannot hold a database lock open while someone fills in a form — it would hold a transaction (and a connection) for minutes, which is L7.3's rule 1 and 2 violated at once.
+
+### Optimistic: verify at write time
+
+Add a `version` column. Read it with the row; include it in the `WHERE` clause of the update; bump it on success. This is <Term k="compare-and-set">compare-and-set</Term>:
+
+```sql
+ALTER TABLE rooms ADD COLUMN version integer NOT NULL DEFAULT 1;
+
+-- The write only lands if nobody changed the row since we read it.
+UPDATE rooms
+   SET hourly_rate = $1, version = version + 1
+ WHERE id = $2 AND version = $3      -- ← the version we loaded
+RETURNING version;
+```
+
+<Callout type="key">
+**The entire mechanism is "zero rows affected means somebody else won".** No lock, no waiting, no error from the database — you must *check the affected row count* and act on it. Code that ignores the result of a conditional update has implemented nothing: the `WHERE version = $3` silently matched nothing and the application cheerfully reported success.
+</Callout>
+
+In application code:
+
+```ts
+const res = await db.query(
+  `UPDATE rooms SET hourly_rate=$1, version=version+1
+    WHERE id=$2 AND version=$3 RETURNING version`,
+  [rate, id, expectedVersion]);
+
+if (res.rowCount === 0) {
+  // Someone changed it since we loaded. Don't overwrite; tell the human.
+  return NextResponse.json(
+    { error: "This room was changed by someone else. Reload and reapply your change." },
+    { status: 409 });
+}
+```
+
+### The third option, and often the best: don't send stale fields
+
+Tomás's problem wasn't concurrency so much as **scope**. His save sent the rate because the form sent every field. Two fixes, both worth having:
+
+1. **Send only what changed.** A `PATCH` with the edited fields only means two people editing *different* fields never conflict at all — the rate and the capacity are independent.
+2. **Still use a version** for the fields that *do* collide, so simultaneous edits to the same field are caught rather than silently resolved as last-write-wins.
+
+This is why collaborative tools feel good: they narrow the unit of conflict. Google Docs doesn't lock the document or reject your save — it merges at the character level, so conflicts are rare and tiny. You can't build that for a booking system, but you can send one field instead of twelve.
+
+### Choosing between them
+
+| | Pessimistic (`FOR UPDATE`) | Optimistic (version/CAS) |
+|---|---|---|
+| Who pays | The second writer waits | The second writer redoes the work |
+| Human-speed edits | ✗ can't hold a lock for minutes | ✓ designed for it |
+| High contention on one row | ✓ queues cleanly | ✗ retry storms, livelock |
+| Low contention | Unnecessary overhead | ✓ nearly free |
+| Needs retry logic | No | **Yes** (or a human-facing 409) |
+| Fails how | Slowly (waiting) | Immediately (rejected) |
+| Across services/databases | Only within one database | ✓ works anywhere there's a version |
+
+<Operator>
+
+Both strategies, runnable against the demo app. The `rooms` table is the natural place — it's the one humans edit.
+
+```bash
+cd demo-app
+
+# ── Reproduce the lost update (last-write-wins) ───────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT id, name, hourly_rate FROM rooms WHERE id=1;"
+#   Two "admins" load the row, then both save their own field.
+curl -s -X PATCH localhost:3001/api/rooms/1 -H 'Content-Type: application/json' \
+  -d '{"hourly_rate":95}' >/dev/null                     # Priya: the rate
+curl -s -X PATCH localhost:3001/api/rooms/1 -H 'Content-Type: application/json' \
+  -d '{"hourly_rate":80}' >/dev/null                     # Tomás: stale value resent
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT id, hourly_rate FROM rooms WHERE id=1;"
+#   80 — Priya's change is gone. Both calls returned 200.
+
+# ── Add optimistic concurrency ───────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE rooms ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 1;"
+
+#   Simulate two editors who both loaded version 1:
+V=$(docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT version FROM rooms WHERE id=1;" | tr -d '[:space:]')
+echo "both editors loaded version $V"
+
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE rooms SET hourly_rate=95, version=version+1 WHERE id=1 AND version=$V RETURNING version;"
+#   UPDATE 1 — Priya wins, version becomes 2.
+
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE rooms SET hourly_rate=80, version=version+1 WHERE id=1 AND version=$V RETURNING version;"
+#   UPDATE 0 — Tomás is REFUSED. Nothing was overwritten.
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT id, hourly_rate, version FROM rooms WHERE id=1;"
+#   95, version 2. The correct value survived.
+
+# ── Compare with the pessimistic approach ────────────────────────────
+#   Session 1 takes the lock for 5s; session 2 WAITS rather than failing.
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT hourly_rate FROM rooms WHERE id=1 FOR UPDATE; SELECT pg_sleep(5);
+   UPDATE rooms SET hourly_rate=99 WHERE id=1; COMMIT;" >/dev/null 2>&1 &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c "\timing on" \
+  -c "BEGIN; SELECT hourly_rate FROM rooms WHERE id=1 FOR UPDATE;
+      UPDATE rooms SET hourly_rate=101 WHERE id=1; COMMIT;" 2>&1 | grep -E "Time:|UPDATE"
+#   It waited ~4s, then read FRESH data and wrote safely. Nobody lost a write,
+#   but someone sat in a queue — unacceptable if that someone is a web request
+#   waiting on a human to finish typing.
+
+# ── FOR UPDATE NOWAIT: fail instead of waiting ───────────────────────
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT id FROM rooms WHERE id=1 FOR UPDATE; SELECT pg_sleep(5); COMMIT;" \
+  >/dev/null 2>&1 &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT id FROM rooms WHERE id=1 FOR UPDATE NOWAIT;" 2>&1 | tail -2
+#   ERROR: could not obtain lock on row — a fast, honest "busy, try again".
+sleep 5
+
+# ── Restore the demo data ────────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE rooms SET hourly_rate=80.00 WHERE id=1;
+   ALTER TABLE rooms DROP COLUMN IF EXISTS version;"
+```
+
+The pair of `UPDATE 1` / `UPDATE 0` results is the whole lesson. Note that the second one is **not an error** — Postgres is perfectly happy; it matched no rows. Everything depends on your code noticing.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Mechanism | Where | Note |
+|---|---|---|
+| `version` integer column | Postgres, any SQL | The portable, explicit default |
+| `updated_at` as the version | Any | Works, but timestamp granularity can collide; prefer an integer |
+| `xmin` system column | Postgres | Free row version with no schema change (Hibernate uses it) |
+| ORM optimistic locking | Prisma, Drizzle, TypeORM, Hibernate | Often built in — check whether it's enabled |
+| `ETag` + `If-Match` | HTTP APIs | Optimistic concurrency at the protocol level; the correct REST answer |
+| Redis `WATCH`/`MULTI` | Redis | CAS for Redis values |
+| `SELECT … FOR UPDATE` | Postgres | The pessimistic option (L7.4) |
+| Conditional `UPDATE … WHERE` | Any | Optimistic concurrency without a version column, when the old value *is* the check |
+
+The HTTP-level version is worth knowing because it pushes the mechanism to where your client already is:
+
+```text
+GET  /api/rooms/1          → 200, ETag: "7"
+PATCH /api/rooms/1         → If-Match: "7"
+                             200 if version still 7
+                             412 Precondition Failed if not
+```
+
+A 412 is the honest status code for "your copy is stale"; 409 is also widely used and fine. Either way the client knows to reload rather than retry blindly.
+
+What good looks like: every human-editable record has a version; edit forms submit only changed fields; a conflicting save produces a clear "someone else changed this" message rather than a silent overwrite; and machine-paced critical sections use `FOR UPDATE` instead.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Reproduce the lost update** with the first Operator block. Confirm both PATCH calls returned 200 and the rate is wrong. This is the Priya/Tomás bug, in 20 seconds.
+
+2. **Add the version column and prove CAS works** (second block). The `UPDATE 1` then `UPDATE 0` pair is the mechanism — make sure you see both.
+
+3. **Wire it into the app.** Change [app/api/rooms/[id]/route.ts](demo-app/app/api/rooms/[id]/route.ts) to require a version:
+   - accept `version` in the request body,
+   - add `AND version = $n` to the `UPDATE` and bump it,
+   - return **409** with a clear message when `rowCount === 0`,
+   - include the new version in the success response so the client can keep editing.
+
+   Then test both paths:
+   ```bash
+   V=$(curl -s localhost:3001/api/rooms | python3 -c "import sys,json; print(json.load(sys.stdin)['rooms'][0].get('version'))")
+   curl -s -X PATCH localhost:3001/api/rooms/1 -H 'Content-Type: application/json' \
+     -d "{\"hourly_rate\":95,\"version\":$V}"          # expect 200
+   curl -s -X PATCH localhost:3001/api/rooms/1 -H 'Content-Type: application/json' \
+     -d "{\"hourly_rate\":80,\"version\":$V}"          # expect 409, stale version
+   ```
+
+4. **Compare the pessimistic shape** (third block) and note the difference in *where* the cost lands: a 4-second wait versus an immediate rejection. Decide which one you'd want for an admin form, and which for decrementing inventory.
+
+5. **Try `NOWAIT`** (fourth block) to see the middle ground — pessimistic, but failing fast instead of queueing.
+
+6. **Narrow the conflict unit.** Make the rooms endpoint accept only the fields present in the request body, so two admins editing *different* fields don't conflict at all. Then re-run step 3's conflicting pair with different fields and confirm both succeed. This is the fix that makes the version column rarely fire.
+
+7. **Restore the demo data** (last block).
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A support-desk app lets agents claim tickets from a shared queue. Agents complain that two of them sometimes work the same ticket, wasting effort and occasionally sending duplicate replies to customers. Separately, the team added optimistic concurrency last month, and agents now report "a lot" of "ticket changed, please reload" errors.
+
+<Evidence title="the claim flow">
+
+```ts
+// POST /api/tickets/:id/claim
+const t = await db.query("SELECT id, assignee_id, version FROM tickets WHERE id=$1", [id]);
+if (t.rows[0].assignee_id) return conflict("already claimed");
+
+await db.query(
+  "UPDATE tickets SET assignee_id=$1, version=version+1 WHERE id=$2 AND version=$3",
+  [agentId, id, t.rows[0].version]);
+
+return ok();
+```
+
+</Evidence>
+
+<Evidence title="the ticket edit flow (where the reload errors come from)">
+
+```ts
+// PUT /api/tickets/:id      — called when an agent saves their work
+await db.query(
+  `UPDATE tickets SET subject=$1, body=$2, status=$3, priority=$4, tags=$5,
+          assignee_id=$6, last_viewed_at=now(), version=version+1
+    WHERE id=$7 AND version=$8`,
+  [subject, body, status, priority, tags, assigneeId, id, version]);
+// rowCount checked → 409 "ticket changed, please reload"
+```
+
+</Evidence>
+
+<Evidence title="production facts">
+
+```text
+Duplicate claims: 14 last week. Logs show pairs ~40–200ms apart.
+409 rate on PUT /api/tickets/:id : 31% of all saves (!)
+
+Also in the codebase:
+  // called every 15s by the open ticket view, to show "agent X is viewing"
+  POST /api/tickets/:id/heartbeat
+    → UPDATE tickets SET last_viewed_at=now(), version=version+1 WHERE id=$1
+
+tickets table: no unique constraint on assignee_id; version integer NOT NULL
+```
+
+</Evidence>
+
+Two complaints, two different mistakes. Diagnose both.
+
+<Reveal label="Reveal the cause">
+
+**Mistake 1 — the claim flow checks the result of nothing.** The `UPDATE … AND version=$3` is a correct compare-and-set, and the code **never looks at `rowCount`.** It always returns `ok()`.
+
+So when two agents claim simultaneously: both read `assignee_id = null` and `version = 7`; agent A's update matches and succeeds; agent B's update matches **zero rows** and changes nothing — and B is told the claim succeeded. Both agents open the ticket, both reply, the customer gets two emails. The optimistic mechanism worked perfectly and the application discarded its answer.
+
+This is the exact failure the mental model warns about: *the database does not error when a conditional update matches nothing.* `UPDATE 0` is a success at the SQL level. Ignoring the row count means you have implemented the ceremony of optimistic concurrency without the protection.
+
+Fix — and note the simpler alternative is better here:
+
+```ts
+// Better: the condition IS the business rule. No version needed,
+// and no separate check-then-act either (L7.2's conditional write).
+const res = await db.query(
+  `UPDATE tickets SET assignee_id=$1, version=version+1
+    WHERE id=$2 AND assignee_id IS NULL
+   RETURNING id`,
+  [agentId, id]);
+
+if (res.rowCount === 0) return conflict("already claimed");
+return ok();
+```
+
+`WHERE assignee_id IS NULL` is both the check and the guard, in one atomic statement. Even better for a shared queue: `FOR UPDATE SKIP LOCKED` (L7.4) so agents are handed different tickets rather than racing for the same one.
+
+**Mistake 2 — the version is being bumped by things that aren't edits.** A 31% conflict rate is not concurrency; it's a broken design. The heartbeat endpoint fires **every 15 seconds per open ticket** and does `version = version + 1`. Any agent who has had a ticket open for a minute is now holding a version four generations stale, and their save is rejected. Agents are conflicting *with themselves*.
+
+Two errors compound here: a non-semantic field (`last_viewed_at`) participates in the version, and the PUT writes **every column**, so saving a status change also resubmits a stale `subject`, `body`, and `assignee_id` — the Priya/Tomás shape, which is how a save could clobber another agent's reassignment.
+
+Fix:
+1. **Don't bump the version for non-edits.** The heartbeat should write `last_viewed_at` without touching `version` — or better, not live in the tickets row at all (it's ephemeral presence data; Redis with a TTL is the right home, and it stops a 15-second write loop hammering a hot row).
+2. **Send only changed fields.** A `PATCH` with the edited fields means status changes and body edits don't collide.
+3. **Version only the fields that matter** — or move to field-level checks (`WHERE status = $oldStatus`) for independent fields.
+
+**The transferable lessons:**
+- **A conditional update's row count is the return value.** Not checking it is equivalent to not having the mechanism. Make it structurally hard to ignore by using `RETURNING` and treating an empty result as the conflict path.
+- **A version column must represent *meaningful* change.** If background writes, view tracking, or `updated_at` touches bump it, you manufacture conflicts and train your users to click through them — which is L8.8's alert fatigue in a different costume.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Find every conditional UPDATE in this codebase — any UPDATE with a WHERE clause that includes a version, a status, or an expected previous value — and tell me whether the code checks the affected row count or RETURNING result. List any that ignore it, with file:line, and what silently fails when the condition doesn't match."}>
+This is the single highest-yield audit in the lesson: an ignored row count means the protection is decorative. Prefer rewrites that use `RETURNING` and branch on an empty result, since that's harder to ignore than a `rowCount` nobody reads. Verify a couple by reading the code yourself.
+</AgentTask>
+
+<AgentTask prompt={"Add optimistic concurrency to this table's edit flow: [table]. Include the migration for a version column, the UPDATE with the version guard, the 409 response with a message a non-technical user would understand, and the new version in the success response. Then list every other place in the codebase that writes to this table and tell me which ones must now also bump the version — and which must NOT."}>
+That last question is what prevents the 31% conflict rate: background jobs, view trackers and `updated_at` touches must **not** bump a version that represents user edits. Check the 409 message tells the human what to do ("reload and reapply"), not just that something failed.
+</AgentTask>
+
+<AgentTask prompt={"For this operation, tell me whether pessimistic locking or optimistic concurrency is the right fit, and why: [describe the operation, including whether a human is in the loop and how long the critical section lasts]. Then implement the one you recommend. If the invariant could instead be enforced by a constraint or a single conditional UPDATE, say so first — I would rather have that."}>
+The last sentence matters: the best answer is often neither strategy but a conditional write or a constraint (L7.2), which needs no retry logic and no version column. If a human is in the loop and it recommends `FOR UPDATE`, push back — you can't hold a transaction open while someone types.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Choosing a strategy:
+
+- Is a **human** in the critical section? → optimistic (you cannot hold a lock while someone types)
+- Is it **machine-paced and short**? → pessimistic `FOR UPDATE` is simpler and needs no retries
+- Could a **constraint or one conditional `UPDATE`** express the rule instead? → do that; it beats both
+- Is contention on **one hot row** high? → pessimistic queues better than optimistic retry storms
+
+If you chose optimistic:
+
+- Is the affected **row count checked** on every conditional update? (Zero rows = someone else won.)
+- Does the version represent **meaningful change only** — no heartbeats, view tracking, or `updated_at` touches?
+- Do edit forms submit **only changed fields**, so independent edits never collide?
+- Does the conflict response tell the human **what to do**, and is the current version returned so they can reapply?
+- Is the conflict rate monitored? (A high rate means a design problem, not busy users.)
+
+What good looks like: silent overwrites are impossible; conflicts are rare because the conflict unit is narrow; and when one happens the user gets a clear message rather than a lost afternoon.
+
+Red flags: an edit endpoint that writes every column; a conditional update whose result is ignored; a version bumped by background writes; a double-digit conflict rate treated as normal.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l05"
+  questions={[
+    {
+      q: "Why can't you use `SELECT … FOR UPDATE` to protect an admin edit form?",
+      options: [
+        "FOR UPDATE doesn't work on tables with foreign keys",
+        "It would hold a database lock — and a transaction and a connection — for however long the human takes to type, which is minutes",
+        "Web requests cannot participate in transactions",
+        "It only locks rows for reading, not writing"
+      ],
+      answer: 1,
+      explain: "Pessimistic locking needs a short, machine-paced critical section. Human-speed edits are exactly what optimistic concurrency exists for: nobody waits, and the stale writer is rejected at save time."
+    },
+    {
+      q: "In optimistic concurrency, how does your code learn that a conflict occurred?",
+      options: [
+        "Postgres raises a serialization failure",
+        "The conditional UPDATE affects zero rows — it is not an error, so the application must check the row count or RETURNING result",
+        "The version column becomes null",
+        "The transaction is automatically rolled back"
+      ],
+      answer: 1,
+      explain: "`UPDATE 0` is a success at the SQL level. That's why the support-desk break-fix had two agents on one ticket: the CAS worked and the application never looked at the answer."
+    },
+    {
+      q: "Why did the ticket app have a 31% conflict rate on saves?",
+      options: [
+        "Too many agents were editing simultaneously",
+        "A heartbeat endpoint bumped the version every 15 seconds, so agents conflicted with their own view-tracking rather than with each other",
+        "The version column overflowed its integer range",
+        "Optimistic and pessimistic locking were both enabled"
+      ],
+      answer: 1,
+      explain: "A version must represent meaningful change. Non-semantic writes — heartbeats, last_viewed_at, updated_at touches — manufacture conflicts and train users to click through the warnings."
+    },
+    {
+      q: "Priya and Tomás saved three minutes apart with no simultaneity. Why was it still a lost update?",
+      options: [
+        "The database cached Tomás's form data from when he loaded it",
+        "His form submitted every field including the rate he had loaded before her change, so his save said 'set rate to 80' when he meant 'don't touch the rate'",
+        "The two saves were processed out of order by the load balancer",
+        "His transaction had a stale snapshot under repeatable read isolation"
+      ],
+      answer: 1,
+      explain: "The system had no way to distinguish a deliberate value from a stale one. Sending only changed fields fixes it structurally — and is why two people editing different fields should never conflict at all."
+    },
+    {
+      q: "For a shared ticket queue where agents claim work, what's better than a version column?",
+      options: [
+        "A longer version integer to reduce collisions",
+        "A single conditional UPDATE — `WHERE assignee_id IS NULL` — where the condition is the business rule, or FOR UPDATE SKIP LOCKED so agents get different tickets",
+        "Serializable isolation with retries on every claim",
+        "An in-memory set of claimed ticket ids"
+      ],
+      answer: 1,
+      explain: "When the old value *is* the check, you don't need a separate version — the atomic conditional write covers it. SKIP LOCKED goes further by never handing two agents the same row."
+    }
+  ]}
+/>
+
+</Section>

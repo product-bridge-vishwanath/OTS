@@ -1,0 +1,503 @@
+---
+id: m07-l02
+module: M7
+title: "Race conditions: double bookings, double charges, negative inventory"
+order: 2
+difficulty: 2
+depth: both
+platforms: [postgres, redis]
+concepts: [race-conditions, concurrency, relational-model]
+prerequisites: [m07-l01]
+lab: demo-repo
+scenario_ids: [sc-double-booking-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+An events startup sold tickets to a 200-capacity venue. Their checkout counted sold tickets, compared against capacity, and inserted a row if there was room. It worked for months.
+
+Then an artist posted the link to 80,000 followers at once.
+
+They sold 247 tickets. Forty-seven people had valid confirmations for a venue that could not hold them. The fix cost them refunds, apology credits, and a day of support — but the part that stung was the postmortem, where an advisor asked what guaranteed capacity, and the honest answer was *"the code checks it"*.
+
+Checking is not guaranteeing. A check is a statement about the past: *at the moment I looked, there were 199 tickets sold.* By the time the insert ran, that was no longer true. The only thing that can *guarantee* a rule about data is the database holding the data — and it has purpose-built machinery for exactly this, which they weren't using.
+
+</Section>
+
+<Section kind="already-did">
+
+You have written the vulnerable shape. Everyone has, because it's the obvious way to express a rule:
+
+```ts
+const existing = await db.query("SELECT … WHERE …");   // is it taken?
+if (existing.length > 0) return conflict();            // yes → refuse
+await db.query("INSERT INTO …");                       // no → take it
+```
+
+An agent will write this for you on request, and it will pass every test you give it. You may also have added a loading spinner or disabled a submit button to stop double submissions — a real improvement to the user experience, and **not** a fix: it defends against one user clicking twice, not two users arriving together, and anyone can call your API directly.
+
+The demo app has this exact shape in its booking endpoint, which is why fifteen simultaneous requests produced fifteen bookings for one slot.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Why the check is worthless
+
+<svg viewBox="0 0 780 250" role="img" aria-label="Two requests both check availability and find the slot free, then both insert, producing a double booking" className="diagram">
+  <text x="12" y="20" className="sub">TIME →</text>
+
+  <text x="12" y="50" className="sub">Request A</text>
+  <rect x="96" y="32" width="150" height="30" rx="5" />
+  <text x="171" y="52" textAnchor="middle" className="sub">SELECT … → 0 rows</text>
+  <rect x="430" y="32" width="150" height="30" rx="5" />
+  <text x="505" y="52" textAnchor="middle" className="sub">INSERT → 201 ✓</text>
+
+  <text x="12" y="110" className="sub">Request B</text>
+  <rect x="230" y="92" width="150" height="30" rx="5" />
+  <text x="305" y="112" textAnchor="middle" className="sub">SELECT … → 0 rows</text>
+  <rect x="600" y="92" width="170" height="30" rx="5" />
+  <text x="685" y="112" textAnchor="middle" className="sub">INSERT → 201 ✓✓</text>
+
+  <path d="M 96 146 L 770 146" className="arrow" />
+  <text x="250" y="178" className="sub">both saw an empty slot — because neither had written yet</text>
+  <text x="250" y="200" className="sub">the window between check and act is where the bug lives</text>
+  <text x="12" y="234" className="sub">Widen that window (a 150ms fraud check, a slow query) and the race becomes trivially reproducible.</text>
+</svg>
+
+A check tells you what *was* true. Nothing holds it true until your insert runs. The window is normally microseconds — but it only has to be wide enough once, and anything you `await` inside it (a payment pre-check, an external call) widens it to hundreds of milliseconds.
+
+### The four classic races
+
+| Race | Shape | Consequence |
+|---|---|---|
+| **Double booking** | Check availability → insert | Two customers, one slot |
+| **Double charge** | Check if paid → charge | Refund, support ticket, lost trust |
+| **Negative inventory** | Count sold → sell | Oversold stock |
+| **Lost update** | Read → modify → write | Someone's work silently gone (L7.6) |
+
+### Four ways to fix it, in order of preference
+
+**1. Let the database enforce the rule (a constraint).** Best, because it's impossible to bypass — not from your code, not from a worker, not from someone in `psql` at 2am.
+
+For "this exact combination may exist once", a unique constraint:
+
+```sql
+ALTER TABLE payments ADD CONSTRAINT payments_event_unique UNIQUE (provider_event_id);
+```
+
+For "these time ranges may not overlap", an **exclusion constraint** — the right tool for bookings, and the one almost nobody knows exists:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+ALTER TABLE bookings
+  ADD COLUMN hours int4range
+    GENERATED ALWAYS AS (int4range(start_hour, end_hour)) STORED;
+
+ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlap
+  EXCLUDE USING gist (room_id WITH =, date WITH =, hours WITH &&);
+```
+
+Now an overlapping insert fails at the database, whatever the application believes:
+
+```text
+ERROR: conflicting key value violates exclusion constraint "bookings_no_overlap"
+DETAIL: Key (room_id, date, hours)=(1, 2026-12-01, [20,22)) conflicts with
+        existing key (room_id, date, hours)=(1, 2026-12-01, [19,21)).
+```
+
+Note the range semantics: `int4range(19,21)` is `[19,21)` — end-exclusive. A booking ending at 21 and one starting at 21 **don't** overlap, which is exactly what you want for consecutive bookings.
+
+**2. Make the write itself conditional** so the check and the act are one statement:
+
+```sql
+-- Sell a ticket only if capacity remains. One statement, no window.
+UPDATE events SET sold = sold + 1
+ WHERE id = $1 AND sold < capacity
+RETURNING sold;
+```
+
+If it returns no row, there was no capacity. The condition is evaluated and the write applied atomically.
+
+**3. Lock the thing you're about to change** (`SELECT … FOR UPDATE`) — serialises the two requests so one waits for the other. Correct, costs throughput, and it's L7.4's subject.
+
+**4. Serializable isolation** — the database detects the conflict and aborts one transaction, which you then retry. Powerful, needs retry logic, and it's L7.3's subject.
+
+<Callout type="key">
+**Prefer a constraint over application logic, always.** Application checks protect one code path; a constraint protects the data. Your app, your worker, a future endpoint an agent writes, a migration script and your own `psql` session are all subject to it. The question to ask is never "does my code check this?" but **"what makes this impossible?"**
+</Callout>
+
+### Handling the constraint violation gracefully
+
+Adding a constraint turns a silent data corruption into a loud error, which you then translate into a sensible response:
+
+```ts
+try {
+  await db.query("INSERT INTO bookings (…) VALUES (…)", [...]);
+} catch (e) {
+  // 23P01 = exclusion violation, 23505 = unique violation
+  if (e.code === "23P01" || e.code === "23505") {
+    return NextResponse.json({ error: "slot already booked" }, { status: 409 });
+  }
+  throw e;
+}
+```
+
+Keep the application's pre-check too — it gives a fast, friendly 409 in the common case. The difference is that it's now an *optimisation*, not the guarantee.
+
+<Operator>
+
+Everything here is runnable against the demo app.
+
+```bash
+cd demo-app
+
+# ── 1. Reproduce the race ─────────────────────────────────────────────
+APP_URL=http://localhost:3001 node scripts/load/booking-rush.js
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT room_id, date, start_hour, end_hour, count(*)
+    FROM bookings WHERE customer_name LIKE 'rush-customer-%'
+   GROUP BY 1,2,3,4 HAVING count(*) > 1;"
+
+# ── 2. Clean up, then install the real fix ───────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name LIKE 'rush-customer-%';"
+
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings
+  ADD COLUMN IF NOT EXISTS hours int4range
+    GENERATED ALWAYS AS (int4range(start_hour, end_hour)) STORED;
+ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_no_overlap;
+ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlap
+  EXCLUDE USING gist (room_id WITH =, date WITH =, hours WITH &&);
+SQL
+#   If this fails, you have existing overlapping rows — find them first:
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT a.id, b.id, a.room_id, a.date, a.start_hour, a.end_hour
+    FROM bookings a JOIN bookings b
+      ON a.room_id=b.room_id AND a.date=b.date AND a.id<b.id
+     AND a.start_hour < b.end_hour AND a.end_hour > b.start_hour LIMIT 5;"
+
+# ── 3. Prove the fix at the database level ───────────────────────────
+#   Derive the overlap from existing data rather than hardcoding a date —
+#   a hardcoded date can silently land in a free slot and "pass".
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO bookings (room_id, customer_name, date, start_hour, end_hour)
+  SELECT room_id, 'overlap-test', date, start_hour+1, end_hour+1
+    FROM bookings ORDER BY id LIMIT 1;" 2>&1 | tail -3
+#   Expect: conflicting key value violates exclusion constraint
+
+#   Now prove the BOUND SEMANTICS: a booking starting exactly where
+#   another ends must be ACCEPTED (ranges are end-exclusive).
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO bookings (room_id, customer_name, date, start_hour, end_hour)
+  SELECT room_id, 'adjacent-ok', date, end_hour, end_hour+1
+    FROM bookings ORDER BY id LIMIT 1;" 2>&1 | tail -2
+#   Expect: INSERT 0 1 — consecutive bookings are legal, which is the
+#   behaviour you want. Had you used a plain unique constraint or
+#   compared with >= / <=, this legitimate booking would be rejected.
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name IN ('overlap-test','adjacent-ok');"
+
+# ── 4. Prove it under concurrency (the real test) ────────────────────
+APP_URL=http://localhost:3001 node scripts/load/booking-rush.js
+#   Now: one 201 and fourteen 500s — the constraint held, but the app
+#   isn't translating the error yet. That's the next fix (and why you
+#   handle the violation in code rather than only adding the constraint).
+
+# ── 5. The conditional-write pattern, for counters ───────────────────
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+CREATE TABLE IF NOT EXISTS capacity_demo (id int primary key, sold int, capacity int);
+INSERT INTO capacity_demo VALUES (1, 199, 200) ON CONFLICT (id) DO UPDATE SET sold=199;
+SQL
+#   Two "simultaneous" sells against 1 remaining seat:
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE capacity_demo SET sold = sold + 1 WHERE id=1 AND sold < capacity RETURNING sold;"
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE capacity_demo SET sold = sold + 1 WHERE id=1 AND sold < capacity RETURNING sold;"
+#   First: returns 200. Second: UPDATE 0 — no row, no oversell.
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE capacity_demo;"
+
+# ── 6. Inspect what constraints actually protect your data ───────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT conname, contype, pg_get_constraintdef(oid)
+    FROM pg_constraint WHERE conrelid='bookings'::regclass;"
+#   contype: p=primary key, u=unique, x=exclusion, f=foreign key, c=check
+```
+
+Step 4 is the important one pedagogically: the constraint alone converts silent corruption into 500s. That's already a huge improvement — a loud failure beats quiet data loss — but the finished job is a 409.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Mechanism | Enforces | Use for |
+|---|---|---|
+| `UNIQUE` constraint | This combination exists at most once | Idempotency keys, one-vote-per-user, slugs |
+| **`EXCLUDE USING gist`** | These ranges don't overlap | Bookings, reservations, schedules |
+| `CHECK` constraint | A row-level invariant | `sold <= capacity`, `end_hour > start_hour` |
+| Conditional `UPDATE … WHERE` | Decision + write in one statement | Counters, inventory, state transitions |
+| `SELECT … FOR UPDATE` | Serialise access to specific rows | Multi-row invariants (L7.4) |
+| `SERIALIZABLE` isolation | The database detects all conflicts | Complex invariants (L7.3) |
+| Redis `SETNX` / `INCR` | Atomic claim or counter outside Postgres | Rate limits, distributed locks |
+| Unique index on an expression | Uniqueness over computed values | `UNIQUE (lower(email))` |
+
+What good looks like: for every business rule of the form "at most one", "no overlap", or "never more than N", you can name the **database object** that enforces it. If the only answer is "the code checks it", you have the ticketing startup's architecture.
+
+The migration caution: adding a constraint to a table that already violates it fails. Find the violations first (query in step 2 above), decide what to do with them — they're real data corruption, and deciding is a product question — then add the constraint. On a large table, `ALTER TABLE` takes a lock, so see L7.4 and M6.3 before doing it in production.
+
+</Section>
+
+<Section kind="hands-on">
+
+This is the lesson where you fix the demo app's flagship bug properly.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Reproduce and quantify.** Run step 1 from the Operator block. Record how many bookings existed for one slot.
+
+2. **Install the exclusion constraint** (step 2). If it fails because of existing overlaps, use the detection query, delete the test rows, and retry — that's the real migration experience.
+
+3. **Prove it at the database level** (step 3): a direct overlapping `INSERT` is rejected even though no application code is involved — that's the moment the guarantee becomes real. Then run the second half of step 3 and confirm an *adjacent* booking (starting exactly when another ends) is still accepted. If both results are what you expect, your constraint has the right semantics; a sloppier rule would have rejected legitimate consecutive bookings and you'd have shipped a new bug.
+
+4. **Re-run the rush** (step 4). You now get one 201 and fourteen 500s. The data is correct; the API is rude.
+
+5. **Make it a 409.** Edit [app/api/bookings/route.ts](demo-app/app/api/bookings/route.ts) to catch the violation and return 409, keeping the existing pre-check as a fast path:
+   ```ts
+   } catch (e: any) {
+     if (e.code === "23P01" || e.code === "23505") {
+       return NextResponse.json({ error: "slot already booked" }, { status: 409 });
+     }
+     throw e;
+   }
+   ```
+   Rebuild (`docker compose up -d --build app`) and run the rush again. Target: **one 201, fourteen 409s, zero 500s.**
+
+6. **Make your L7.1 concurrent test pass.** The test you wrote expecting "exactly one won" should now pass. That transition — a failing concurrency test becoming a passing one via a database constraint — is the whole lesson.
+
+7. **Find the next one.** The `payments` table has no unique constraint on `provider_event_id` (planted anti-pattern AP6). Add it and predict what happens to `scripts/load/webhook-replay.js`:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c "
+     ALTER TABLE payments ADD CONSTRAINT payments_event_unique UNIQUE (provider_event_id);"
+   APP_URL=http://localhost:3001 node scripts/load/webhook-replay.js
+   ```
+   The second delivery now fails loudly instead of double-charging — the correct *next* problem, which L7.7 solves properly with idempotency.
+
+8. **Clean up:**
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "DELETE FROM bookings WHERE customer_name LIKE 'rush-customer-%' OR customer_name='overlap-test';"
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A subscription product gives each new user one free trial credit. Support reports that a handful of users have multiple trial credits, and one has eleven. Revenue is being given away, slowly.
+
+<Evidence title="the code">
+
+```ts
+// POST /api/trial/claim
+const user = await db.query("SELECT id FROM users WHERE id=$1", [userId]);
+
+const existing = await db.query(
+  "SELECT id FROM credits WHERE user_id=$1 AND kind='trial'", [userId]);
+if (existing.rows.length > 0) {
+  return NextResponse.json({ error: "trial already claimed" }, { status: 409 });
+}
+
+const eligible = await checkEligibility(userId);     // external fraud API, ~400ms
+if (!eligible) return NextResponse.json({ error: "not eligible" }, { status: 403 });
+
+await db.query(
+  "INSERT INTO credits (user_id, kind, amount) VALUES ($1,'trial',10)", [userId]);
+return NextResponse.json({ ok: true });
+```
+
+</Evidence>
+
+<Evidence title="the data and the pattern">
+
+```text
+SELECT user_id, count(*) FROM credits WHERE kind='trial' GROUP BY 1 HAVING count(*)>1;
+ user_id | count
+---------+-------
+    4417 |    11
+    8823 |     3
+    9120 |     2
+   (14 rows total)
+
+SELECT user_id, created_at FROM credits WHERE user_id=4417 AND kind='trial' ORDER BY created_at;
+ 2026-11-02 14:22:08.113
+ 2026-11-02 14:22:08.147
+ 2026-11-02 14:22:08.182
+ ... (11 rows, all within 400ms)
+
+Schema:
+  credits(id serial pk, user_id int, kind text, amount int, created_at timestamptz)
+  -- no unique constraint anywhere
+
+Client: a "Claim trial" button with no disabled state during the request.
+Logs: 11 × "POST /api/trial/claim 200" for user 4417, all within 400ms.
+```
+
+</Evidence>
+
+Name the shape, explain the 400ms, and give the fix that makes eleven credits impossible rather than unlikely.
+
+<Reveal label="Reveal the cause">
+
+**Check-then-act, with a 400ms external call sitting inside the window.**
+
+**The mechanism.** All eleven requests ran the `SELECT` on `credits` before any of them reached the `INSERT`. Each found zero rows and concluded the trial was unclaimed — correctly, at the moment it looked. Then each spent ~400ms in `checkEligibility`, and all eleven inserted.
+
+**The 400ms is the whole story.** Normally the check-to-act window is sub-millisecond and you'd need freak timing to hit it. Here an `await` on a third-party API holds the window open for 400ms — easily long enough for a user to land eleven requests in it by holding down a key, double-clicking an unguarded button, or a retrying mobile client on a flaky connection. The timestamps confirm it: all eleven within 400ms, matching the eligibility call exactly. **Anything awaited between a check and its act turns a theoretical race into a reproducible one.**
+
+**Why the obvious fixes are insufficient:**
+- *Disable the button* — fixes one user double-clicking; does nothing for a direct API call, a retrying client, or two tabs.
+- *Move the eligibility check before the credits check* — narrows the window but doesn't close it. Still check-then-act.
+- *Wrap it in a transaction* — a transaction alone does **not** help here. Under Postgres's default read-committed isolation, two transactions can both run that `SELECT`, see nothing, and both insert. Transactions give you atomicity, not mutual exclusion (L7.3 covers exactly this misconception).
+
+**The fix — make it impossible in the database:**
+
+```sql
+-- One trial credit per user, enforced by the data itself.
+CREATE UNIQUE INDEX CONCURRENTLY credits_one_trial_per_user
+  ON credits (user_id) WHERE kind = 'trial';
+```
+
+A **partial** unique index: it constrains only trial rows, leaving users free to hold many credits of other kinds. Then translate the violation:
+
+```ts
+try {
+  await db.query("INSERT INTO credits (user_id, kind, amount) VALUES ($1,'trial',10)", [userId]);
+} catch (e: any) {
+  if (e.code === "23505") {
+    return NextResponse.json({ error: "trial already claimed" }, { status: 409 });
+  }
+  throw e;
+}
+```
+
+Also **move the expensive eligibility call before the insert but treat the insert as the authority**, and keep the pre-check as a fast path for the friendly common case.
+
+**Clean up the existing damage deliberately:** fourteen users have extra credits. Decide the product answer (revoke the extras? honour them?) before writing the migration, because the unique index won't apply until the duplicates are gone — and deleting rows that represent money is not a decision to make inside a migration script.
+
+**The general rule, restated:** when the invariant is "at most one of these may exist", express it as a unique index, not as an `if`. Then the guarantee holds against your endpoint, a future endpoint, a worker, a backfill, and a 2am `psql` session — none of which will remember to run your check.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"For each business rule in this app of the form 'at most one', 'no overlap', or 'never more than N' — list them from the schema and endpoints — tell me what currently enforces it: a database constraint, application code, or nothing. For anything enforced only in code, give the exact DDL for the constraint that would enforce it, and the Postgres error code to catch."}>
+The output you want is a table where every rule names a database object. Anything in the "application code" column is a race waiting to happen. Check it suggests *partial* unique indexes where the rule is conditional, and an exclusion constraint (not a unique constraint) for anything involving time ranges — a unique constraint cannot express overlap.
+</AgentTask>
+
+<AgentTask prompt={"Add an exclusion constraint to prevent overlapping bookings on (room_id, date, hour range). Give me: the extension needed, the generated column or expression, the DDL, a query to find existing rows that would violate it, and the application change to catch the violation and return 409. Explain the range bound semantics so I know whether a booking ending at 21:00 conflicts with one starting at 21:00."}>
+The bound-semantics answer must be end-exclusive (`[19,21)` doesn't overlap `[21,23)`) — if it gets that wrong, consecutive bookings will be rejected and you'll have built a new bug. Run the find-violations query *before* the DDL; on a real table it will find rows, and what to do with them is a product decision.
+</AgentTask>
+
+<AgentTask prompt={"Rewrite this handler so the check and the write are a single atomic statement rather than a SELECT followed by an INSERT or UPDATE: [paste the handler]. Show the SQL, explain what happens when the condition is not met (zero rows affected), and show how the application distinguishes 'succeeded' from 'refused'. Do not add a transaction and call it fixed."}>
+The last clause blocks the most common wrong answer. Verify the handler checks the affected-row count or `RETURNING` result rather than assuming success — a conditional update that matches nothing succeeds silently at the SQL level, so the application must notice. Then test it with your concurrent test from L7.1.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every rule your product promises:
+
+- What **database object** enforces it? (Not "the code checks it".)
+- Is the invariant "at most one"? → unique index (partial, if conditional)
+- Is it "no overlap"? → exclusion constraint with `btree_gist`
+- Is it "never more than N"? → conditional `UPDATE … WHERE n < limit`, or a `CHECK`
+- Is there an `await` between the check and the write? (That's the window, measured in hundreds of milliseconds.)
+- Does the application translate the constraint violation into a sensible status code?
+- Is there a concurrent test asserting the invariant holds under N simultaneous requests?
+
+Before adding a constraint in production:
+
+- Find existing violating rows first, and decide what to do with them as a product question.
+- Use `CREATE UNIQUE INDEX CONCURRENTLY` on large tables to avoid a long lock (M6.3).
+- Ship the error-handling code *with* the constraint, or you convert silent corruption into 500s.
+
+What good looks like: every "at most once" rule maps to a named constraint; application pre-checks exist for friendly messages and are understood to be optimisations; a disabled submit button is UX, never a correctness measure.
+
+Red flags: "the code checks it" as the guarantee; a transaction added in the belief it prevents duplicates; UI-level double-submit protection described as a fix.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l02"
+  questions={[
+    {
+      q: "Why doesn't `SELECT` to check availability followed by `INSERT` prevent double bookings?",
+      options: [
+        "Because SELECT doesn't lock rows unless you add FOR UPDATE, so both requests see the slot as free and both insert",
+        "Because SELECT and INSERT use different connections from the pool",
+        "Because the INSERT can fail silently without a RETURNING clause",
+        "Because read-committed isolation caches query results"
+      ],
+      answer: 0,
+      explain: "A check describes the past. Nothing holds it true until the insert runs, so two requests can both pass the check. Anything awaited in between widens that window from microseconds to hundreds of milliseconds."
+    },
+    {
+      q: "Which constraint type prevents overlapping time ranges, and why isn't a unique constraint enough?",
+      options: [
+        "A CHECK constraint, because it can compare columns within a row",
+        "An exclusion constraint (EXCLUDE USING gist), because uniqueness tests equality while overlap is a range relationship a unique constraint cannot express",
+        "A composite unique constraint on (room_id, date, start_hour, end_hour)",
+        "A foreign key with a deferred check"
+      ],
+      answer: 1,
+      explain: "A unique constraint on the hour columns would still allow 19–21 and 20–22 to coexist — different values, overlapping times. Exclusion constraints with btree_gist test the && (overlaps) operator."
+    },
+    {
+      q: "In the trial-credit break-fix, why was wrapping the handler in a transaction not a fix?",
+      options: [
+        "Transactions don't apply to INSERT statements",
+        "Under read-committed isolation two transactions can both run the SELECT, see no rows, and both insert — transactions give atomicity, not mutual exclusion",
+        "The external API call would have rolled back the transaction",
+        "The transaction would have deadlocked instead"
+      ],
+      answer: 1,
+      explain: "A very common misconception. Atomicity means all-or-nothing for your own statements; it says nothing about another transaction doing the same thing simultaneously. That needs a constraint, a lock, or serializable isolation."
+    },
+    {
+      q: "Why prefer a database constraint over an application-level check?",
+      options: [
+        "Constraints execute faster than application queries",
+        "A constraint protects the data against every writer — your endpoint, a future endpoint, a worker, a backfill, a manual psql session — while a check protects only one code path",
+        "Constraints provide better error messages to users",
+        "Application checks cannot be tested reliably"
+      ],
+      answer: 1,
+      explain: "The question to ask is never 'does my code check this' but 'what makes this impossible'. None of the other writers will remember to run your check."
+    },
+    {
+      q: "After adding the exclusion constraint, the booking rush returns one 201 and fourteen 500s. What does this mean?",
+      options: [
+        "The constraint is misconfigured and rejecting valid bookings",
+        "The data is now correct — the constraint held — but the application isn't translating the violation, so it needs a catch returning 409",
+        "The database is overloaded by the concurrent requests",
+        "The constraint needs to be deferred until the end of the transaction"
+      ],
+      answer: 1,
+      explain: "A loud failure already beats silent corruption, which is why the constraint is the important half. Shipping the error handling alongside it finishes the job: one 201, fourteen 409s, zero 500s."
+    }
+  ]}
+/>
+
+</Section>

@@ -11,7 +11,7 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 Phase 1, build-order steps 1–4 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
-- **Content wave 1: 18 lessons across M0, M1 and M8**, each with all 9 anatomy sections
+- **28 lessons across M0, M1, M7 and M8**, each with all 9 anatomy sections
   (story, what-you-already-did, mental model + theme-aware SVG diagram, tools, hands-on
   against the demo app, break-fix with evidence + reveal, three ask-your-agent prompts
   with verification steps, checklist, 5-question quiz):
@@ -20,6 +20,14 @@ Phase 1, build-order steps 1–4 complete:
   - **M1 The server is just a computer** — PaaS/serverless/VPS and the process-vs-function
     shape, SSH and lockout prevention, commands taught by question, processes/ports/
     permissions, environment variables and precedence, supervision and crash loops.
+  - **M7 Concurrency, jobs and time** (wave 2) — what "concurrent" means and shared
+    state, race conditions fixed with exclusion constraints, transactions and isolation
+    (including why `BEGIN` doesn't stop duplicates), locks and the lock *queue*,
+    optimistic vs pessimistic, the single-cell anti-pattern, idempotency and
+    at-least-once delivery, cron (ran twice / ran never), safe backfills, and
+    UTC/DST/clock skew. Every lesson's mechanics were verified against the running
+    demo app — deadlock detection, serialization failures, `pg_blocking_pids`,
+    advisory locks, `SKIP LOCKED`, exclusion constraints and DST arithmetic.
   - **M8 Observability and the debugging method** — four signals, where logs live,
     structured logging and request IDs, golden signals and dashboards, error tracking and
     tracing, **the debugging method** (`/lessons/m08-l06`, the template lesson), building a
@@ -40,14 +48,17 @@ Phase 1, build-order steps 1–4 complete:
   plus `scripts/break/*` and `scripts/load/*` to trigger each one — see
   `demo-app/README.md` for the full map. These are drill material for the lessons and
   Phase 2 scenarios.
-- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **19 scenario definitions** in
+- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **28 scenario definitions** in
   `/content/scenarios/*.yaml` rendered read-only at `/scenarios` (one per break-fix,
   each with breakage, agent bias, probes, root-cause vs symptom-only markers, hint
   ladder and scoring), Drizzle schema includes `scenario_attempts`.
 - Content lint: `npm run lint:content` — frontmatter schema, controlled vocabularies,
   prerequisite/scenario link integrity, 9-section completeness, glossary term
-  resolution, unknown components, unknown section kinds, quiz-id binding, and nested
-  code fences (which break MDX parsing and only surface at build time).
+  resolution, unknown components, unknown section kinds, quiz-id binding, nested
+  code fences and escaped backticks in prose (both break MDX parsing and otherwise
+  only surface at build time), plus a note on mental-model diagram coverage. The
+  component checks are fence-aware, so TypeScript generics in code samples don't
+  trip them.
 
 Not wired yet (deliberately): auth + server-side persistence (schema is ready in `/db`;
 progress lives in localStorage until a Postgres instance is chosen — see PLAN §7 open
@@ -91,8 +102,12 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-5. Content wave 2: M7 (concurrency — the demo app's planted races are waiting for it),
-   M6, M4, M5, M2.
+5. Rest of content wave 2: M6 (data), M4 (config/secrets), M5 (networking), M2 (git/shipping).
 6. Content wave 3: M11 (decision pages), M9, M10, M13, M14.
 7. Content wave 4: M3, M12.
 8. Personal map editor and decision records; then auth + server-side progress.
+
+The demo app's planted anti-patterns now have lessons that fix them properly: the
+double-booking race (M7.2), single-cell notes (M7.6), the non-idempotent webhook
+(M7.7) and the unlocked cron (M7.8). Each lesson's hands-on restores the
+anti-pattern at the end so the app stays teachable.

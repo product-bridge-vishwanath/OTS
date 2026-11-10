@@ -1,0 +1,530 @@
+---
+id: m07-l04
+module: M7
+title: "Locks: when one query blocks everyone"
+order: 4
+difficulty: 3
+depth: both
+platforms: [postgres, supabase, neon, rds]
+concepts: [locks, deadlock, transactions, concurrency]
+prerequisites: [m07-l03]
+lab: demo-repo
+scenario_ids: [sc-lock-wait-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+Tuesday, 11:04. A developer runs a migration to add a column to the `bookings` table. It's a tiny change — a nullable text column, no data rewrite, instant in staging.
+
+11:05: the site stops responding. Every page. Not slow — *hung*. No errors in the application logs, no CPU on the database, no errors anywhere. Just silence, and a spinner.
+
+11:19: he cancels the migration. The site recovers instantly, as if nothing happened.
+
+What occurred: an analytics query someone had opened in a SQL console at 10:52 was still running — a `SELECT` over the whole bookings table, holding a read lock. The migration's `ALTER TABLE` needed an exclusive lock, so it waited. And because Postgres queues lock requests **in order**, every subsequent query touching `bookings` queued *behind the migration*. One idle analytics tab, one small migration, and the entire product was down for fifteen minutes.
+
+The database was healthy throughout. It was doing exactly what it promised. The failure was in not knowing that **a waiting lock blocks everyone behind it.**
+
+</Section>
+
+<Section kind="already-did">
+
+You've been locked and not known it. A query that usually takes 20ms occasionally taking 4 seconds. A migration that "hung" and that you cancelled and re-ran successfully later. A deploy that timed out and worked on the second attempt. Those are lock waits.
+
+If you've ever followed an agent's advice to add `SELECT … FOR UPDATE` to fix a race, you've used a lock deliberately. If you've seen `deadlock detected` in a log, Postgres has already saved you from one — by killing one of your transactions.
+
+The thing nobody tells you is that locks are mostly **invisible**: a blocked query produces no error, no log line, and no CPU usage. It just waits. Which is why "everything is slow and nothing is wrong" is the characteristic signature.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What a lock is
+
+A <Term k="row-lock">lock</Term> is a claim on something — a row, a table — held **until the transaction ends**. That last clause is the whole subject: lock duration equals transaction duration, so every rule about short transactions (L7.3) is really a rule about locks.
+
+Postgres takes locks for you automatically:
+
+| You run | Lock taken | Blocks |
+|---|---|---|
+| `SELECT` | Nothing on rows; a weak table lock | Only `ALTER`/`DROP` |
+| `UPDATE` / `DELETE` | Exclusive **row** lock on affected rows | Other writes to *those rows* |
+| `INSERT` | Row lock on the new row | Conflicting unique/exclusion keys |
+| `SELECT … FOR UPDATE` | Exclusive row lock, deliberately | Other writers and `FOR UPDATE` readers |
+| `ALTER TABLE` | `ACCESS EXCLUSIVE` on the **whole table** | **Everything, including `SELECT`** |
+| `CREATE INDEX` (without `CONCURRENTLY`) | Blocks writes on the table | All `INSERT`/`UPDATE`/`DELETE` |
+
+<Callout type="warn">
+**The queue is the dangerous part.** Postgres grants lock requests roughly in order. If a long `SELECT` holds a weak lock and an `ALTER TABLE` queues behind it waiting for an exclusive lock, then every *new* query — even a fast `SELECT` — queues behind the `ALTER`. One slow query plus one DDL statement takes down everything touching that table. This is why the story's site died from a *nullable column addition*.
+</Callout>
+
+### Using locks on purpose: `SELECT … FOR UPDATE`
+
+When an invariant spans multiple rows and a constraint can't express it, lock the rows you're about to depend on:
+
+```sql
+BEGIN;
+  -- Claim the row. A second transaction doing this WAITS here.
+  SELECT seats_left FROM events WHERE id = $1 FOR UPDATE;
+  -- Now the value cannot change under us.
+  UPDATE events SET seats_left = seats_left - 1 WHERE id = $1;
+COMMIT;                 -- lock released
+```
+
+This converts a race into a queue: correct, at the cost of throughput. Two variants matter:
+
+- **`FOR UPDATE NOWAIT`** — fail immediately instead of waiting. Good for "tell the user it's busy" rather than hanging.
+- **`FOR UPDATE SKIP LOCKED`** — ignore locked rows. This is what turns a table into a work queue (L7.9):
+
+```sql
+-- Two workers run this simultaneously and claim DIFFERENT rows, no waiting.
+BEGIN;
+  SELECT id FROM jobs WHERE status='pending'
+   ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;
+  -- …process them…
+COMMIT;
+```
+
+### Deadlocks
+
+Two transactions each holding a lock the other needs. Neither can proceed, so Postgres detects the cycle (after ~1s) and **kills one**:
+
+```text
+ERROR:  deadlock detected
+DETAIL: Process 541 waits for ShareLock on transaction 892; blocked by process 548.
+        Process 548 waits for ShareLock on transaction 889; blocked by process 541.
+```
+
+<svg viewBox="0 0 780 200" role="img" aria-label="A deadlock: transaction A holds row 1 and wants row 2, while transaction B holds row 2 and wants row 1" className="diagram">
+  <defs>
+    <marker id="arrdl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="60" y="30" width="200" height="56" rx="10" />
+  <text x="160" y="54" textAnchor="middle">Transaction A</text>
+  <text x="160" y="74" textAnchor="middle" className="sub">holds row 1 · wants row 2</text>
+
+  <rect x="520" y="30" width="200" height="56" rx="10" />
+  <text x="620" y="54" textAnchor="middle">Transaction B</text>
+  <text x="620" y="74" textAnchor="middle" className="sub">holds row 2 · wants row 1</text>
+
+  <path d="M 262 48 L 516 48" className="arrow" markerEnd="url(#arrdl)" />
+  <text x="389" y="42" textAnchor="middle" className="sub">waiting for</text>
+  <path d="M 516 72 L 262 72" className="arrow" markerEnd="url(#arrdl)" />
+  <text x="389" y="90" textAnchor="middle" className="sub">waiting for</text>
+
+  <text x="12" y="134" className="sub">Postgres detects the cycle after ~1s and kills one transaction with SQLSTATE 40P01.</text>
+  <text x="12" y="158" className="sub">Prevention: always lock rows in a consistent order (e.g. ascending id).</text>
+  <text x="12" y="182" className="sub">Handling: retry the victim — it had no effect, so re-running it is safe.</text>
+</svg>
+
+The classic cause is **inconsistent lock ordering**: one code path updates booking 1 then booking 2, another updates 2 then 1. The fix is cultural and simple — always acquire locks in a deterministic order (`ORDER BY id`), and retry the victim (`40P01`, same handler as serialization failures from L7.3).
+
+### Reading lock waits: the three diagnostic queries
+
+A blocked query is silent, so you need to go looking. These three answer "who is stuck, and who is to blame":
+
+```sql
+-- 1. Who is waiting, and who is blocking them?
+SELECT pid, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocked_by,
+       now() - query_start AS waiting_for, left(query, 60) AS query
+  FROM pg_stat_activity
+ WHERE wait_event_type = 'Lock';
+
+-- 2. Who is holding a transaction open (the usual culprit)?
+SELECT pid, state, now() - xact_start AS open_for, left(query, 60)
+  FROM pg_stat_activity
+ WHERE xact_start IS NOT NULL AND now() - xact_start > interval '5 seconds'
+ ORDER BY xact_start;
+
+-- 3. Unblock, when you must (last resort, in order of violence)
+SELECT pg_cancel_backend(<pid>);      -- cancel the query, keep the connection
+SELECT pg_terminate_backend(<pid>);   -- kill the connection entirely
+```
+
+`pg_blocking_pids` is the single most useful function in this lesson: it names the blocker directly, turning "everything is slow" into "PID 541 has held a transaction open for nine minutes".
+
+### Migrations: the special case
+
+DDL takes `ACCESS EXCLUSIVE`, which blocks everything. Two habits make migrations safe:
+
+```sql
+-- Fail fast rather than queue up behind a long query and block the world.
+SET lock_timeout = '3s';
+ALTER TABLE bookings ADD COLUMN notes_v2 jsonb;
+
+-- Build indexes without blocking writes (cannot run inside a transaction).
+CREATE INDEX CONCURRENTLY idx_bookings_date ON bookings (date);
+```
+
+`lock_timeout` is the lesson of the story in one line: if the lock isn't available in 3 seconds, the migration fails and you retry later — instead of taking the site down for fifteen minutes.
+
+<Operator>
+
+All of these run against the demo app. Two of them deliberately create a block so you can watch it.
+
+```bash
+cd demo-app
+
+# ── 1. Watch a row lock block a second writer ────────────────────────
+#   Session 1 holds a FOR UPDATE lock for 6 seconds:
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT id FROM bookings WHERE id=1 FOR UPDATE; SELECT pg_sleep(6); COMMIT;" \
+  >/dev/null 2>&1 &)
+sleep 1
+#   Session 2 tries the same row and waits — time it:
+docker compose exec -T db psql -U ots -d demo -c "\timing on" \
+  -c "SELECT id FROM bookings WHERE id=1 FOR UPDATE;" 2>&1 | grep -E "Time:"
+#   ~5s — it waited for session 1's transaction to end.
+
+# ── 2. SEE the block while it is happening (the key skill) ───────────
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; UPDATE bookings SET customer_name=customer_name WHERE id=2; SELECT pg_sleep(8); COMMIT;" \
+  >/dev/null 2>&1 &)
+sleep 1
+(docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE bookings SET customer_name=customer_name WHERE id=2;" >/dev/null 2>&1 &)
+sleep 2
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT pid, wait_event_type, wait_event, pg_blocking_pids(pid) AS blocked_by,
+         now()-query_start AS waiting, left(query,40) AS query
+    FROM pg_stat_activity WHERE wait_event_type='Lock';"
+#   One row: the waiter, and blocked_by naming the blocker's PID.
+sleep 7
+
+# ── 3. Find long-open transactions (the usual root cause) ────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT pid, state, now()-xact_start AS open_for, left(query,50) AS query
+    FROM pg_stat_activity
+   WHERE datname='demo' AND xact_start IS NOT NULL
+     AND now()-xact_start > interval '2 seconds' ORDER BY xact_start;"
+
+# ── 4. Cause a real deadlock and read the error ──────────────────────
+cat > /tmp/dl_a.sql <<'SQL'
+BEGIN;
+  UPDATE bookings SET customer_name=customer_name WHERE id=1;
+  SELECT pg_sleep(2);
+  UPDATE bookings SET customer_name=customer_name WHERE id=2;
+COMMIT;
+SQL
+cat > /tmp/dl_b.sql <<'SQL'
+BEGIN;
+  UPDATE bookings SET customer_name=customer_name WHERE id=2;
+  SELECT pg_sleep(2);
+  UPDATE bookings SET customer_name=customer_name WHERE id=1;
+COMMIT;
+SQL
+(docker compose exec -T db psql -U ots -d demo < /tmp/dl_a.sql > /tmp/dl_a.out 2>&1 &)
+sleep 0.3
+docker compose exec -T db psql -U ots -d demo < /tmp/dl_b.sql > /tmp/dl_b.out 2>&1
+sleep 3
+grep -iE "deadlock|ERROR|DETAIL" /tmp/dl_a.out /tmp/dl_b.out | head -4
+#   One session gets "deadlock detected" — Postgres killed the victim.
+rm -f /tmp/dl_*.sql /tmp/dl_*.out
+
+# ── 5. SKIP LOCKED: two workers claim different rows, neither waits ──
+docker compose exec -T db psql -U ots -d demo -c \
+  "CREATE TABLE IF NOT EXISTS jobs_demo(id serial primary key, done bool DEFAULT false);
+   TRUNCATE jobs_demo; INSERT INTO jobs_demo SELECT generate_series(1,6), false;" >/dev/null
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT id FROM jobs_demo WHERE NOT done ORDER BY id LIMIT 2 FOR UPDATE SKIP LOCKED;
+   SELECT pg_sleep(4); COMMIT;" 2>&1 | grep -E "^ +[0-9]+" | tr '\n' ' ' | xargs echo "worker A:" &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT id FROM jobs_demo WHERE NOT done ORDER BY id LIMIT 2 FOR UPDATE SKIP LOCKED; COMMIT;" \
+  2>&1 | grep -E "^ +[0-9]+" | tr '\n' ' ' | xargs echo "worker B:"
+sleep 4
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE jobs_demo;" >/dev/null
+#   A claims 1,2 and B claims 3,4 — disjoint sets, no blocking.
+
+# ── 6. Safe migration habits ─────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SET lock_timeout='3s';
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS scratch_col text;
+  ALTER TABLE bookings DROP COLUMN IF EXISTS scratch_col;"
+```
+
+Run block 2 and watch `blocked_by` populate. That query is what you run the moment anyone says "the site is hanging".
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Who is blocked, by whom | `pg_blocking_pids(pid)` in `pg_stat_activity` |
+| What locks exist | `pg_locks` joined to `pg_stat_activity` |
+| Long-open transactions | `pg_stat_activity.xact_start` |
+| Stop a blocker | `pg_cancel_backend` → `pg_terminate_backend` |
+| Prevent migration disasters | `SET lock_timeout`, `CREATE INDEX CONCURRENTLY` |
+| Prevent stuck transactions | `idle_in_transaction_session_timeout` |
+| Safer migration tooling | `pgroll`, `reshape`, Strong Migrations (Rails), Prisma/Drizzle with manual review |
+| Monitoring | Alert on `wait_event_type='Lock'` count > 0 for more than N seconds |
+
+Settings worth having before you need them:
+
+```sql
+ALTER DATABASE demo SET idle_in_transaction_session_timeout = '30s';
+ALTER DATABASE demo SET lock_timeout = '5s';          -- app sessions fail fast
+ALTER DATABASE demo SET deadlock_timeout = '1s';      -- detection interval (default)
+ALTER DATABASE demo SET log_lock_waits = on;          -- log waits > deadlock_timeout
+```
+
+`log_lock_waits = on` is the one people miss: it turns invisible lock waits into log lines you can search afterwards, which is the difference between diagnosing the story's outage and guessing at it.
+
+What good looks like: migrations run with `lock_timeout`; indexes are built `CONCURRENTLY`; code locks rows in a consistent order; deadlock and serialization errors are retried; and something alerts when a query waits on a lock for more than a few seconds.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Watch a lock block a writer** (Operator block 1). Note the ~5 second wait and that *nothing errored* — the second query just took five seconds.
+
+2. **Diagnose a live block** (block 2). This is the skill: run the `pg_blocking_pids` query while something is blocked and read `blocked_by`. Practise it until it's muscle memory — it's the first query to run when anyone says the site is hanging.
+
+3. **Cause a deadlock and read the error** (block 4). Note which session died and that the other committed normally. Postgres chose a victim; your code's job is to retry it.
+
+4. **Use `SKIP LOCKED`** (block 5) and confirm the two workers claimed *disjoint* rows without waiting. You'll build on this in L7.9.
+
+5. **Reproduce the story's outage shape.** Hold a long transaction on `bookings`, queue a migration behind it, then send a normal read. Run all three in the background so you can inspect the queue *while* it exists — if you time the read in the foreground instead, it completes before you can look and the evidence is gone:
+   ```bash
+   # 1. the holder: a long transaction that read bookings
+   (docker compose exec -T db psql -U ots -d demo -c \
+     "BEGIN; SELECT count(*) FROM bookings; SELECT pg_sleep(14); COMMIT;" >/dev/null 2>&1 &)
+   sleep 1
+   # 2. the migration, which must wait for an exclusive lock
+   (docker compose exec -T db psql -U ots -d demo -c \
+     "ALTER TABLE bookings ADD COLUMN blocked_demo text;" >/dev/null 2>&1 &)
+   sleep 1
+   # 3. an ordinary read, which should be instant
+   (docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT count(*) FROM bookings;" >/dev/null 2>&1 &)
+   sleep 3
+   docker compose exec -T db psql -U ots -d demo -c "
+     SELECT pid, wait_event, pg_blocking_pids(pid) AS blocked_by, left(query,42) AS q
+       FROM pg_stat_activity WHERE wait_event_type='Lock' ORDER BY query_start;"
+   ```
+   Expected output — read the `blocked_by` column carefully:
+   ```text
+    pid  | wait_event | blocked_by |                     q
+   ------+------------+------------+--------------------------------------------
+    2653 | relation   | {2646}     | ALTER TABLE bookings ADD COLUMN blocked_de
+    2660 | relation   | {2653}     | SELECT count(*) FROM bookings;
+   ```
+   The migration waits for the long transaction — and the plain `SELECT` waits for **the migration**, not for the original holder. That second row is the queue, and it's why one DDL statement takes down everything. (Timed in the foreground, that `SELECT` takes ~9 seconds instead of ~2ms.) Wait for it to drain before continuing.
+
+6. **Fix it with `lock_timeout`.** Wait for everything to finish, then repeat step 5 with `SET lock_timeout='2s';` before the `ALTER`. The migration now fails in 2 seconds and the site keeps serving. Clean up:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c "ALTER TABLE bookings DROP COLUMN IF EXISTS blocked_demo;"
+   ```
+
+7. **Turn on lock-wait logging** and confirm waits appear in the database logs:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c "ALTER DATABASE demo SET log_lock_waits = on;"
+   docker compose logs --since 5m db | grep -i "lock" | tail -5
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** Every weekday at 09:00 the app becomes unusable for about three minutes. Requests hang rather than erroring, then everything returns to normal. It has happened every weekday for two weeks. No deploys correlate; CPU and memory are flat throughout.
+
+<Evidence title="during the window">
+
+```text
+$ SELECT pid, state, wait_event_type, wait_event,
+         pg_blocking_pids(pid) AS blocked_by,
+         now()-query_start AS waiting, left(query,50) AS q
+    FROM pg_stat_activity WHERE datname='demo' AND wait_event_type='Lock';
+
+  pid  | state  | wait_event_type |  wait_event   | blocked_by | waiting  |                q
+-------+--------+-----------------+---------------+------------+----------+----------------------------
+  8812 | active | Lock            | relation      | {8790}     | 00:02:41 | ALTER TABLE bookings ADD ...
+  8814 | active | Lock            | relation      | {8812}     | 00:02:38 | SELECT b.id, r.name FROM b...
+  8815 | active | Lock            | relation      | {8812}     | 00:02:36 | SELECT b.id, r.name FROM b...
+  8816 | active | Lock            | relation      | {8812}     | 00:02:31 | INSERT INTO bookings (room...
+  ... (47 rows)
+
+$ SELECT pid, state, now()-xact_start AS open_for, left(query,60)
+    FROM pg_stat_activity WHERE pid = 8790;
+  pid  |        state        | open_for |                    query
+-------+---------------------+----------+----------------------------------------
+  8790 | idle in transaction | 00:09:12 | SELECT count(*), date FROM bookings ...
+```
+
+</Evidence>
+
+<Evidence title="context">
+
+```text
+Application: health checks pass (they hit /api/health, which does SELECT 1)
+App logs: no errors; request durations climb to the 30s proxy timeout
+Deploy pipeline: runs migrations at 09:00 on weekdays (scheduled deploy window)
+pid 8790 client_addr: 10.0.4.22  →  the analytics container
+Analytics tool: opens a transaction, runs a dashboard refresh query every
+  morning at 08:55, and holds the connection open between queries
+Migration being applied: ALTER TABLE bookings ADD COLUMN source text;
+```
+
+</Evidence>
+
+Three parties, one outage. Explain the chain precisely, and give both the immediate and permanent fixes.
+
+<Reveal label="Reveal the cause">
+
+**A lock queue: an idle analytics transaction blocks a migration, and the migration blocks all 47 normal queries behind it.**
+
+**The chain, in order:**
+
+1. **08:55 — the analytics tool** opens a transaction, runs its dashboard query against `bookings`, and then sits `idle in transaction` without committing. It holds a weak `ACCESS SHARE` lock on `bookings` — harmless on its own, and it would coexist happily with all normal traffic forever.
+2. **09:00 — the migration** runs `ALTER TABLE bookings ADD COLUMN`, which needs `ACCESS EXCLUSIVE`. That conflicts with the analytics session's lock, so the migration **waits** (pid 8812, `blocked_by {8790}`).
+3. **09:00 onwards — every other query** touching `bookings` now queues *behind the waiting migration*, because Postgres grants locks roughly in request order and will not let later weak-lock requests jump ahead of a pending exclusive request. Note the `blocked_by` column: pids 8814, 8815, 8816 are blocked by **8812 (the migration)**, not by 8790. Forty-seven queries, all waiting on a migration that is itself waiting.
+4. The app hangs. Requests climb to the 30s proxy timeout. Nothing errors in the database because waiting is not an error.
+
+**Why every signal looked healthy:** CPU and memory are flat because waiting consumes neither. The health check passes because `SELECT 1` doesn't touch `bookings`. There are no application errors because the queries haven't failed — they haven't finished. This is the characteristic signature of lock contention, and it's why `pg_blocking_pids` is the diagnostic that matters: it's the only one that shows the structure.
+
+**The three-minute duration is the coincidence that made it survivable** — the analytics transaction eventually ended, the migration acquired its lock and completed in milliseconds, and the queue drained. Had the analytics tool held its transaction for an hour, so would the outage.
+
+**Immediate fix (during an incident):**
+```sql
+SELECT pg_cancel_backend(8812);     -- cancel the waiting migration first:
+                                    -- this drains the queue instantly
+```
+Cancel the **migration**, not the analytics session — it's the thing 47 queries are queued behind, and cancelling it is harmless (the migration simply didn't apply). Then deal with 8790.
+
+**Permanent fixes, all three needed:**
+
+1. **Every migration gets `lock_timeout`.** This is the single highest-value change:
+   ```sql
+   SET lock_timeout = '3s';
+   ALTER TABLE bookings ADD COLUMN source text;
+   ```
+   The migration now fails after 3 seconds instead of parking an exclusive lock request in front of the world. A failed migration is a retry; a 3-minute outage is an incident.
+2. **Stop the analytics tool holding transactions open.** Set `idle_in_transaction_session_timeout` (globally, or on the analytics role specifically), and configure the tool to use autocommit for read-only dashboards:
+   ```sql
+   ALTER ROLE analytics SET idle_in_transaction_session_timeout = '15s';
+   ```
+3. **Make it visible next time:** `ALTER DATABASE demo SET log_lock_waits = on;` and alert when any session has `wait_event_type='Lock'` for more than ~5 seconds. This outage was invisible to every existing signal for two weeks.
+
+Worth adding: **don't run migrations in the same window as a known analytics refresh**, and consider reader access via a replica so dashboard queries can't interact with production DDL at all (M9.4).
+
+**The transferable lesson:** lock problems are not about the lock *you* take — they're about the **queue**. A harmless reader plus a harmless DDL statement combined into a total outage, and neither party did anything individually wrong. `lock_timeout` on DDL is the seatbelt, and `pg_blocking_pids` is how you see the structure when it fails.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review the migrations in this repository. For each, tell me which lock it takes and what it blocks, whether it rewrites the table, and how long it would take on a table with 5 million rows. Flag any that need CREATE INDEX CONCURRENTLY, a lock_timeout, or a multi-step approach, and show me the safe rewrite for the worst one."}>
+The "rewrites the table" question is the one that separates a 3ms migration from a 20-minute outage — adding a column with a volatile default or changing a column type rewrites every row. Check the advice against your actual Postgres version; the rules for what requires a rewrite have changed across versions, so make it state the version it's assuming.
+</AgentTask>
+
+<AgentTask prompt={"Write me a lock diagnosis runbook for Postgres: the query that shows who is blocked and who is blocking (using pg_blocking_pids), the query that finds long-open and idle-in-transaction sessions, how to decide which process to cancel first when a queue has formed, and the difference between pg_cancel_backend and pg_terminate_backend. Include what healthy output looks like."}>
+The "which to cancel first" reasoning is the valuable part — in a queue you usually cancel the *blocked blocker* (the DDL everything is stacked behind), not the original holder. Test every query now, while nothing is blocked, and record the healthy output — that's the L8.7 discipline applied to the queries you'll need most urgently.
+</AgentTask>
+
+<AgentTask prompt={"Find any code path in this repo where two or more rows are updated in a single transaction, and tell me whether the rows are locked in a deterministic order. For each path that isn't ordered, show the fix (ORDER BY id in the locking SELECT, or sorting the ids before the loop) and explain the deadlock scenario it prevents."}>
+Inconsistent lock ordering is invisible in review and shows up as intermittent `deadlock detected` in production. Also confirm you have a retry handler for SQLSTATE `40P01` — ordering makes deadlocks rare, retries make them survivable, and you want both.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+When something is "hanging" rather than erroring:
+
+1. Run the `pg_blocking_pids` query. Who is waiting, and on whom?
+2. Find sessions `idle in transaction` — that's usually the root holder.
+3. Follow the chain: the thing blocking 47 queries may itself be blocked.
+4. Cancel the blocker that is draining the queue (often a waiting DDL), then fix the root.
+
+Standing protections:
+
+- `lock_timeout` set on every migration — the single highest-value habit here.
+- `CREATE INDEX CONCURRENTLY` for indexes on large tables.
+- `idle_in_transaction_session_timeout` set, especially for analytics roles.
+- `log_lock_waits = on`, so waits are searchable afterwards.
+- Rows locked in a consistent order (`ORDER BY id`) wherever several are updated.
+- Retry handling for `40P01` (deadlock) and `40001` (serialization).
+- An alert on any session waiting on a lock for more than a few seconds.
+
+What good looks like: migrations fail fast rather than blocking the world; lock waits are logged and alerted; deadlocks are rare and retried automatically.
+
+Red flags: an analytics tool or BI dashboard connected to the primary with long transactions; migrations run without `lock_timeout`; "it hung, we re-ran it and it worked" as an accepted outcome.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l04"
+  questions={[
+    {
+      q: "A long-running SELECT holds a weak lock. An ALTER TABLE queues behind it. What happens to a fast SELECT that arrives afterwards?",
+      options: [
+        "It runs immediately, since SELECTs don't conflict with each other",
+        "It queues behind the ALTER — Postgres grants locks roughly in order, so one pending exclusive request blocks everything after it",
+        "It fails immediately with a lock error",
+        "It runs against a stale snapshot without waiting"
+      ],
+      answer: 1,
+      explain: "The queue is the dangerous part. A harmless reader plus a harmless DDL statement combine into a total outage, which is how a nullable column addition took a site down for fifteen minutes."
+    },
+    {
+      q: "How long does a row lock taken by an UPDATE last?",
+      options: [
+        "Until the UPDATE statement finishes",
+        "Until the transaction ends — which is why every rule about short transactions is really a rule about locks",
+        "For a fixed timeout of one second",
+        "Until another transaction requests the same row"
+      ],
+      answer: 1,
+      explain: "Lock duration equals transaction duration. That's why an external API call inside a transaction (L7.3) is also a lock-holding problem, and why `idle in transaction` sessions are so destructive."
+    },
+    {
+      q: "What does `SELECT … FOR UPDATE SKIP LOCKED` enable?",
+      options: [
+        "Reading rows without any locking overhead",
+        "Several workers draining the same table as a queue — each claims different rows instead of waiting for one another",
+        "Updating rows without a transaction",
+        "Automatic retry when a lock is unavailable"
+      ],
+      answer: 1,
+      explain: "Verified in the hands-on: worker A claims rows 1,2 and worker B claims 3,4, with no blocking. It's the mechanism behind using a plain table as a job queue (L7.9, D7)."
+    },
+    {
+      q: "Why do CPU, memory and error-rate dashboards all look healthy during a lock-contention outage?",
+      options: [
+        "The metrics are sampled too infrequently to catch it",
+        "Waiting consumes no CPU or memory and produces no error — queries haven't failed, they simply haven't finished",
+        "The database excludes blocked queries from its statistics",
+        "Lock waits are reported only in the application tier"
+      ],
+      answer: 1,
+      explain: "'Everything is slow and nothing is wrong' is the signature. `pg_blocking_pids` is the diagnostic that shows the structure, and `log_lock_waits = on` is what makes it visible after the fact."
+    },
+    {
+      q: "What is the single highest-value habit for making migrations safe?",
+      options: [
+        "Running them during low-traffic hours",
+        "Setting `lock_timeout` so the migration fails fast instead of parking an exclusive lock request that everything queues behind",
+        "Wrapping every migration in an explicit transaction",
+        "Always adding columns as nullable"
+      ],
+      answer: 1,
+      explain: "A failed migration is a retry; a blocked one is an outage. Low-traffic windows help but don't prevent it — the break-fix outage happened at 09:00 precisely because a scheduled migration met a scheduled analytics query."
+    }
+  ]}
+/>
+
+</Section>

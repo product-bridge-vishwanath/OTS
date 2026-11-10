@@ -1,0 +1,46 @@
+id: sc-concurrency-basics-01
+module: M7
+lesson: m07-l01
+title: "Rate limit lets a bot through and blocks real users"
+difficulty: realistic
+symptom: "A bot made 40 signups a minute against a 5-per-minute limit, while legitimate users are told 'too many attempts' after two tries."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/in-memory-rate-limit.patch   # module-level Map, multi-instance
+    - type: platform
+      apply: scripts/break/scale-to-four-instances.sh
+    - type: traffic
+      apply: scripts/load/signup-flood.js
+evidence:
+  logs: true
+  metrics: [signup.allowed, signup.blocked, process.instances]
+  db_console: true
+  notes: "Log lines carry an instance identifier, which is how the per-instance divergence becomes visible."
+agent:
+  context: "You wrote this rate limiter and verified it works correctly in local testing."
+  bias: "lowers the limit rather than questioning where the state lives"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - rate-limit-enforced-globally     # 5/min across all instances, not per instance
+    - legitimate-user-not-blocked
+  root_cause_markers:
+    - limiter state moved out of process memory to a shared store
+    - an atomic operation used (INCR or equivalent) rather than read-modify-write
+  symptom_only_markers:
+    - limit lowered to compensate for instance count
+    - session affinity enabled to pin users to one instance
+hints:
+  - "Both symptoms appeared together. What single property explains too-permissive AND too-strict?"
+  - "How many instances serve this app, and where does the limiter keep its counts?"
+  - "Even on one instance, two simultaneous requests both read the count before either writes. What is that shape called?"
+  - "Reveal: per-instance in-memory state means limit x instances. Move it to Redis and use an atomic INCR."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

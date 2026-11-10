@@ -1,0 +1,501 @@
+---
+id: m07-l09
+module: M7
+title: "Batch jobs and backfills: how not to take production down with a loop"
+order: 9
+difficulty: 3
+depth: both
+platforms: [postgres, redis, anthropic, openai]
+concepts: [batch-jobs, locks, connection-pooling, rate-limiting, idempotency]
+prerequisites: [m07-l04, m07-l07]
+lab: demo-repo
+scenario_ids: [sc-backfill-impact-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A product needed AI-generated summaries for every historical booking — 180,000 rows. The founder asked her agent for a backfill script. It produced something reasonable-looking: select all the rows, loop, call the model, update the row.
+
+She ran it at 14:00 on a Tuesday.
+
+At 14:02 the app began returning 500s. At 14:04 her LLM provider started refusing requests with 429s. At 14:06 the database hit its connection limit. At 14:09 she killed the script — and then discovered the harder problem: she had no idea how far it had got. Some rows had summaries, most didn't, and the script had no way to resume. Running it again would re-summarise everything it had already done, at full cost.
+
+The job itself wasn't wrong. It was *unbounded* — no limit on how fast it worked, how many connections it used, how long its transactions lasted, or how much it spent. A loop with no brakes, pointed at production.
+
+</Section>
+
+<Section kind="already-did">
+
+You've written one of these. A script to fix a data problem, recompute a column, import a CSV, or send a one-off announcement. It probably looked like `SELECT * FROM table` then a `for` loop — and it probably ran fine, because your table had 500 rows.
+
+The shape is identical at 500 rows and 500,000. The difference is that at 500 the brakes don't matter, and at 500,000 their absence is an outage. Agents write the 500-row version by default, because nothing in the prompt said "this must coexist with live traffic".
+
+</Section>
+
+<Section kind="mental-model">
+
+### The five brakes
+
+A safe <Term k="backfill">backfill</Term> is a normal loop with five constraints added. Each one prevents a specific failure from the story.
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Five brakes on a batch job: chunking, bounded concurrency, rate limiting, resumable progress, and throttling against live traffic" className="diagram">
+  <rect x="8" y="16" width="372" height="60" rx="10" />
+  <text x="194" y="40" textAnchor="middle">1 · CHUNK</text>
+  <text x="194" y="60" textAnchor="middle" className="sub">many small committed batches, not one big transaction</text>
+
+  <rect x="400" y="16" width="372" height="60" rx="10" />
+  <text x="586" y="40" textAnchor="middle">2 · BOUND CONCURRENCY</text>
+  <text x="586" y="60" textAnchor="middle" className="sub">a small, dedicated connection budget</text>
+
+  <rect x="8" y="90" width="372" height="60" rx="10" />
+  <text x="194" y="114" textAnchor="middle">3 · RATE LIMIT</text>
+  <text x="194" y="134" textAnchor="middle" className="sub">stay under every third party&apos;s ceiling</text>
+
+  <rect x="400" y="90" width="372" height="60" rx="10" />
+  <text x="586" y="114" textAnchor="middle">4 · RESUME</text>
+  <text x="586" y="134" textAnchor="middle" className="sub">durable per-item progress, so a kill is harmless</text>
+
+  <rect x="8" y="164" width="764" height="60" rx="10" />
+  <text x="390" y="188" textAnchor="middle">5 · YIELD TO LIVE TRAFFIC</text>
+  <text x="390" y="208" textAnchor="middle" className="sub">sleep between chunks · run off-peak · stop if the app degrades</text>
+
+  <text x="12" y="252" className="sub">Without 1–3 you cause an outage. Without 4 you cannot stop or restart safely.</text>
+  <text x="12" y="276" className="sub">Without 5 you are a denial-of-service attack with good intentions.</text>
+</svg>
+
+### 1. Chunk: many small transactions
+
+<Term k="chunking">Chunking</Term> is the single most important brake. One transaction over 180,000 rows holds locks for its entire duration (L7.4), bloats the database's snapshot, and loses everything if interrupted.
+
+```ts
+let lastId = 0;
+for (;;) {
+  const { rows } = await db.query(
+    `SELECT id FROM bookings WHERE id > $1 AND summary IS NULL
+      ORDER BY id LIMIT 500`, [lastId]);
+  if (rows.length === 0) break;
+
+  for (const row of rows) { /* …work, committed per row or per chunk… */ }
+
+  lastId = rows[rows.length - 1].id;
+  await sleep(200);                       // brake 5
+}
+```
+
+<Callout type="warn">
+**Use keyset pagination (`WHERE id > $lastId`), not `OFFSET`.** `OFFSET 100000` makes the database scan and discard 100,000 rows on *every* chunk, so the job gets quadratically slower and hammers the table. It also skips or repeats rows when the data changes underneath you. `WHERE id > last` uses the index and is stable.
+</Callout>
+
+### 2. Bound concurrency and connections
+
+The backfill must not compete with web traffic for the connection pool (L8.6's incident, M6.2). Give it its own small budget:
+
+```ts
+const batchPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 2 });
+```
+
+Two connections is usually plenty. The job will be slower; that's the point — you're choosing the job's speed over your users' errors.
+
+### 3. Rate limit against third parties
+
+Every external call has a ceiling — requests per minute, tokens per minute, or just your budget. Exceeding it gets you 429s (and, with a naive retry, a retry storm that makes it worse).
+
+```ts
+const CONCURRENCY = 3;            // simultaneous model calls
+const MIN_INTERVAL_MS = 250;      // ≈4 requests/second
+```
+
+For LLM backfills specifically, do the arithmetic **before** you start: 180,000 rows × ~2,000 tokens × your per-token price. That number has ended projects, and it's cheaper to compute than to discover (M13.6).
+
+### 4. Make it resumable
+
+The script must be killable at any moment and restartable without redoing work or double-charging. Two patterns:
+
+**a) Progress is visible in the data** — the cheapest option when a natural marker exists:
+```sql
+SELECT id FROM bookings WHERE summary IS NULL ORDER BY id LIMIT 500;
+```
+Re-running simply picks up the remaining rows. Requires the write to be idempotent per row (L7.7).
+
+**b) An explicit progress table** — when there's no natural marker, or you need status and error detail:
+```sql
+CREATE TABLE backfill_progress (
+  job        text    NOT NULL,
+  item_id    bigint  NOT NULL,
+  status     text    NOT NULL DEFAULT 'pending',   -- pending|done|failed
+  error      text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (job, item_id)
+);
+```
+This also gives you `SELECT status, count(*) … GROUP BY status` — a real progress report and a list of failures to retry, which a `for` loop can never provide.
+
+For a shared queue of work, `FOR UPDATE SKIP LOCKED` (L7.4) lets several workers drain it without collisions:
+
+```sql
+UPDATE backfill_progress SET status='running'
+ WHERE (job, item_id) IN (
+   SELECT job, item_id FROM backfill_progress
+    WHERE job=$1 AND status='pending'
+    ORDER BY item_id LIMIT 100
+      FOR UPDATE SKIP LOCKED)
+RETURNING item_id;
+```
+
+### 5. Yield to live traffic
+
+The job is less important than your users. Make that explicit in code:
+
+- **Sleep between chunks** — 100–500ms costs you little and gives the database room.
+- **Run off-peak**, and know your peak from metrics rather than intuition (L8.4).
+- **Watch and back off**: check a signal between chunks — pool waiters, replication lag, p95 latency — and pause if it's degrading. A job that monitors its own impact is the difference between a professional backfill and a loop with a `sleep`.
+- **Have a kill switch** — a config flag or a row the job checks, so stopping it doesn't require finding the process.
+
+<Operator>
+
+Run both versions against the demo app and compare their effect on the live app.
+
+```bash
+cd demo-app
+
+# ── Baseline: how healthy is the app right now? ──────────────────────
+for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+  localhost:3001/api/bookings; done
+
+# ── 1. The UNSAFE backfill (the agent's default) ─────────────────────
+#   Grow the table first so the job has real work:
+docker compose exec -T db psql -U ots -d demo -f /dev/stdin \
+  < scripts/break/missing-index-growth.sql >/dev/null
+#   Now the greedy version: no chunking, no limit, long transaction.
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; UPDATE bookings SET meta = coalesce(meta,'{}'::jsonb) || '{\"backfilled\":true}'::jsonb;
+   SELECT pg_sleep(8); COMMIT;" >/dev/null 2>&1 &)
+sleep 2
+#   Measure the app DURING it:
+for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+  localhost:3001/api/bookings; done
+#   And see what it's holding:
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT pid, state, now()-xact_start AS tx_age,
+         (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock') AS waiters
+    FROM pg_stat_activity WHERE datname='demo' AND xact_start IS NOT NULL
+   ORDER BY xact_start LIMIT 3;"
+sleep 8
+
+# ── 2. The SAFE version: chunked, keyset-paginated, polite ───────────
+cat > /tmp/safe-backfill.sh <<'EOF'
+#!/bin/sh
+LAST=0; TOTAL=0
+while : ; do
+  IDS=$(docker compose exec -T db psql -U ots -d demo -tAc \
+    "SELECT id FROM bookings WHERE id > $LAST AND NOT (meta ? 'backfilled2')
+      ORDER BY id LIMIT 500;" | tr -d '\r' | tr '\n' ' ')
+  [ -z "$(echo $IDS | tr -d ' ')" ] && break
+  HI=$(echo $IDS | tr ' ' '\n' | tail -1)
+  docker compose exec -T db psql -U ots -d demo -c \
+    "UPDATE bookings SET meta = coalesce(meta,'{}'::jsonb) || '{\"backfilled2\":true}'::jsonb
+      WHERE id > $LAST AND id <= $HI;" >/dev/null
+  LAST=$HI; TOTAL=$((TOTAL+500))
+  echo "chunk committed, through id $LAST"
+  sleep 0.3                       # brake 5: yield to live traffic
+done
+echo "done, ~$TOTAL rows"
+EOF
+chmod +x /tmp/safe-backfill.sh
+(/tmp/safe-backfill.sh > /tmp/backfill.log 2>&1 &)
+sleep 3
+#   Measure the app DURING the safe version:
+for i in 1 2 3; do curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+  localhost:3001/api/bookings; done
+tail -3 /tmp/backfill.log
+
+# ── 3. Prove resumability: kill it and restart ───────────────────────
+pkill -f safe-backfill.sh 2>/dev/null
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT count(*) FILTER (WHERE meta ? 'backfilled2') AS done,
+          count(*) FILTER (WHERE NOT (meta ? 'backfilled2')) AS remaining
+     FROM bookings;"
+#   Restarting continues from the remaining rows — the WHERE clause IS
+#   the progress marker. No work is repeated, nothing is double-charged.
+
+# ── 4. Watch your own impact between chunks (the professional touch) ─
+docker compose exec -T db psql -U ots -d demo -tAc "
+  SELECT count(*) FROM pg_stat_activity
+   WHERE datname='demo' AND wait_event_type='Lock';" | xargs echo "lock waiters:"
+#   A real job reads this (or p95 latency) between chunks and pauses if
+#   it is above zero.
+
+# ── 5. Clean up the grown table ──────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name LIKE 'archived-customer-%';"
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE bookings SET meta = meta - 'backfilled' - 'backfilled2';"
+rm -f /tmp/safe-backfill.sh /tmp/backfill.log
+```
+
+Compare the two sets of latency measurements. The unsafe version's long transaction and table-wide update is what the app feels; the chunked version is nearly invisible to it.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Approach |
+|---|---|
+| Paginate a large table | **Keyset**: `WHERE id > $last ORDER BY id LIMIT n`. Never `OFFSET` |
+| Per-item progress + retry | A progress table with a status column |
+| Several workers on one queue | `FOR UPDATE SKIP LOCKED` |
+| Bounded concurrency in Node | `p-limit`, or a simple semaphore |
+| Rate limiting outgoing calls | `bottleneck`, or a token bucket in Redis |
+| Dedicated DB connections | A second `Pool` with `max: 2` |
+| Long-running managed jobs | Inngest, Trigger.dev, Temporal, a Render background worker |
+| Bulk transforms with no app logic | Plain SQL in chunks — far faster than a loop over rows |
+| Bulk LLM work | Provider **batch APIs** — significantly cheaper and designed for this |
+
+Two points worth internalising:
+
+**If the transform can be expressed in SQL, do it in SQL, in chunks.** A loop that fetches a row, computes in JavaScript, and writes it back does three network round trips per row. `UPDATE … WHERE id BETWEEN` does 500 rows in one. The loop is only necessary when each item needs application logic or an external call.
+
+**For LLM backfills, use the batch API.** Anthropic's Message Batches and the equivalents elsewhere are built for exactly this job — asynchronous, cheaper per token, and with no rate-limit dance. A 180,000-row summarisation backfill belongs there, not in a `for` loop against the synchronous endpoint.
+
+What good looks like: every backfill is chunked, keyset-paginated, has its own small connection pool, rate-limits external calls, records per-item progress, sleeps between chunks, and can be killed at any moment with no consequence beyond stopping.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Record a baseline** of `/api/bookings` latency (first Operator command). You need it to judge impact.
+
+2. **Run the unsafe version** (step 1) and measure the app *during* it. Note the latency change, the transaction age, and the lock waiters. This is the 14:02 moment from the story.
+
+3. **Run the safe version** (step 2) and measure again. The difference between those two measurements is the entire lesson.
+
+4. **Prove resumability** (step 3): kill it mid-run, inspect how much is done, and restart. Confirm no work repeats — the `WHERE NOT (meta ? 'backfilled2')` clause is the progress marker.
+
+5. **Compare `OFFSET` against keyset** on the grown table, and watch the cost diverge:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+     -c 'SELECT id FROM bookings ORDER BY id OFFSET 350000 LIMIT 500;' \
+     -c 'SELECT id FROM bookings WHERE id > 350000 ORDER BY id LIMIT 500;'
+   ```
+   The `OFFSET` query scans and throws away 350,000 rows. Imagine that on every chunk.
+
+6. **Add a self-monitoring brake.** Modify the safe script to read lock waiters (step 4) between chunks and sleep longer when it's above zero. That's the step that distinguishes a job you can run during business hours.
+
+7. **Write a progress table version** for a job where there's no natural marker, with `status` and `error` columns, and confirm you can answer "how far along, and what failed?" in one query.
+
+8. **Clean up** (step 5).
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A data migration to re-encrypt a `ssn_encrypted` column was started at 09:30 on a weekday. Within four minutes the app was timing out. The engineer killed the script at 09:36. The app recovered — but now the data is in an unknown state and nobody will say whether it is safe to re-run.
+
+<Evidence title="the script">
+
+```ts
+const rows = await db.query("SELECT id, ssn_encrypted FROM customers");   // 2.4M rows
+console.log(`re-encrypting ${rows.rowCount} customers`);
+
+await db.query("BEGIN");
+for (const row of rows.rows) {
+  const plain = await kms.decrypt(row.ssn_encrypted);        // AWS KMS, ~25ms
+  const reenc = await kms.encrypt(plain, NEW_KEY_ID);        // AWS KMS, ~25ms
+  await db.query("UPDATE customers SET ssn_encrypted=$1 WHERE id=$2", [reenc, row.id]);
+}
+await db.query("COMMIT");
+```
+
+</Evidence>
+
+<Evidence title="what happened">
+
+```text
+09:30:02  script started
+09:30:44  SELECT returned 2.4M rows (process RSS climbed to 3.1 GB)
+09:32:10  app p95 latency 180ms → 6s
+09:33:40  app returning 500s: "timeout exceeded when trying to connect"
+09:34:02  AWS CloudTrail: KMS ThrottlingException begins (shared account limit)
+09:36:15  engineer killed the process (SIGKILL)
+
+Postgres after the kill:
+  SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction';  → 0
+  SELECT count(*) FROM customers WHERE ssn_encrypted LIKE 'v2:%';           → 0
+
+Progress logged by the script: none (only the initial count)
+Pool: shared with the web app, max 20
+```
+
+</Evidence>
+
+Count the defects, and say what the data state actually is — because the team's uncertainty is the most expensive part.
+
+<Reveal label="Reveal the cause">
+
+**Six defects. But first, the question paralysing the team: the data is fine, and it is safe to re-run.**
+
+`SELECT count(*) WHERE ssn_encrypted LIKE 'v2:%'` returns **0**, and the transaction never committed — the process was SIGKILLed, the connection dropped, and Postgres rolled back everything automatically. Zero rows were re-encrypted. Atomicity did its job perfectly (L7.3). The irony is that the single worst defect in the script — one giant transaction — is the reason recovery is trivial. Had it been chunked without a progress marker, the state really would have been unknown.
+
+**The defects:**
+
+1. **One transaction over 2.4M rows.** It would have held row locks on every row it touched for the full duration (hours), blocking any user who tried to update their own record. It also means no progress survives an interruption — all or nothing, on a job measured in hours.
+2. **`SELECT` with no `LIMIT`**, loading 2.4M rows into memory: 3.1GB RSS, heading for an OOM kill (M1.6) before the job would have finished.
+3. **No chunking and no keyset pagination**, so there is no natural resume point.
+4. **Two network calls per row inside the transaction** (L7.3's rule 2). At ~50ms per row, 2.4M rows is **33 hours** of open transaction. This also made the throttling inevitable: the loop issues KMS calls as fast as it can.
+5. **No connection isolation** — it used the web app's pool (max 20), so the job's connections and long transaction competed directly with user requests. That's the 09:33 timeout.
+6. **No rate limiting on KMS**, hitting a shared account-level limit at 09:34 — which would have affected *other services in the same AWS account*, not just this job. A backfill that degrades unrelated systems is the "denial of service with good intentions" case.
+
+Plus two absences: **no progress reporting** (the team couldn't tell how far it got, which is why they didn't know if it was safe to re-run) and **no kill switch** (stopping it required finding and killing a process).
+
+**The rewrite:**
+
+```ts
+const batchPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 2 });
+const limit = pLimit(4);                       // ≤4 concurrent KMS calls
+
+let lastId = 0;
+for (;;) {
+  if (await killSwitchEnabled()) { console.log("stopping: kill switch"); break; }
+
+  const { rows } = await batchPool.query(
+    `SELECT id, ssn_encrypted FROM customers
+      WHERE id > $1 AND ssn_encrypted NOT LIKE 'v2:%'
+      ORDER BY id LIMIT 200`, [lastId]);
+  if (rows.length === 0) break;
+
+  await Promise.all(rows.map(row => limit(async () => {
+    const plain = await kms.decrypt(row.ssn_encrypted);
+    const reenc = await kms.encrypt(plain, NEW_KEY_ID);     // writes 'v2:' prefix
+    // One short transaction per row; no external call inside it.
+    await batchPool.query(
+      `UPDATE customers SET ssn_encrypted=$1
+        WHERE id=$2 AND ssn_encrypted NOT LIKE 'v2:%'`,      // idempotent
+      [reenc, row.id]);
+  })));
+
+  lastId = rows[rows.length - 1].id;
+  const waiters = await lockWaiters(batchPool);
+  await sleep(waiters > 0 ? 2000 : 200);                     // back off under contention
+  console.log(`through id ${lastId}`);
+}
+```
+
+Every brake is present: chunked with keyset pagination, bounded concurrency, a dedicated 2-connection pool, no external call inside a transaction, the `v2:` prefix as both the resume marker and the idempotency guard, a self-monitoring sleep, and a kill switch.
+
+**Before re-running:** test it on a copy, compute the KMS call count against the account's throttling limit, schedule it off-peak, and confirm the `v2:` filter means a re-run skips completed rows (step 4 of the hands-on, on real data).
+
+**The transferable lesson:** a backfill is not a script, it's an **operation against production**. The question to answer before running one is not "does the logic work?" but **"what is the maximum harm this can do per second, and how do I stop it?"** Every brake is an answer to that question.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review this backfill script against the five brakes — chunking with keyset pagination (not OFFSET), bounded concurrency with a dedicated connection pool, rate limiting on external calls, durable per-item resumability, and yielding to live traffic. For each brake, say whether it is present, and for each missing one describe the specific production failure it would cause. Also tell me the total number of external API calls and the estimated cost."}>
+The call count and cost estimate are not optional for anything touching a paid API — compute them before running, not after. If every brake is "present", be suspicious and check the pagination is genuinely keyset; `OFFSET` with a `LIMIT` looks chunked and degrades quadratically.
+</AgentTask>
+
+<AgentTask prompt={"Rewrite this script as a safe backfill: keyset pagination in chunks of 200-500, its own connection pool with max 2, bounded concurrency on external calls, one short transaction per item with no network call inside it, a resume marker that doubles as an idempotency guard, a sleep between chunks, a kill switch it checks each chunk, and progress logging. Show me how to verify resumability by killing it mid-run."}>
+"A resume marker that doubles as an idempotency guard" is the elegant part — `WHERE NOT already_done` in both the select and the update means a re-run is free and safe without a separate progress table. Actually kill it mid-run and restart to verify, as the hands-on does; a resumability claim you haven't tested is a guess.
+</AgentTask>
+
+<AgentTask prompt={"I need to run this backfill against production. Tell me: what the maximum harm per second is, which metric I should watch while it runs, what threshold should make me stop it, how to stop it without finding the process, and roughly how long it will take at a rate that keeps p95 latency within 20% of baseline. If this job should use a provider batch API instead of a loop, say so."}>
+The last question matters for LLM and bulk-mail work — batch APIs are cheaper and built for it, and an agent will happily write you a synchronous loop instead. The "how to stop it" answer must be a flag or a row the job polls, not `kill -9`, which is how the break-fix left the team unsure of their data state.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before running any backfill against production:
+
+1. **Chunked?** Keyset pagination (`WHERE id > $last`), never `OFFSET`.
+2. **One transaction per chunk or per item?** Never one transaction for the whole job.
+3. **No external call inside a transaction?**
+4. **Own connection pool**, `max` of 2–3, separate from the web app's?
+5. **Rate limited** against every third party, with the total call count and cost computed in advance?
+6. **Resumable?** A marker in the data or a progress table, so a kill costs nothing.
+7. **Idempotent per item?** Re-running must not double-charge or double-send.
+8. **Sleeps between chunks**, and ideally reads a signal (lock waiters, p95) and backs off?
+9. **Kill switch** that doesn't require finding the process?
+10. **Progress logged**, so "how far did it get?" is answerable?
+11. **Tested on a copy**, and scheduled off-peak based on real metrics?
+
+What good looks like: you can start a backfill during business hours, watch it have no measurable effect on users, stop it at any moment, and restart it tomorrow where it left off.
+
+Red flags: `SELECT *` with no limit on a large table; a single `BEGIN` around a loop; a backfill sharing the web app's pool; a job whose progress is only in stdout; `OFFSET`-based pagination; and discovering the cost of an LLM backfill from the invoice.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l09"
+  questions={[
+    {
+      q: "Why is `OFFSET`-based pagination wrong for a backfill?",
+      options: [
+        "OFFSET isn't supported on large tables",
+        "Each chunk makes the database scan and discard all preceding rows, so the job degrades quadratically — and rows can be skipped or repeated when data changes underneath",
+        "OFFSET requires a sort that can't use an index",
+        "It holds a lock on the rows it skips"
+      ],
+      answer: 1,
+      explain: "`OFFSET 350000` scans and throws away 350,000 rows on that chunk alone. Keyset pagination (`WHERE id > $last`) uses the index, stays constant-cost, and is stable under concurrent writes."
+    },
+    {
+      q: "In the break-fix, how much data had actually been re-encrypted when the script was killed?",
+      options: [
+        "Roughly a third, matching the elapsed time",
+        "None — the single giant transaction was never committed, so the SIGKILL caused a complete rollback",
+        "An unknown amount, which is why it was unsafe to re-run",
+        "All rows up to the last logged id"
+      ],
+      answer: 1,
+      explain: "The worst design flaw — one transaction for 2.4M rows — is the reason recovery was trivial. Atomicity rolled everything back. Chunking *without* a resume marker is what would have left a genuinely unknown state."
+    },
+    {
+      q: "Why must a backfill have its own connection pool with a small max?",
+      options: [
+        "Separate pools are faster due to connection reuse",
+        "Otherwise it competes with web traffic for the shared pool and can starve user requests — making the job's speed come directly out of your users' reliability",
+        "Postgres requires separate pools for DDL and DML",
+        "It prevents the job from holding locks"
+      ],
+      answer: 1,
+      explain: "That's the 09:33 timeout, and the same mechanism as the connection-starvation incident in M8.6. Two connections is usually enough; the job being slower is the deliberate trade."
+    },
+    {
+      q: "What makes a resume marker like `WHERE ssn_encrypted NOT LIKE 'v2:%'` especially elegant?",
+      options: [
+        "It avoids needing an index on the column",
+        "It serves as both the progress marker and the idempotency guard — a re-run skips completed rows automatically, with no separate progress table",
+        "It allows the job to run in a single transaction safely",
+        "It lets several workers coordinate without locks"
+      ],
+      answer: 1,
+      explain: "Progress is visible in the data itself, so killing and restarting costs nothing and nothing is processed twice. A progress table is for when no such natural marker exists."
+    },
+    {
+      q: "What's the right question to answer before running a backfill against production?",
+      options: [
+        "Has the logic been code-reviewed?",
+        "What is the maximum harm this can do per second, and how do I stop it without finding the process?",
+        "How long will it take to complete?",
+        "Does it handle every edge case in the data?"
+      ],
+      answer: 1,
+      explain: "A backfill is an operation against production, not a script. Every one of the five brakes is an answer to that question — and a kill switch beats `kill -9`, which is what left the break-fix team unsure of their data state."
+    }
+  ]}
+/>
+
+</Section>

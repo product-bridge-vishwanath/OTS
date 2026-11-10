@@ -1,0 +1,44 @@
+id: sc-double-booking-01
+module: M7
+lesson: m07-l02
+title: "Two customers, one studio, same evening"
+difficulty: realistic
+symptom: "Two customers hold confirmed bookings for the same room and time. Support has three such pairs this week."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: traffic
+      apply: scripts/load/booking-rush.js          # 15 simultaneous identical bookings
+evidence:
+  logs: true
+  metrics: [http.2xx, bookings.created]
+  db_console: true
+agent:
+  context: "The booking endpoint already checks for clashes before inserting, so you believe it is correct."
+  bias: "adds a disabled state to the submit button and calls it fixed"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - one-booking-per-slot-under-rush   # 15 simultaneous requests, exactly one 201
+    - adjacent-bookings-still-allowed   # a booking starting when another ends must succeed
+    - clash-returns-409                 # not a 500
+  root_cause_markers:
+    - database-level constraint prevents overlap (exclusion constraint)
+    - application translates the violation into 409
+    - end-exclusive range semantics preserved
+  symptom_only_markers:
+    - client-side double-submit protection only
+    - transaction added around the existing check-then-insert
+    - unique constraint on hour columns (rejects legitimate adjacent bookings)
+hints:
+  - "The code checks availability before inserting. What happens if two requests both check first?"
+  - "What is between the check and the insert, and how long does it take?"
+  - "A unique constraint tests equality. Overlap is not equality — what else can Postgres enforce?"
+  - "Reveal: add an EXCLUDE USING gist constraint on (room_id, date, hour range) and return 409 on violation."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

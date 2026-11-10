@@ -1,0 +1,44 @@
+id: sc-cron-twice-01
+module: M7
+lesson: m07-l08
+title: "1,400 customers got the digest three times"
+difficulty: realistic
+symptom: "After scaling the app to three instances, the weekly digest went out three times to every customer. No errors were logged."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: platform
+      apply: scripts/break/scale-worker-to-three.sh   # cron lives in the app container
+evidence:
+  logs: true
+  metrics: [digest.sent, reports.written, worker.instances]
+  db_console: true
+  notes: "Each runner logs its own successful completion, so the logs look healthy three times over."
+agent:
+  context: "You scaled the service to handle traffic and consider the deploy successful."
+  bias: "treats the duplicates as a mailing-list bug rather than a scheduling one"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - one-run-per-schedule-tick        # with three instances running
+    - duplicate-run-is-harmless        # work is idempotent even if the lock is bypassed
+    - job-liveness-detected            # stopping the job must raise an alert
+  root_cause_markers:
+    - single runner enforced by advisory lock or platform cron
+    - work made idempotent (unique key plus upsert)
+    - dead man's switch added and verified by not pinging
+  symptom_only_markers:
+    - scaled back to one instance with no lock added
+    - duplicate sends filtered downstream in the mail provider
+hints:
+  - "Where is the schedule defined, and what happens to it when you add instances?"
+  - "Three runs all logged success. What would have made two of them exit instead?"
+  - "An advisory lock stops duplicates. What would tell you the job stopped running entirely?"
+  - "Reveal: move the cron to one runner or take an advisory lock, make the work idempotent, and add a tested dead man's switch."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 20
+  agent_verification: 25

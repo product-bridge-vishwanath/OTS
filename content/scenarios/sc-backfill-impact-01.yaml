@@ -1,0 +1,52 @@
+id: sc-backfill-impact-01
+module: M7
+lesson: m07-l09
+title: "The backfill took production down in two minutes"
+difficulty: hard
+symptom: "A data backfill started at 14:00. By 14:02 the app returned 500s, by 14:04 the provider sent 429s, by 14:06 the connection pool was exhausted."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data
+      apply: scripts/break/missing-index-growth.sql        # enough rows for the job to matter
+    - type: job
+      apply: scripts/break/unbounded-backfill.js           # no chunking, no limits, one transaction
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [http.5xx, latency.p95, db.connections, db.lock_waiters, provider.429]
+  db_console: true
+  notes: "A rate-limited simulated provider is available, with a per-minute ceiling and a call counter."
+agent:
+  context: "You wrote this backfill script and verified it works on a small development dataset."
+  bias: "suggests raising the connection pool size and the provider rate limit"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - app-latency-within-20pct-of-baseline-during-backfill
+    - no-provider-429s
+    - backfill-completes
+    - backfill-resumable           # killed mid-run, restart repeats no work
+  root_cause_markers:
+    - chunked with keyset pagination (not OFFSET)
+    - dedicated small connection pool
+    - external calls rate limited and bounded in concurrency
+    - resume marker or progress table, idempotent per item
+    - sleep or adaptive backoff between chunks
+  symptom_only_markers:
+    - pool size or provider limits raised with the job unchanged
+    - job moved to night-time with no other change
+    - OFFSET-based pagination presented as chunking
+hints:
+  - "Measure the app's latency before and during the job. What is the job holding?"
+  - "How many rows does the first query return, and how long is its transaction open?"
+  - "Kill the job. How would a restart know what is already done?"
+  - "Reveal: apply the five brakes — chunk with keyset pagination, bound connections, rate limit, resume, and yield."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 50
+  stability: 30
+  agent_verification: 20

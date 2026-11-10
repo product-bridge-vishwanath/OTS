@@ -1,0 +1,49 @@
+id: sc-dst-shift-01
+module: M7
+lesson: m07-l10
+title: "Paid bookings cancelled in March, double fees in October"
+difficulty: hard
+symptom: "On the spring clock change, 61 paid bookings were cancelled. On the autumn change, 48 customers were charged a late fee twice."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: schema
+      apply: scripts/break/naive-timestamp-column.sql    # starts_at as plain timestamp
+    - type: config
+      apply: scripts/break/local-timezone-crontab.sh     # hourly job in Europe/London
+    - type: clock
+      apply: scripts/break/simulate-dst-transition.sh    # fast-forwards to both transitions
+evidence:
+  logs: true
+  metrics: [bookings.cancelled, late_fee.charged, cron.invocations]
+  db_console: true
+  notes: "The environment can be advanced to either 2026 UK transition so both incidents are reproducible."
+agent:
+  context: "You can see the job logic is a straightforward 24-hour window comparison."
+  bias: "adds an hour of tolerance to the window rather than examining types and scheduling"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-paid-bookings-cancelled-across-spring-transition
+    - one-fee-per-booking-across-autumn-transition
+    - cron-fires-once-per-hour-across-both-transitions
+  root_cause_markers:
+    - instants stored as timestamptz, built from an explicit zone
+    - schedule moved to UTC
+    - fee charge guarded by an atomic state transition with an idempotency key
+  symptom_only_markers:
+    - window widened or narrowed by an hour to compensate
+    - job disabled on transition weekends
+    - duplicate fees refunded with no code change
+hints:
+  - "Three defects compound here. Start with the column type of starts_at."
+  - "The cron ran twice with one server and no retries. What happened to the local clock that night?"
+  - "Even with one invocation, what makes the fee charge safe to repeat?"
+  - "Reveal: timestamptz for instants, CRON_TZ=UTC for the schedule, and a guarded idempotent charge."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 20
+  agent_verification: 25

@@ -1,0 +1,512 @@
+---
+id: m07-l03
+module: M7
+title: "Transactions and isolation: what BEGIN actually promises"
+order: 3
+difficulty: 3
+depth: both
+platforms: [postgres, mysql, supabase, neon]
+concepts: [transactions, isolation-levels, race-conditions]
+prerequisites: [m07-l02]
+lab: demo-repo
+scenario_ids: [sc-partial-write-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A marketplace's payout job ran nightly: for each seller, insert a payout row, then decrement their pending balance. Eleven months without incident.
+
+One night the database connection dropped partway through — a routine failover at the provider, thirty seconds of unavailability. The job had processed 1,840 of 3,200 sellers. Some had a payout row and a decremented balance. Some had a payout row and an **un-decremented** balance. One seller had a decremented balance and no payout row at all.
+
+Reconciling it took four days of a founder's time and a spreadsheet, because there was no way to tell from the data which sellers had been fully processed and which had been caught mid-write. The fix in the code was eight characters: `BEGIN` and `COMMIT`.
+
+The deeper lesson arrived a month later, when the same founder wrapped the *booking* endpoint in a transaction to stop double bookings — and double bookings continued. Transactions had solved the payout problem completely and the booking problem not at all, and nobody could explain why.
+
+</Section>
+
+<Section kind="already-did">
+
+You have used transactions without seeing them. Every single SQL statement you run is already a transaction — Postgres wraps it in one automatically, which is why a half-finished `UPDATE` affecting 10,000 rows never leaves 4,000 updated. Your ORM may wrap some operations for you too.
+
+You may also have been told by an agent to "wrap it in a transaction" to fix a concurrency bug, applied it, and found the bug still there. That experience is the thing this lesson exists to explain: transactions and locks solve different problems, and the word "isolation" in ACID promises less than it sounds like it does.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What a transaction actually gives you
+
+<Term k="acid">ACID</Term>, in plain language:
+
+| Letter | Promise | What it prevents |
+|---|---|---|
+| **A**tomic | All of my statements, or none | The marketplace's half-processed sellers |
+| **C**onsistent | Constraints hold at commit | Invalid data surviving a multi-step write |
+| **I**solated | Others don't see my partial work | Someone reading a booking that has no payment row yet |
+| **D**urable | Committed means survived | A crash losing an acknowledged write |
+
+```sql
+BEGIN;
+  INSERT INTO bookings (…) VALUES (…) RETURNING id;
+  INSERT INTO payments (booking_id, amount, provider_event_id) VALUES (…);
+  UPDATE rooms SET last_booked_at = now() WHERE id = $1;
+COMMIT;   -- all three, or (on ROLLBACK or a crash) none
+```
+
+<Callout type="key">
+**Atomicity is about *your own* statements. It is not mutual exclusion.** A transaction guarantees that your three writes land together. It does *not* stop another transaction doing the same three writes simultaneously. That single distinction explains why `BEGIN` fixed the payout job and did nothing for double bookings — and it is the most common misconception in this entire module.
+</Callout>
+
+### What "isolated" does and doesn't mean
+
+Isolation controls what concurrent transactions *see* of each other, not whether they can both act. Postgres's default is **read committed**, which gives you:
+
+- You never see another transaction's uncommitted work.
+- Each statement sees a fresh snapshot of committed data.
+
+What it does **not** give you: any guarantee that data you read is still true when you write. Two transactions can both `SELECT` and find a slot free, and both `INSERT`. Exactly the L7.2 race, now inside transactions.
+
+| Level | Prevents | Allows | Cost |
+|---|---|---|---|
+| **Read committed** (default) | Dirty reads | Lost updates, phantom reads | None |
+| **Repeatable read** | Dirty + non-repeatable reads | Some write skew | Occasional serialization errors |
+| **Serializable** | Everything above | Nothing — result equals *some* serial order | Conflicts you must retry |
+
+<svg viewBox="0 0 780 260" role="img" aria-label="The same read-modify-write under read committed loses a write with both transactions committing, while under serializable one transaction is aborted with a serialization failure" className="diagram">
+  <text x="12" y="20" className="sub">THE SAME CODE, TWO ISOLATION LEVELS</text>
+
+  <text x="12" y="48" className="sub">READ COMMITTED (default)</text>
+  <rect x="8" y="58" width="150" height="38" rx="6" />
+  <text x="83" y="82" textAnchor="middle" className="sub">A: read n = 0</text>
+  <rect x="172" y="58" width="150" height="38" rx="6" />
+  <text x="247" y="82" textAnchor="middle" className="sub">B: read n = 0</text>
+  <rect x="336" y="58" width="160" height="38" rx="6" />
+  <text x="416" y="82" textAnchor="middle" className="sub">B: write 2 · COMMIT ✓</text>
+  <rect x="510" y="58" width="160" height="38" rx="6" />
+  <text x="590" y="82" textAnchor="middle" className="sub">A: write 1 · COMMIT ✓</text>
+  <text x="684" y="82" className="sub">n = 1</text>
+  <text x="12" y="116" className="sub">Both committed. B&apos;s write is gone. No error anywhere — this is a lost update.</text>
+
+  <text x="12" y="152" className="sub">SERIALIZABLE</text>
+  <rect x="8" y="162" width="150" height="38" rx="6" />
+  <text x="83" y="186" textAnchor="middle" className="sub">A: read n = 0</text>
+  <rect x="172" y="162" width="150" height="38" rx="6" />
+  <text x="247" y="186" textAnchor="middle" className="sub">B: read n = 0</text>
+  <rect x="336" y="162" width="160" height="38" rx="6" />
+  <text x="416" y="186" textAnchor="middle" className="sub">B: write 2 · COMMIT ✓</text>
+  <rect x="510" y="162" width="240" height="38" rx="6" />
+  <text x="630" y="186" textAnchor="middle" className="sub">A: ERROR 40001 — aborted</text>
+  <text x="12" y="220" className="sub">Nothing is lost: the database refused one transaction rather than allow the anomaly.</text>
+  <text x="12" y="242" className="sub">A had no effect, so retrying it is safe — which is why serializable REQUIRES retry logic.</text>
+</svg>
+
+### Serializable: the real guarantee, with a real cost
+
+Under <Term k="serializable">serializable</Term>, Postgres tracks the dependencies between transactions and aborts one if the outcome couldn't have happened in any sequential order:
+
+```text
+ERROR:  could not serialize access due to concurrent update
+```
+
+That error is not a bug — **it is the feature.** The database is telling you "I prevented a lost update; please try again." Which means serializable is only correct if you have **retry logic**:
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();                    // BEGIN ISOLATION LEVEL SERIALIZABLE … COMMIT
+    } catch (e: any) {
+      // 40001 serialization_failure · 40P01 deadlock_detected
+      if ((e.code === "40001" || e.code === "40P01") && i < attempts - 1) {
+        await sleep(2 ** i * 50 + Math.random() * 50);   // backoff + jitter
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("unreachable");
+}
+```
+
+Without retries, serializable converts silent data corruption into user-visible 500s — better, but not the goal.
+
+### Choosing between the four tools
+
+You now have four ways to defend an invariant. They are not interchangeable:
+
+| Tool | Use when | Cost |
+|---|---|---|
+| **Constraint** (L7.2) | The rule is expressible in the schema | Almost none — always prefer this |
+| **Conditional write** (L7.2) | A counter or state transition | None |
+| **`FOR UPDATE` lock** (L7.4) | Multi-row invariant, moderate contention | Throughput; the waiters queue |
+| **Serializable** | Complex invariant across several tables | Retries, and conflicts rise with contention |
+
+### Three rules for transaction scope
+
+1. **Keep them short.** A transaction holds locks and a snapshot until it ends. Long ones block others and bloat the database (L7.4, M6.3).
+2. **Never `await` a network call inside one.** A Stripe call inside `BEGIN…COMMIT` means an open transaction for 400ms, times every concurrent request. This is the single most common cause of connection and lock pile-ups.
+3. **Do side effects after commit.** Sending an email inside a transaction that later rolls back means an email about something that didn't happen. Sending it after commit means it might not send — which is what queues and <Term k="idempotent">idempotency</Term> are for (L7.7).
+
+<Operator>
+
+Two terminals, side by side, is the best way to internalise this. Here it's scripted so you can run it directly.
+
+```bash
+cd demo-app
+
+# ── Atomicity: prove all-or-nothing ──────────────────────────────────
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+BEGIN;
+  INSERT INTO events (type, payload) VALUES ('tx.demo', '{"step":1}');
+  SELECT count(*) AS inside_tx FROM events WHERE type='tx.demo';
+ROLLBACK;
+SELECT count(*) AS after_rollback FROM events WHERE type='tx.demo';
+SQL
+#   inside_tx = 1, after_rollback = 0.
+
+# ── Isolation: another session can't see uncommitted work ────────────
+(docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; INSERT INTO events (type,payload) VALUES ('tx.uncommitted','{}'); SELECT pg_sleep(4); ROLLBACK;" \
+  >/dev/null 2>&1 &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT count(*) FROM events WHERE type='tx.uncommitted';" | xargs echo "other session sees:"
+#   0 — no dirty reads. Wait for the rollback before moving on.
+sleep 4
+
+# ── The misconception: a transaction does NOT prevent a lost update ──
+docker compose exec -T db psql -U ots -d demo -c \
+  "CREATE TABLE IF NOT EXISTS tx_demo(id int primary key, n int); \
+   TRUNCATE tx_demo; INSERT INTO tx_demo VALUES (1,0);" >/dev/null
+
+cat > /tmp/rmw.sql <<'SQL'
+BEGIN;                                  -- default: read committed
+  SELECT n FROM tx_demo WHERE id=1;     -- reads 0
+  SELECT pg_sleep(3);
+  UPDATE tx_demo SET n = 1 WHERE id=1;  -- writes 1, based on a stale read
+COMMIT;
+SQL
+(docker compose exec -T db psql -U ots -d demo < /tmp/rmw.sql >/dev/null 2>&1 &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN; SELECT n FROM tx_demo WHERE id=1; UPDATE tx_demo SET n=2 WHERE id=1; COMMIT;" >/dev/null
+sleep 4
+docker compose exec -T db psql -U ots -d demo -tAc "SELECT n FROM tx_demo WHERE id=1;" \
+  | xargs echo "final n (both transactions committed, one write lost):"
+#   1 — the second transaction's write to 2 was overwritten. BOTH used transactions.
+
+# ── Serializable: the same pattern is now REJECTED ───────────────────
+docker compose exec -T db psql -U ots -d demo -c "TRUNCATE tx_demo; INSERT INTO tx_demo VALUES (1,0);" >/dev/null
+cat > /tmp/ser.sql <<'SQL'
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+  SELECT n FROM tx_demo WHERE id=1;
+  SELECT pg_sleep(3);
+  UPDATE tx_demo SET n = 1 WHERE id=1;
+COMMIT;
+SQL
+(docker compose exec -T db psql -U ots -d demo < /tmp/ser.sql > /tmp/ser.out 2>&1 &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c \
+  "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT n FROM tx_demo WHERE id=1; \
+   UPDATE tx_demo SET n=2 WHERE id=1; COMMIT;" >/dev/null 2>&1
+sleep 4
+grep -iE "could not serialize|ERROR" /tmp/ser.out | head -2
+#   "could not serialize access due to concurrent update" — the lost
+#   update was PREVENTED, by refusing one transaction. Now you retry.
+
+# ── Find long-running transactions (rule 1 violations) ───────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT pid, state, now()-xact_start AS open_for, left(query,50) AS query
+    FROM pg_stat_activity
+   WHERE datname='demo' AND xact_start IS NOT NULL
+     AND now()-xact_start > interval '1 second'
+   ORDER BY xact_start;"
+
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE tx_demo;" >/dev/null
+rm -f /tmp/rmw.sql /tmp/ser.sql /tmp/ser.out
+```
+
+The third and fourth blocks are the heart of the lesson: the *identical* read-modify-write loses a write under read committed and is refused under serializable. Run them both and the distinction becomes permanent.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Concern | Postgres | Note |
+|---|---|---|
+| Set isolation per transaction | `BEGIN ISOLATION LEVEL SERIALIZABLE;` | Per-transaction is the right granularity — not a global default |
+| Retryable error codes | `40001` serialization_failure, `40P01` deadlock_detected | Retry these, with backoff and <Term k="jitter">jitter</Term> |
+| Find long transactions | `pg_stat_activity.xact_start` | Alert on anything open more than a few seconds |
+| Statement/transaction timeouts | `SET statement_timeout`, `idle_in_transaction_session_timeout` | The seatbelt for rule 1 |
+| Transactions in app code | `db.transaction(...)` in Drizzle/Prisma/Knex | Check whether your ORM retries serialization failures — most don't |
+| Savepoints | `SAVEPOINT` / `ROLLBACK TO` | Partial rollback inside a transaction; rarely needed |
+
+A configuration worth setting on day one, because it bounds the damage of rule-1 violations:
+
+```sql
+ALTER DATABASE demo SET idle_in_transaction_session_timeout = '30s';
+ALTER DATABASE demo SET statement_timeout = '30s';
+```
+
+An `idle in transaction` session holds its locks and snapshot while doing *nothing* — usually an application that opened a transaction and then awaited something slow. This timeout kills it instead of letting it block the database indefinitely.
+
+What good looks like: multi-step writes are wrapped in transactions; transactions contain no network calls; serializable is used deliberately where needed *with* retry logic; and `idle_in_transaction_session_timeout` is set.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Prove atomicity and isolation** with the first two Operator blocks. These are the easy, reassuring ones.
+
+2. **Prove the misconception** with the third block. Two transactions, both committed, one write silently lost. Write down the final value and why. This is the step that makes `BEGIN` stop feeling like magic.
+
+3. **Prove serializable prevents it** with the fourth block, and read the error text carefully. Note that the *write* was refused, not the read — the database detected the dependency at commit time.
+
+4. **Find the demo app's missing transaction.** Open [app/api/bookings/route.ts](demo-app/app/api/bookings/route.ts). It performs two writes: the booking insert, and the `events` insert. Ask: if the process died between them, what would the data look like? Then check whether anything wraps them.
+
+5. **Add the transaction.** Wrap both writes so a crash can't leave a booking with no event row:
+   ```ts
+   const client = await db.connect();
+   try {
+     await client.query("BEGIN");
+     const { rows } = await client.query("INSERT INTO bookings (…) RETURNING id", [...]);
+     await client.query("INSERT INTO events (type, payload) VALUES ('booking.created', $1)", [...]);
+     await client.query("COMMIT");
+   } catch (e) {
+     await client.query("ROLLBACK");
+     throw e;
+   } finally {
+     client.release();          // ← always, or you leak the connection (M6.2)
+   }
+   ```
+   Note what must stay **outside** the transaction: the 150ms `fraudCheck()`. Moving it inside would hold a transaction open for 400ms per request — rule 2.
+
+6. **Verify the rollback path actually works.** Temporarily make the second insert fail (e.g. insert into a non-existent column), attempt a booking, and confirm **no** booking row was created. An untested rollback path is a rollback path that doesn't work.
+
+7. **Set the timeouts** from the tools section and confirm with `SHOW idle_in_transaction_session_timeout;`.
+
+8. **Clean up:**
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "DELETE FROM events WHERE type LIKE 'tx.%'; DROP TABLE IF EXISTS tx_demo;"
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A booking app's "cancel and refund" flow sometimes leaves money unaccounted for. Finance reports that over three months, 23 cancellations have a refund recorded in Stripe with no matching `refunds` row, and 4 have a `refunds` row with no Stripe refund.
+
+<Evidence title="the handler">
+
+```ts
+// POST /api/bookings/:id/cancel
+const client = await db.connect();
+try {
+  await client.query("BEGIN");
+
+  const { rows } = await client.query(
+    "SELECT id, amount, payment_intent FROM payments WHERE booking_id=$1", [id]);
+  const payment = rows[0];
+
+  await client.query("UPDATE bookings SET status='cancelled' WHERE id=$1", [id]);
+
+  const refund = await stripe.refunds.create({                 // ← ~800ms, external
+    payment_intent: payment.payment_intent,
+  });
+
+  await client.query(
+    "INSERT INTO refunds (booking_id, stripe_refund_id, amount) VALUES ($1,$2,$3)",
+    [id, refund.id, payment.amount]);
+
+  await client.query("COMMIT");
+  await sendCancellationEmail(booking.customer_email);         // after commit ✓
+} catch (e) {
+  await client.query("ROLLBACK");
+  throw e;
+} finally {
+  client.release();
+}
+```
+
+</Evidence>
+
+<Evidence title="production evidence">
+
+```text
+Postgres logs, 23 occurrences over 3 months:
+  ERROR: canceling statement due to statement timeout
+  STATEMENT: INSERT INTO refunds (booking_id, stripe_refund_id, amount) VALUES ...
+  (statement_timeout = 1s; set last year to stop slow queries)
+
+Connection metrics during peak: pool exhausted twice weekly, waiters 4–12
+pg_stat_activity sample at peak:
+  7 of 10 connections: state='idle in transaction', open 0.6–0.9s
+
+The 4 refunds rows with no Stripe refund:
+  all four at 2026-09-14 between 10:02 and 10:04
+  Stripe status page: "Elevated error rates in the Refunds API", 10:00–10:15
+  Our logs for those: stripe.refunds.create threw, ROLLBACK ran... but
+    SELECT * FROM refunds WHERE booking_id IN (...)  → 4 rows present
+```
+
+</Evidence>
+
+Two different inconsistencies from one design error. Name it, explain both, and give the correct shape.
+
+<Reveal label="Reveal the cause">
+
+**An 800ms external API call sits inside the transaction. That single violation of rule 2 produces both inconsistencies, by two different mechanisms.**
+
+**Mechanism 1 — the 23 Stripe-refund-without-a-row cases.** The transaction opens, Stripe is called (800ms, succeeded — money is refunded), then the `INSERT INTO refunds` hits the 1-second `statement_timeout` and is cancelled. The transaction rolls back, undoing the `bookings` update and the refunds insert. **But the Stripe refund cannot be rolled back.** Postgres kept its promise perfectly — atomicity covers *its* statements and has no authority over a third party's side effects. The customer has their money; your books don't know.
+
+**Mechanism 2 — the 4 rows-without-a-Stripe-refund cases.** During Stripe's outage window, `stripe.refunds.create` threw. The `catch` ran `ROLLBACK`… and yet the rows exist. The reason is the error path itself: by the time the exception surfaced, the transaction had likely already been aborted or the connection reset by the earlier timeout behaviour, and the subsequent `ROLLBACK` on a connection in a failed state doesn't do what the code assumes. In short, **the rollback path was never tested** — exactly hands-on step 6's warning. An error handler that is only exercised during a vendor outage is an error handler nobody has ever seen work.
+
+**And a third consequence visible in the metrics:** 7 of 10 connections sitting `idle in transaction` for 0.6–0.9s at peak. Each cancellation holds a pooled connection and its locks for the whole Stripe round trip, which is why the pool exhausts twice a week. One rule-2 violation is also a capacity bug (M6.2).
+
+**The correct shape — the transaction covers only database work, and the external call is made idempotent:**
+
+```ts
+// 1. Reserve the intent to refund, in a short transaction.
+//    A unique constraint on booking_id makes this safe under concurrency (L7.2).
+const idemKey = `refund:${id}`;
+await db.query(
+  `INSERT INTO refunds (booking_id, amount, status, idempotency_key)
+   VALUES ($1,$2,'pending',$3) ON CONFLICT (booking_id) DO NOTHING`,
+  [id, amount, idemKey]);
+
+// 2. Call Stripe OUTSIDE any transaction, with an idempotency key so a
+//    retry cannot double-refund (L7.7).
+const refund = await stripe.refunds.create(
+  { payment_intent: paymentIntent },
+  { idempotencyKey: idemKey });
+
+// 3. Record the outcome in a second short transaction.
+await db.query(
+  `UPDATE refunds SET status='succeeded', stripe_refund_id=$2 WHERE booking_id=$1`,
+  [id, refund.id]);
+```
+
+Now every interruption leaves a **recoverable** state rather than an inconsistent one: a `pending` row with no `stripe_refund_id` means "we intended to refund and don't know if it happened" — which a reconciliation job can resolve by asking Stripe, safely, because the idempotency key guarantees it can't double-refund. The states are discoverable instead of invisible.
+
+**Also fix:** raise or scope the `statement_timeout` for this path (1s is aggressive for a write path), and add the reconciliation job plus an alert on `refunds` rows stuck in `pending` for more than a few minutes.
+
+**The transferable rules:**
+1. **A transaction cannot roll back the outside world.** The moment you call a third party inside one, atomicity becomes a false promise.
+2. **Make the state machine explicit** (`pending` → `succeeded`) so an interruption is a known, queryable state rather than a silent inconsistency.
+3. **Test the rollback path deliberately** — it is the code most likely to be wrong and least likely to have been run.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Find every place in this codebase where a network call, external API request, email send, or long-running computation happens inside a database transaction (between BEGIN and COMMIT, or inside an ORM transaction callback). For each, give file:line, how long that call typically takes, and what inconsistent state results if it fails or times out mid-transaction."}>
+This is the highest-value audit in the lesson. Verify a hit or two by reading the code yourself. For each one, ask the follow-up: "what does the data look like if this throws?" — if the answer isn't a state you could query for and recover from, the design needs the pending-then-confirm shape, not just a moved call.
+</AgentTask>
+
+<AgentTask prompt={"Rewrite this handler so the transaction covers only database work and the external call happens outside it, using an explicit status column (pending → succeeded/failed) and an idempotency key on the external call. Then write the reconciliation query that finds rows stuck in pending and explain how it resolves them safely."}>
+The reconciliation query is the part that proves the design works — without it, `pending` rows are just a different kind of invisible inconsistency. Check the idempotency key is **derived deterministically** (from the booking id, say) rather than randomly generated per attempt, or a retry creates a second operation (L7.7).
+</AgentTask>
+
+<AgentTask prompt={"Add serializable isolation with correct retry handling to this operation: [describe it]. Retry only on SQLSTATE 40001 and 40P01, with exponential backoff and jitter, a bounded attempt count, and no retry on other errors. Explain what the user sees if all attempts fail, and why retrying a serialization failure is safe while retrying an arbitrary error is not."}>
+Check it retries *only* those two codes — a blanket retry on any error will happily re-run a transaction that failed on a constraint violation or a bug, forever. The safety explanation should note that a serialization failure means the transaction had **no effect**, so re-running it is clean; that reasoning doesn't hold for errors thrown mid-transaction elsewhere.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every multi-step write:
+
+- Is it wrapped in a transaction, so a crash can't leave it half-done?
+- Does the transaction contain **any** network call? (If yes, that's the bug.)
+- Are side effects — emails, webhooks, notifications — sent **after** commit?
+- Is the connection released in a `finally` block?
+- Has the **rollback path** actually been executed and verified?
+
+For concurrency protection specifically:
+
+- Am I relying on a transaction to prevent duplicates? (It won't — use a constraint, a conditional write, a lock, or serializable.)
+- If using serializable: is there retry logic for `40001`/`40P01` with backoff and jitter?
+- Is `idle_in_transaction_session_timeout` set, so a stuck transaction can't hold locks forever?
+- Does anything alert on transactions open longer than a few seconds?
+
+What good looks like: short transactions containing only database work; external calls made idempotently outside them; explicit status columns so interruptions leave recoverable states; and a reconciliation job for anything involving money.
+
+Red flags: `BEGIN` used as a concurrency fix; a Stripe or email call between `BEGIN` and `COMMIT`; serializable without retries; a rollback path nobody has ever seen run.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l03"
+  questions={[
+    {
+      q: "Why did wrapping the booking endpoint in a transaction fail to stop double bookings?",
+      options: [
+        "The transaction needed to be committed explicitly",
+        "Atomicity applies to your own statements — it groups your writes but does nothing to stop another transaction performing the same check and insert simultaneously",
+        "Read committed isolation caches the SELECT result",
+        "The INSERT needed a RETURNING clause to take effect"
+      ],
+      answer: 1,
+      explain: "The single most common misconception in this module. A transaction is all-or-nothing for your writes, not mutual exclusion. Preventing duplicates needs a constraint, a conditional write, a lock, or serializable isolation."
+    },
+    {
+      q: "Under Postgres's default read-committed isolation, two transactions each read a counter as 0 and write their own new value. What happens?",
+      options: [
+        "The second transaction blocks until the first commits, then reads the new value",
+        "Both commit successfully and one write is silently lost",
+        "Postgres raises a serialization failure on the second commit",
+        "The counter ends up with the sum of both increments"
+      ],
+      answer: 1,
+      explain: "Exactly what the hands-on demonstrates: both transactions commit, final value reflects only the last write. Read committed prevents dirty reads, not lost updates."
+    },
+    {
+      q: "What does the error \"could not serialize access due to concurrent update\" mean?",
+      options: [
+        "The database is overloaded and rejecting connections",
+        "Serializable isolation detected a conflict and aborted one transaction to prevent an anomaly — it's the feature working, and it requires retry logic",
+        "The transaction exceeded its statement timeout",
+        "Two transactions deadlocked and one was chosen as the victim"
+      ],
+      answer: 1,
+      explain: "It means a lost update was prevented. Because the transaction had no effect, retrying it is safe — which is why serializable is only correct when paired with retries on SQLSTATE 40001."
+    },
+    {
+      q: "Why must an external API call never sit inside a database transaction?",
+      options: [
+        "The database connection will time out during the call",
+        "A rollback cannot undo the third party's side effect, so atomicity becomes a false promise — and the transaction holds a connection and locks for the whole round trip",
+        "External calls cannot be made while a transaction is open",
+        "The ORM will serialise the HTTP response into the transaction log"
+      ],
+      answer: 1,
+      explain: "Both halves bit the break-fix: Stripe refunds that couldn't be rolled back, and 7 of 10 connections stuck `idle in transaction` at peak, exhausting the pool twice a week."
+    },
+    {
+      q: "What makes the pending → succeeded status pattern better than a single write after the external call?",
+      options: [
+        "It avoids needing an idempotency key",
+        "Every interruption leaves a recoverable, queryable state — a pending row means 'we intended this and don't know if it happened', which a reconciliation job can resolve safely",
+        "It allows the transaction to span the external call safely",
+        "It reduces the number of database round trips"
+      ],
+      answer: 1,
+      explain: "The goal isn't to make interruptions impossible but to make their consequences discoverable. Combined with a deterministic idempotency key, reconciliation can finish the job without risking a double operation."
+    }
+  ]}
+/>
+
+</Section>

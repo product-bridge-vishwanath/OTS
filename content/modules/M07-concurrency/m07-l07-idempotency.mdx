@@ -1,0 +1,518 @@
+---
+id: m07-l07
+module: M7
+title: "Idempotency: the webhook fired twice and exactly-once is a lie"
+order: 7
+difficulty: 3
+depth: both
+platforms: [postgres, redis, upstash, anthropic, openai]
+concepts: [idempotency, queues, race-conditions]
+prerequisites: [m07-l02]
+lab: demo-repo
+scenario_ids: [sc-idempotency-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A booking platform charged 38 customers twice on a Tuesday morning.
+
+The cause was not a bug in their payment code. Their payment code was correct. What happened was that their webhook handler took 1.4 seconds to process each `payment_intent.succeeded` event — a little slow, but fine. Stripe's webhook timeout is shorter than that under load, so Stripe concluded the delivery had failed and **retried**, exactly as documented. The handler ran twice, inserted two payment records, and triggered two confirmation emails and two ledger entries.
+
+The founder's first reaction was to email Stripe support about their duplicate webhooks. The reply, politely: *at-least-once delivery is the documented guarantee, and the integration guide recommends keying on the event ID.*
+
+The refunds took two days. The lesson took five minutes to learn and would have taken five minutes to implement: **a system that can retry will retry, and the receiver is responsible for making the second attempt harmless.**
+
+</Section>
+
+<Section kind="already-did">
+
+You have been on the receiving end of a retry without noticing. A form that submitted twice on a flaky connection. A webhook delivered again because your handler was slow. A deploy that re-ran a job. A user who refreshed during checkout. A mobile client that retried on a dropped connection.
+
+You may also have *written* a retry — an agent suggesting "add retry logic" for a flaky call — which is a reasonable thing to do and doubles the number of times the other side might act. Every retry you add is a duplicate someone downstream must tolerate, including when the downstream is you.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Why exactly-once delivery doesn't exist
+
+A sender dispatches a message and waits for an acknowledgement. The acknowledgement doesn't arrive. The sender cannot distinguish between:
+
+1. the message never arrived,
+2. the message arrived and was processed, but the ack was lost.
+
+<svg viewBox="0 0 780 250" role="img" aria-label="Two indistinguishable failure cases: the message never arrived, or the message arrived and was processed but the acknowledgement was lost" className="diagram">
+  <defs>
+    <marker id="arrid" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <text x="12" y="20" className="sub">CASE A — the message never arrived</text>
+  <rect x="8" y="30" width="150" height="46" rx="8" />
+  <text x="83" y="58" textAnchor="middle" className="sub">sender</text>
+  <rect x="560" y="30" width="150" height="46" rx="8" />
+  <text x="635" y="58" textAnchor="middle" className="sub">receiver: did nothing</text>
+  <path d="M 162 53 L 390 53" className="arrow" markerEnd="url(#arrid)" />
+  <text x="276" y="46" textAnchor="middle" className="sub">message ✗ lost here</text>
+
+  <text x="12" y="112" className="sub">CASE B — it arrived, was processed, and the ACK was lost</text>
+  <rect x="8" y="122" width="150" height="46" rx="8" />
+  <text x="83" y="150" textAnchor="middle" className="sub">sender</text>
+  <rect x="560" y="122" width="150" height="46" rx="8" />
+  <text x="635" y="142" textAnchor="middle" className="sub">receiver: charged</text>
+  <text x="635" y="160" textAnchor="middle" className="sub">the card ✓</text>
+  <path d="M 162 138 L 556 138" className="arrow" markerEnd="url(#arrid)" />
+  <text x="358" y="132" textAnchor="middle" className="sub">message delivered</text>
+  <path d="M 556 158 L 330 158" className="arrow" markerEnd="url(#arrid)" />
+  <text x="430" y="176" textAnchor="middle" className="sub">ack ✗ lost here</text>
+
+  <text x="12" y="212" className="sub">The sender sees the SAME thing in both cases: silence. No further message resolves it —</text>
+  <text x="12" y="234" className="sub">asking &quot;did you get it?&quot; can have its own reply lost. So the sender must guess, and guessing safely means retrying.</text>
+</svg>
+
+Those two states look identical from outside, and there is no message the sender can send to tell them apart — asking would have the same problem. So the sender must choose:
+
+- **Retry** → the message might be processed twice (<Term k="at-least-once">at-least-once</Term>)
+- **Don't retry** → the message might never be processed (at-most-once)
+
+<Callout type="key">
+Everyone who matters chooses at-least-once, because losing a payment notification is worse than sending one twice. Stripe, SQS, every webhook provider, every queue you'll use. **"Exactly-once delivery" is not a product you can buy** — what you can build is *exactly-once effect*, by making the receiver tolerate duplicates. That's idempotency, and it's your job, not the sender's.
+</Callout>
+
+### What <Term k="idempotent">idempotent</Term> means
+
+An operation is idempotent if performing it twice has the same effect as once.
+
+| Not idempotent | Idempotent version |
+|---|---|
+| `INSERT INTO payments …` | `INSERT … ON CONFLICT (event_id) DO NOTHING` |
+| `balance = balance - 100` | `UPDATE … SET status='paid' WHERE status='pending'` |
+| `sendEmail(customer)` | send only if no `email_sent` record for this event id |
+| `qty = qty + 1` | upsert keyed on `(cart_id, sku, request_id)` |
+
+Note the pattern: idempotency comes from **naming the operation** and recording that the name has been handled. Relative operations ("add 100") are inherently unsafe to repeat; absolute ones ("set status to paid") usually are not.
+
+### The mechanism: an idempotency key with a unique constraint
+
+```sql
+ALTER TABLE payments ADD CONSTRAINT payments_event_unique UNIQUE (provider_event_id);
+```
+
+```ts
+// Second delivery of the same event changes nothing and reports success.
+const res = await db.query(
+  `INSERT INTO payments (booking_id, amount, provider_event_id)
+   VALUES ($1,$2,$3)
+   ON CONFLICT (provider_event_id) DO NOTHING
+   RETURNING id`,
+  [bookingId, amount, eventId]);
+
+if (res.rowCount === 0) {
+  console.log(`payment.duplicate event=${eventId} — already processed`);
+  return NextResponse.json({ ok: true, duplicate: true });   // 200, deliberately
+}
+// …first time only: side effects go here…
+```
+
+Two details that matter enormously:
+
+- **Return 200 on the duplicate.** A 409 or 500 tells the provider delivery failed, so it retries *again* — you've built a retry loop. The provider's question is "did you receive this?", and the answer is yes.
+- **The constraint is what makes it safe under concurrency.** Two deliveries arriving simultaneously both find no existing row; the unique index lets exactly one insert win (L7.2). `SELECT`-then-`INSERT` without the constraint is the same race in a new costume.
+
+### Where the key comes from
+
+| Situation | Key |
+|---|---|
+| Incoming webhook | The provider's event id (`evt_1A2b…`) — always present, use it |
+| Outgoing payment / API call | A key **you** generate, deterministically from the operation |
+| Queue job | The job id, or a hash of its meaningful payload |
+| Client form submission | A UUID the client generates once per attempt and reuses on retry |
+
+<Callout type="warn">
+For outgoing calls, the key must be **deterministic** — derived from what you're doing (`refund:booking:4471`), not randomly generated per attempt. A fresh UUID on each retry defeats the entire mechanism: the provider sees a new operation each time and happily performs it again. This is the single most common implementation error.
+</Callout>
+
+```ts
+// Correct: the same logical operation always produces the same key.
+const idemKey = `refund:booking:${bookingId}`;
+await stripe.refunds.create({ payment_intent }, { idempotencyKey: idemKey });
+```
+
+### Side effects beyond the database
+
+A unique constraint protects your rows. It does **not** stop the second run from sending an email, because the email already left. So:
+
+1. **Do side effects after the guard**, inside the `rowCount > 0` branch — not before it.
+2. **Record each side effect** with its own key if it must happen exactly once (`notifications(event_id, kind)` with a unique constraint).
+3. Accept that some things are **best-effort**: a duplicate "thanks for booking" email is a minor annoyance; a duplicate charge is not. Spend your effort proportionally.
+
+### Idempotency keys expire — and the window matters
+
+Providers keep keys for a limited time (Stripe: 24 hours). After that, the same key is treated as new. For retries that happen within seconds this is irrelevant; for a job that could be re-run days later — a backfill, a replayed dead-letter queue — your *own* record of what you processed is the authority, not the provider's memory.
+
+<Operator>
+
+The demo app's webhook handler has no idempotency (planted anti-pattern AP6). Reproduce, fix, verify.
+
+```bash
+cd demo-app
+
+# ── 1. Reproduce the double charge ───────────────────────────────────
+APP_URL=http://localhost:3001 node scripts/load/webhook-replay.js
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT provider_event_id, count(*), sum(amount) AS charged
+    FROM payments GROUP BY 1 HAVING count(*) > 1;"
+#   One event, two rows, double the money.
+
+# ── 2. See what simultaneous delivery does (worse than sequential) ───
+EV="evt_concurrent_$(date +%s)"
+for i in 1 2 3; do
+  (curl -s -X POST localhost:3001/api/webhooks/payment \
+     -H 'Content-Type: application/json' \
+     -d "{\"event_id\":\"$EV\",\"booking_id\":1,\"amount\":240}" >/dev/null &)
+done
+sleep 2
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT count(*) FROM payments WHERE provider_event_id='$EV';" \
+  | xargs echo "rows for one concurrently-delivered event:"
+
+# ── 3. Clean up and install the constraint ───────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM payments WHERE provider_event_id LIKE 'evt_%';"
+docker compose exec -T db psql -U ots -d demo -c "
+  ALTER TABLE payments
+    ADD CONSTRAINT payments_event_unique UNIQUE (provider_event_id);"
+#   If this fails, you already have duplicates — find and resolve them first:
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT provider_event_id, count(*), array_agg(id) AS row_ids
+    FROM payments GROUP BY 1 HAVING count(*) > 1;"
+
+# ── 4. Prove the constraint holds (before touching app code) ─────────
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO payments (booking_id, amount, provider_event_id)
+  VALUES (1, 240, 'evt_dup_test');" >/dev/null
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO payments (booking_id, amount, provider_event_id)
+  VALUES (1, 240, 'evt_dup_test');" 2>&1 | tail -2
+#   duplicate key value violates unique constraint — the money is safe.
+
+# ── 5. The idempotent insert, which is what the app should do ────────
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO payments (booking_id, amount, provider_event_id)
+  VALUES (1, 240, 'evt_dup_test')
+  ON CONFLICT (provider_event_id) DO NOTHING
+  RETURNING id;"
+#   'INSERT 0 0' with no row: nothing happened, and nothing errored.
+#   That zero row count is how your handler knows to skip side effects.
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM payments WHERE provider_event_id='evt_dup_test';"
+
+# ── 6. Check your own retries aren't creating the problem ────────────
+grep -rnE "retry|retries|attempt" --include="*.ts" app/ lib/ worker/ 2>/dev/null | head
+#   Every retry you add is a duplicate the far side must tolerate.
+
+# ── 7. Restore the anti-pattern for other learners ───────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_event_unique;"
+```
+
+Step 5 is the shape to internalise: a duplicate produces `INSERT 0 0` — no row, no error. Your code branches on that, skips the email and the ledger entry, and returns 200.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Mechanism |
+|---|---|
+| Deduplicate incoming events | Unique constraint on the provider's event id + `ON CONFLICT DO NOTHING` |
+| Deduplicate outgoing calls | The provider's idempotency-key header, with a **deterministic** key |
+| Short-lived dedup without a table | Redis `SET key value NX EX 86400` — atomic claim with expiry |
+| Dedup queue jobs | A unique job id, or a `processed_events` table |
+| Client-side retry safety | A UUID generated once per form attempt, resent on retry |
+| Make a state change idempotent | `UPDATE … WHERE status = 'pending'` — guarded transitions |
+| Exactly-once side effects | A `notifications(event_id, kind)` table with a unique constraint |
+
+Provider support worth knowing: **Stripe** accepts `Idempotency-Key` on every mutating request and keeps keys 24 hours. **SQS** offers message deduplication on FIFO queues within a 5-minute window. **Anthropic and OpenAI** APIs are not idempotent by default — a retried completion is a new completion and a new charge, so cache or key them yourself (M13.6).
+
+The Redis one-liner is worth remembering for cases where a table feels heavy:
+
+```ts
+// NX = only if absent. Atomic, so concurrent deliveries can't both win.
+const first = await redis.set(`evt:${eventId}`, "1", "NX", "EX", 86400);
+if (!first) return { ok: true, duplicate: true };
+```
+
+Note the trade-off: Redis dedup is fast and self-expiring, but if Redis is flushed you lose the memory of what you processed. For money, keep the record in Postgres where it's durable and auditable.
+
+What good looks like: every webhook endpoint keyed on the provider's event id with a unique constraint; every outgoing payment carrying a deterministic idempotency key; duplicates answered with 200; and side effects placed after the dedup guard.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Reproduce the double charge** (Operator step 1) and look at the money: one event, two rows.
+
+2. **Try it concurrently** (step 2). Three simultaneous deliveries of one event. Note that this is worse than the sequential case and that a `SELECT`-then-`INSERT` check would not have saved you — only a constraint can.
+
+3. **Install the constraint** (step 3) and **prove it at the database level** (step 4).
+
+4. **Watch the idempotent insert do nothing, quietly** (step 5). `INSERT 0 0` is the signal your handler branches on.
+
+5. **Fix the application.** Rewrite [app/api/webhooks/payment/route.ts](demo-app/app/api/webhooks/payment/route.ts) so that it:
+   - inserts with `ON CONFLICT (provider_event_id) DO NOTHING … RETURNING id`,
+   - returns `200 {ok:true, duplicate:true}` when `rowCount === 0`,
+   - logs the duplicate distinguishably (`payment.duplicate event=…`),
+   - only writes the `events` row — the side effect — on the first delivery.
+
+   Then verify:
+   ```bash
+   APP_URL=http://localhost:3001 node scripts/load/webhook-replay.js
+   docker compose exec -T db psql -U ots -d demo -c "
+     SELECT provider_event_id, count(*) FROM payments GROUP BY 1 HAVING count(*) > 1;"
+   ```
+   Target: both deliveries return 200, exactly one payment row, zero duplicate groups.
+
+6. **Check the side-effect placement.** Confirm the `events` insert is inside the first-delivery branch. If it's outside, you've deduplicated the money and not the audit trail — a partial fix that looks complete.
+
+7. **Find your own retries** (step 6) and for each ask: does the far side tolerate a duplicate? The demo app's `fraudCheck` is a no-op, but in your real product every retry is a duplicate contract with someone.
+
+8. **Restore the anti-pattern** (step 7) for the next learner.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A SaaS company's monthly invoicing job runs on the 1st. This month, 212 of 4,100 customers received two invoices, and 9 received three. The job itself reported success. It has run cleanly for 14 months.
+
+<Evidence title="the job">
+
+```ts
+// Runs on the 1st at 02:00 (platform cron)
+for (const customer of await getActiveCustomers()) {
+  const amount = await computeUsage(customer.id);
+
+  const invoice = await stripe.invoices.create({        // no idempotency key
+    customer: customer.stripe_id,
+    amount,
+  });
+
+  await db.query(
+    "INSERT INTO invoices (customer_id, stripe_invoice_id, amount, period) VALUES ($1,$2,$3,$4)",
+    [customer.id, invoice.id, amount, period]);
+
+  await sendInvoiceEmail(customer.email, invoice.id);
+}
+```
+
+</Evidence>
+
+<Evidence title="what happened this month">
+
+```text
+Platform cron logs:
+  02:00:04  invoice-job started  (run_id 7741)
+  02:08:51  invoice-job FAILED   — Error: connect ETIMEDOUT (stripe.com)
+  02:08:51  retrying job (platform retry policy: 2 attempts)
+  02:08:53  invoice-job started  (run_id 7742)
+  02:19:40  invoice-job completed successfully
+
+Stripe status page: brief connectivity incident 02:06–02:09 UTC
+
+invoices table:
+  SELECT customer_id, count(*) FROM invoices WHERE period='2026-11' GROUP BY 1 HAVING count(*)>1;
+   → 221 rows (212 with 2, 9 with 3)
+  First attempt reached customer index ~2,050 before failing.
+
+Also: the 9 customers with three invoices appear in a second log line:
+  02:19:38  WARN sendInvoiceEmail failed for 9 customers (SMTP timeout) — job retried send loop
+```
+
+</Evidence>
+
+Three things went wrong. Name each, and give the design that makes a mid-job failure safe.
+
+<Reveal label="Reveal the cause">
+
+**The job is not idempotent and is not resumable, so the platform's retry re-did work that had already succeeded.**
+
+**Problem 1 — no idempotency key on the outgoing call.** `stripe.invoices.create` with no `idempotencyKey` means the retry created genuinely new invoices for the ~2,050 customers already processed. Stripe did exactly what it was asked. A deterministic key — `invoice:${customer.id}:${period}` — would have made the second attempt return the *existing* invoice instead of creating one.
+
+**Problem 2 — no record of per-customer progress.** The job has no idea which customers it finished. Its only state is the loop counter in a process that no longer exists. Any interruption therefore means "start from the beginning", which is only safe if every step is idempotent — and none of them were. This is the resumability gap (L7.9).
+
+**Problem 3 — a non-idempotent side effect, retried independently.** The 9 triple-invoiced customers come from the inner email retry: the send loop was retried, and because sending an email is not idempotent and wasn't keyed, those customers got an extra one. Note that this is a *separate* defect from the first two — it would have produced duplicate emails even with Stripe keys in place.
+
+**And the 14 clean months are the trap.** The job was always broken; it had simply never been interrupted. A retry policy configured for resilience became the trigger, which is a recurring theme in this module — the environment changed (a brief Stripe blip), not the code.
+
+**The resumable, idempotent design:**
+
+```sql
+-- 1. One row per customer per period, created BEFORE any external call.
+CREATE TABLE invoice_runs (
+  customer_id       integer NOT NULL,
+  period            text    NOT NULL,
+  status            text    NOT NULL DEFAULT 'pending',   -- pending|invoiced|emailed|failed
+  stripe_invoice_id text,
+  amount            integer,
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (customer_id, period)      -- ← makes re-running a no-op
+);
+```
+
+```ts
+for (const customer of await getActiveCustomers()) {
+  // Claim this customer for this period. A second run skips claimed ones.
+  const claim = await db.query(
+    `INSERT INTO invoice_runs (customer_id, period) VALUES ($1,$2)
+     ON CONFLICT (customer_id, period) DO NOTHING RETURNING customer_id`,
+    [customer.id, period]);
+
+  const row = await db.query(
+    `SELECT status FROM invoice_runs WHERE customer_id=$1 AND period=$2`,
+    [customer.id, period]);
+  if (row.rows[0].status !== "pending") continue;          // already done — resume point
+
+  const amount = await computeUsage(customer.id);
+
+  // Deterministic key: the same logical invoice, however many times we retry.
+  const invoice = await stripe.invoices.create(
+    { customer: customer.stripe_id, amount },
+    { idempotencyKey: `invoice:${customer.id}:${period}` });
+
+  await db.query(
+    `UPDATE invoice_runs SET status='invoiced', stripe_invoice_id=$3, amount=$4, updated_at=now()
+      WHERE customer_id=$1 AND period=$2`,
+    [customer.id, period, invoice.id, amount]);
+
+  await sendInvoiceEmail(customer.email, invoice.id);      // keyed separately
+  await db.query(
+    `UPDATE invoice_runs SET status='emailed', updated_at=now()
+      WHERE customer_id=$1 AND period=$2`, [customer.id, period]);
+}
+```
+
+Now a crash at customer 2,050 means the retry skips 2,050 rows in milliseconds and continues. Each external call is keyed, so even a retry *mid-customer* is safe. And `status` makes the state of every customer queryable — you can find exactly who is stuck, which no log line could tell you before.
+
+**Cleaning up this month:** void the 221 duplicate Stripe invoices (carefully, matching the extras not the originals), reconcile the `invoices` table, and email affected customers before they email you. That's a day of work caused by a missing key.
+
+**The transferable rule:** **any job that can be retried must be idempotent at the granularity of its smallest unit of work** — here, one customer. Per-item claims plus deterministic keys plus an explicit status column is the standard shape, and it converts an interruption from a data-integrity incident into a resumption.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit every webhook handler and every job in this codebase for idempotency: does it have a key, is the key derived from the sender's event id or deterministically from the operation, is there a unique constraint backing it, does a duplicate return a 2xx, and are side effects (emails, charges, notifications) placed after the deduplication guard or before it? Give file:line and the specific defect for each."}>
+The side-effect placement question catches the partial fix that looks complete — deduplicating the database row while still sending the second email. Also confirm duplicates return 2xx: a 409 or 500 tells the provider delivery failed and triggers another retry, so you've built a loop.
+</AgentTask>
+
+<AgentTask prompt={"Make this webhook handler idempotent: [paste it]. Use the provider's event id with a unique constraint and ON CONFLICT DO NOTHING, return 200 with a duplicate flag when nothing was inserted, log duplicates distinguishably, and move all side effects inside the first-delivery branch. Include the migration, and the query to find pre-existing duplicates that would block adding the constraint."}>
+The pre-existing-duplicates query matters: on real data the constraint will fail to apply, and resolving those rows is a product decision about money, not a migration detail. Verify with two sequential deliveries *and* three simultaneous ones — only the constraint survives the concurrent case.
+</AgentTask>
+
+<AgentTask prompt={"Add idempotency keys to every outgoing payment, refund and email call in this repo. Keys must be deterministic — derived from the entity and operation (e.g. refund:booking:123), never randomly generated per attempt. Show me each call site before and after, and explain what breaks if the key is random."}>
+"What breaks if the key is random" is the check that it understands the mechanism: a fresh UUID per attempt means the provider sees a new operation each time and performs it again, defeating the whole thing. This is the most common implementation error, and agents make it readily.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every inbound event or message:
+
+- Is there a key? (The provider's event id — it's always there.)
+- Is there a **unique constraint** on it? (The constraint, not a `SELECT` check, is what survives concurrency.)
+- Does a duplicate return **2xx**? (Anything else triggers another retry.)
+- Are side effects **inside** the first-delivery branch?
+- Is a duplicate logged distinguishably, so you can see how often it happens?
+
+For every outbound call that costs money or sends something:
+
+- Is there an idempotency key, and is it **deterministic** rather than per-attempt random?
+- Does the provider support keys, and for how long? (Stripe: 24h.)
+- Is your own record of "already done" durable, for retries beyond that window?
+
+For every job:
+
+- Can it be interrupted halfway? What happens when it re-runs?
+- Is there a **per-item** claim or status row, so a retry resumes rather than restarts?
+- Is every step idempotent at the granularity of one item?
+
+What good looks like: replaying any webhook, re-running any job, and double-submitting any form are all harmless, and you can prove it by doing them.
+
+Red flags: "our provider sends duplicate webhooks" framed as their bug; randomly generated idempotency keys; a retry policy added without checking what the far side does with duplicates; a job whose only progress record is a loop counter.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l07"
+  questions={[
+    {
+      q: "Why is exactly-once delivery impossible, regardless of provider?",
+      options: [
+        "Network packets can be corrupted in transit",
+        "A sender whose acknowledgement is lost cannot distinguish 'never arrived' from 'arrived and was processed', so it must choose between retrying (possible duplicates) and not retrying (possible loss)",
+        "Clock skew prevents reliable ordering of messages",
+        "Distributed systems cannot guarantee message ordering"
+      ],
+      answer: 1,
+      explain: "The two states are indistinguishable from outside and no extra message resolves it. Everyone chooses at-least-once because loss is worse than duplication — which makes exactly-once *effect* the receiver's job."
+    },
+    {
+      q: "Why must a duplicate webhook delivery return 200 rather than 409?",
+      options: [
+        "409 is reserved for validation errors",
+        "A non-2xx tells the provider delivery failed, so it retries again — turning your duplicate handling into a retry loop",
+        "Providers ignore response codes entirely",
+        "200 is required for the provider to record the event as delivered in its dashboard"
+      ],
+      answer: 1,
+      explain: "The provider's question is 'did you receive this?' and the honest answer is yes. Returning an error means you'll keep being asked, with increasing backoff and alarm."
+    },
+    {
+      q: "Why must an outgoing idempotency key be deterministic rather than a fresh UUID per attempt?",
+      options: [
+        "Random UUIDs may collide across customers",
+        "A new key on each retry makes the provider see a new operation and perform it again — defeating the entire mechanism",
+        "Providers reject keys that aren't derived from the request body",
+        "Deterministic keys are shorter and cheaper to transmit"
+      ],
+      answer: 1,
+      explain: "The most common implementation error. `refund:booking:4471` means the same logical operation always presents the same key; `crypto.randomUUID()` per attempt means every retry is a new charge."
+    },
+    {
+      q: "You add `ON CONFLICT DO NOTHING` to a webhook insert but leave the confirmation email before that statement. What have you built?",
+      options: [
+        "A fully idempotent handler",
+        "A partial fix: the payment row is deduplicated but the duplicate delivery still sends a second email",
+        "A handler that will deadlock on concurrent deliveries",
+        "A handler that returns the wrong status code"
+      ],
+      answer: 1,
+      explain: "A unique constraint protects rows, not side effects that already left the building. Side effects must sit inside the branch where the insert actually created something."
+    },
+    {
+      q: "The invoicing job had run cleanly for 14 months before duplicating 221 invoices. What changed?",
+      options: [
+        "Customer count crossed a threshold that exhausted memory",
+        "Nothing in the code — a brief Stripe connectivity blip caused the platform's retry policy to re-run a job that was never idempotent or resumable",
+        "Stripe changed its invoice API semantics",
+        "The cron schedule began overlapping with another job"
+      ],
+      answer: 1,
+      explain: "The job was always broken; it had simply never been interrupted. A retry policy configured for resilience became the trigger — and the fix is per-item claims plus deterministic keys so a retry resumes instead of restarting."
+    }
+  ]}
+/>
+
+</Section>

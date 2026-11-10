@@ -1,0 +1,50 @@
+id: sc-lock-wait-01
+module: M7
+lesson: m07-l04
+title: "Every weekday at 09:00 the app hangs for three minutes"
+difficulty: hard
+symptom: "Requests hang rather than erroring, for about three minutes every weekday morning, then recover. CPU and memory are flat; no application errors."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: job
+      apply: scripts/break/idle-analytics-transaction.sh   # holds a transaction open on bookings
+    - type: migration
+      apply: scripts/break/unprotected-migration.sh        # ALTER TABLE with no lock_timeout
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [http.5xx, latency.p95, db.lock_waiters, cpu.pct, memory.pct]
+  db_console: true
+  notes: "Health checks hit an endpoint that does not touch the locked table, so they stay green throughout."
+agent:
+  context: "You can see that CPU, memory and error rates are all normal."
+  bias: "concludes the database is healthy and suspects the application or network"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-lock-queue-during-migration
+    - migration-still-applies-or-fails-fast
+    - lock-wait-alerting-present
+  root_cause_markers:
+    - learner uses pg_blocking_pids to find the queue structure
+    - identifies that ordinary queries are blocked by the waiting DDL, not the original holder
+    - lock_timeout added to migrations
+    - idle-in-transaction timeout set for the analytics role
+  symptom_only_markers:
+    - app restarted or scaled up
+    - proxy timeout increased
+    - original holder killed without preventing recurrence
+hints:
+  - "Nothing is erroring and nothing is consuming CPU. What state are the queries in?"
+  - "Run the pg_blocking_pids query while it is happening. Read the blocked_by column carefully."
+  - "A plain SELECT is waiting. Is it waiting for the long transaction, or for something else?"
+  - "Reveal: a waiting ALTER TABLE queues everything behind it. Add lock_timeout to migrations and bound idle transactions."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

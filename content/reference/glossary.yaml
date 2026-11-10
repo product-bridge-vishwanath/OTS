@@ -117,6 +117,63 @@ terms:
     name: PITR (point-in-time recovery)
     def: Restoring a database to any chosen moment, not just the nightly snapshot — the difference between losing one minute and losing one day of data.
 
+  # --- concurrency (M7) ---
+  read-modify-write:
+    name: Read-modify-write
+    def: Reading a value, changing it in your code, then writing it back. Safe alone; under concurrency two readers both get the old value and the second write erases the first.
+  check-then-act:
+    name: Check-then-act
+    def: Checking whether something is allowed and then doing it, as two separate steps. Between the check and the act another request can change the answer — the shape behind double bookings and negative inventory.
+  lost-update:
+    name: Lost update
+    def: A write that silently disappears because another writer overwrote it. Nothing errors; the API returns success to both callers and one person's work is simply gone.
+  acid:
+    name: ACID
+    def: The four promises a transaction makes — atomic (all or nothing), consistent (constraints hold), isolated (concurrent transactions don't see each other's partial work), durable (committed means survived).
+  isolation-level:
+    name: Isolation level
+    def: How much concurrent transactions are allowed to see of each other. Postgres defaults to read committed; stricter levels prevent more anomalies at the cost of more conflicts to retry.
+  serializable:
+    name: Serializable
+    def: The strictest isolation level — the database guarantees the result matches some order of running the transactions one at a time, and aborts one with a serialization error when it can't.
+  row-lock:
+    name: Row lock
+    def: An exclusive claim on specific rows held until the transaction ends. Other transactions wanting the same rows wait. Acquired by UPDATE, or deliberately with SELECT … FOR UPDATE.
+  advisory-lock:
+    name: Advisory lock
+    def: A named lock you ask the database for, tied to no table — the standard way to make sure only one copy of a scheduled job runs. Session-scoped, so it releases when the connection closes.
+  skip-locked:
+    name: SKIP LOCKED
+    def: A clause that makes a query ignore rows another transaction has locked instead of waiting. It turns a plain table into a work queue several workers can drain without collisions.
+  compare-and-set:
+    name: Compare-and-set
+    def: Writing only if the row still holds the value you read, usually via a version column. The update affects zero rows if someone else changed it first, which tells you to retry instead of overwriting.
+  at-least-once:
+    name: At-least-once delivery
+    def: The guarantee almost every queue and webhook provider actually offers — a message will arrive, possibly more than once. Handling duplicates is your job, not a sign of a broken provider.
+
+  # --- time (M7) ---
+  utc:
+    name: UTC
+    def: The single global reference time, with no daylight saving. Storing and computing in UTC and converting only for display is what keeps a system's time arithmetic correct.
+  dst:
+    name: DST (daylight saving)
+    def: Clocks shifting twice a year in many regions, which makes one local hour repeat and another never happen. Jobs scheduled in local time run twice or not at all on those days.
+  timestamptz:
+    name: timestamptz
+    def: The Postgres type that stores an absolute moment, normalising to UTC on write. Its plain cousin `timestamp` stores wall-clock digits with no zone, which is how dates drift between services.
+
+  # --- jobs (M7) ---
+  backfill:
+    name: Backfill
+    def: A one-off job that processes existing data — recomputing a column, importing history, fixing records. Dangerous because it touches far more rows than normal traffic ever does.
+  chunking:
+    name: Chunking
+    def: Processing a large job in small committed batches instead of one enormous transaction, so it holds few locks, can be paused, and leaves room for live traffic.
+  jitter:
+    name: Jitter
+    def: Deliberate randomness added to retry delays so many clients that failed together don't all retry at the same instant and re-create the overload.
+
   # --- shipping ---
   ci-cd:
     name: CI/CD

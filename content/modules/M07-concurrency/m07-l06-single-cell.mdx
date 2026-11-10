@@ -1,0 +1,500 @@
+---
+id: m07-l06
+module: M7
+title: "The single-cell anti-pattern: one JSON column, many writers"
+order: 6
+difficulty: 3
+depth: both
+platforms: [postgres, supabase, mongodb, redis]
+concepts: [data-modelling, race-conditions, locks, concurrency]
+prerequisites: [m07-l02, m07-l05]
+lab: demo-repo
+scenario_ids: [sc-single-cell-lost-updates-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A team shipped collaborative notes on their booking records. The agent's implementation was elegantly simple: a `jsonb` column holding an array of notes. One column, no join table, no migration ceremony. It shipped in an afternoon and worked beautifully in testing.
+
+Three months later, a customer support thread: *"I wrote detailed handover notes for the engineer yesterday and they're gone."*
+
+They checked the database. The notes weren't corrupted — they had never been saved, despite the UI confirming each one. Reviewing the logs, every single `PATCH` had returned 200. Twenty-three notes written that week; eleven in the table.
+
+Then it got worse. One booking — a weekly rehearsal slot used by a band with eight members, all adding notes — had a `notes` cell of 340KB. Queries that merely *listed* bookings had slowed to a crawl, because listing them meant reading that cell. And nobody could answer the question the studio manager actually wanted: *"show me every note mentioning the ribbon mic, across all bookings."*
+
+One column. Three distinct failures: silent data loss, a performance cliff, and a whole class of question made unanswerable.
+
+</Section>
+
+<Section kind="already-did">
+
+You have almost certainly done this, because it's what an AI agent produces when you ask for "notes on a booking" or "tags on a post" or "items in a cart" — a JSON column is the path of least resistance, and in a document database it's the *recommended* path.
+
+Signs you have one right now: a column typed `jsonb`, `json`, or `text` holding an array or object; application code that reads it, pushes to it, and writes the whole thing back; and no join table for something that is conceptually a list of things that belong to a parent.
+
+The demo app has exactly this in `bookings.notes`. Its `concurrent-editors` drill accepts 20 notes and keeps 6.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Why it loses data
+
+Appending to a JSON array is a <Term k="read-modify-write">read-modify-write</Term> cycle — the shape from L7.1, now with a twist that makes it maximally destructive: **the unit of conflict is the entire list.**
+
+```ts
+const { notes } = await db.query("SELECT notes FROM bookings WHERE id=$1", [id]);  // read
+notes.push(newNote);                                                               // modify
+await db.query("UPDATE bookings SET notes=$1 WHERE id=$2", [notes, id]);           // write
+```
+
+Two editors both read a 5-element array, each appends their own note, each writes a 6-element array. The final state has 6 elements and one of the two new notes. **Every concurrent writer except the last loses their work**, and because the whole array is one value, they don't just conflict on their own note — they overwrite each other's entire history.
+
+<svg viewBox="0 0 780 300" role="img" aria-label="Comparison: one JSON cell where five concurrent writers overwrite each other and only one note survives, versus separate rows where all five inserts succeed independently" className="diagram">
+  <text x="12" y="20" className="sub">ONE JSON CELL — the whole list is the unit of conflict</text>
+  <rect x="8" y="30" width="764" height="88" rx="10" />
+  <text x="28" y="54" className="sub">bookings.notes = [n1, n2, n3, n4, n5]        ← ONE value, ONE row, ONE lock</text>
+  <text x="28" y="78" className="sub">5 editors read [n1..n5] · each appends · each writes a 6-element array</text>
+  <text x="28" y="102" className="sub">result: 6 elements. Four notes destroyed. Four HTTP 200s returned.</text>
+
+  <text x="12" y="152" className="sub">SEPARATE ROWS — the unit of conflict is one note</text>
+  <rect x="8" y="162" width="148" height="44" rx="8" />
+  <text x="82" y="190" textAnchor="middle" className="sub">INSERT n6 ✓</text>
+  <rect x="164" y="162" width="148" height="44" rx="8" />
+  <text x="238" y="190" textAnchor="middle" className="sub">INSERT n7 ✓</text>
+  <rect x="320" y="162" width="148" height="44" rx="8" />
+  <text x="394" y="190" textAnchor="middle" className="sub">INSERT n8 ✓</text>
+  <rect x="476" y="162" width="148" height="44" rx="8" />
+  <text x="550" y="190" textAnchor="middle" className="sub">INSERT n9 ✓</text>
+  <rect x="632" y="162" width="140" height="44" rx="8" />
+  <text x="702" y="190" textAnchor="middle" className="sub">INSERT n10 ✓</text>
+
+  <text x="12" y="238" className="sub">Five inserts touch five different rows. Nothing overlaps, nothing waits, nothing is lost.</text>
+  <text x="12" y="262" className="sub">Rows also index, paginate, filter, aggregate, and stay small.</text>
+  <text x="12" y="286" className="sub">Measured on the demo app: 20 writes → 6 survive (cell) · 12 writes → 12 survive (rows).</text>
+</svg>
+
+### The four consequences
+
+Data loss is only the first.
+
+| Consequence | Mechanism |
+|---|---|
+| **Lost writes** | Read-modify-write on a shared value; last writer wins |
+| **Lock contention / hot row** | Every writer updates the *same row*, so they serialise on one row lock (L7.4) |
+| **Giant rows** | 340KB cell read whenever you select the row — and Postgres moves large values to TOAST storage, adding reads |
+| **Unqueryable** | You can't index individual notes usefully, can't paginate, can't `WHERE author = 'mara'` efficiently, can't aggregate |
+
+That last one is the slow-burn cost. "Show me all notes mentioning the ribbon mic" is trivial against rows and genuinely hard against an array buried in a column — and you only discover this when someone asks, months later.
+
+<Callout type="key">
+**The test for whether something deserves its own table:** *do two different people, requests, or processes ever write to different parts of this value independently?* If yes, it must be rows. A JSON column is for a value **one writer owns as a whole** — a settings blob, an API response you're caching, an immutable event payload.
+</Callout>
+
+### When a JSON column is correct
+
+This isn't an argument against `jsonb`. It's genuinely excellent for:
+
+- **Config or preferences** owned by one user, written whole (`user_settings.preferences`)
+- **An immutable payload** — a webhook body, an audit snapshot (`events.payload` in the demo app is fine: written once, never appended to)
+- **Schemaless extras** you only ever read back as a unit
+- **A cached computation** you regenerate rather than edit
+
+The common thread: **one writer, whole-value writes, no independent sub-updates.**
+
+### The fix: a child table
+
+```sql
+CREATE TABLE booking_notes (
+  id         bigserial PRIMARY KEY,
+  booking_id integer NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  author     text NOT NULL,
+  body       text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX booking_notes_booking_idx ON booking_notes (booking_id, created_at);
+```
+
+Note three things the array could never give you: a **foreign key** (notes can't reference a booking that doesn't exist), `ON DELETE CASCADE` (deleting a booking cleans up its notes), and an **index** that makes "this booking's notes, newest first, paginated" fast regardless of how many there are.
+
+Adding a note becomes a single `INSERT` — atomic, conflict-free, no read step at all:
+
+```ts
+await db.query(
+  "INSERT INTO booking_notes (booking_id, author, body) VALUES ($1,$2,$3)",
+  [bookingId, author, body]);
+```
+
+### If you must keep the cell
+
+Sometimes migrating is deferred. Two stopgaps, in order of preference:
+
+1. **Append in SQL, not in application code** — this removes the read-modify-write gap entirely by making the database do the append atomically:
+   ```sql
+   UPDATE bookings
+      SET notes = notes || $1::jsonb      -- jsonb concatenation
+    WHERE id = $2;
+   ```
+   This is a genuine fix for lost updates (the row lock is held for the statement's duration, and there's no window). It does **not** fix giant rows, hot-row contention, or queryability.
+2. **Optimistic concurrency** on the row (L7.5) — detects conflicts and makes the loser retry. Correct, but every concurrent editor now sees a conflict, which is a poor experience for something that should never conflict at all.
+
+<Operator>
+
+The demo app has the anti-pattern live. Measure it, fix it, measure again.
+
+```bash
+cd demo-app
+
+# ── 1. See the shape and its cost ────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT id, jsonb_array_length(notes) AS notes,
+         pg_column_size(notes) AS bytes
+    FROM bookings ORDER BY id;"
+
+# ── 2. Reproduce the data loss, and quantify it ──────────────────────
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT jsonb_array_length(notes) FROM bookings WHERE id=1;" | xargs echo "before:"
+APP_URL=http://localhost:3001 node scripts/load/concurrent-editors.js 1
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT jsonb_array_length(notes) FROM bookings WHERE id=1;" | xargs echo "after:"
+#   20 writes accepted by the API; count rises by ~5. And:
+docker compose logs --since 2m app | grep -ciE "error|warn" | xargs echo "errors logged:"
+#   0 — this is the silent-failure class from M0.4.
+
+# ── 3. Make the hot row genuinely large and feel the cliff ───────────
+docker compose exec -T db psql -U ots -d demo -c "
+  UPDATE bookings SET notes = (
+    SELECT jsonb_agg(jsonb_build_object(
+             'author','member-'||g, 'text', repeat('setlist idea ',40), 'at', now()::text))
+      FROM generate_series(1,2000) g)
+   WHERE id=1;"
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT pg_size_pretty(pg_column_size(notes)::bigint) AS cell_size FROM bookings WHERE id=1;"
+#   Now time a LIST query that doesn't even want the notes:
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c 'SELECT id, customer_name, notes FROM bookings ORDER BY date;'
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c 'SELECT id, customer_name FROM bookings ORDER BY date;'
+#   Compare the two: selecting the cell is what costs you.
+
+# ── 4. The question you cannot answer well ───────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT b.id, n->>'author' AS author, left(n->>'text',30) AS text
+    FROM bookings b, jsonb_array_elements(b.notes) n
+   WHERE n->>'text' ILIKE '%ribbon%' LIMIT 5;"
+#   It works — by unnesting every array in the table. No index can help.
+
+# ── 5. Migrate to rows ───────────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo <<'SQL'
+CREATE TABLE IF NOT EXISTS booking_notes (
+  id         bigserial PRIMARY KEY,
+  booking_id integer NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,
+  author     text NOT NULL,
+  body       text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS booking_notes_booking_idx
+  ON booking_notes (booking_id, created_at);
+
+-- Backfill: one row per array element, preserving authorship and time.
+INSERT INTO booking_notes (booking_id, author, body, created_at)
+SELECT b.id, n->>'author', n->>'text', COALESCE((n->>'at')::timestamptz, now())
+  FROM bookings b, jsonb_array_elements(b.notes) AS n;
+SQL
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT booking_id, count(*) FROM booking_notes GROUP BY 1 ORDER BY 1;"
+
+# ── 6. Prove concurrent writers no longer lose anything ──────────────
+before=$(docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT count(*) FROM booking_notes WHERE booking_id=1;" | tr -d '[:space:]')
+for i in $(seq 1 12); do
+  (docker compose exec -T db psql -U ots -d demo -c \
+    "INSERT INTO booking_notes (booking_id,author,body) VALUES (1,'editor$i','note $i');" \
+    >/dev/null 2>&1 &)
+done
+sleep 4
+after=$(docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT count(*) FROM booking_notes WHERE booking_id=1;" | tr -d '[:space:]')
+echo "before=$before after=$after (12 concurrent inserts; expect after-before = 12)"
+
+# ── 7. Now the queries are easy ──────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT booking_id, author, left(body,30) FROM booking_notes
+   WHERE body ILIKE '%ribbon%' LIMIT 5;"
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT author, count(*) FROM booking_notes GROUP BY 1 ORDER BY 2 DESC LIMIT 5;"
+
+# ── 8. Restore the demo app's anti-pattern for other learners ────────
+docker compose exec -T db psql -U ots -d demo -c "
+  DROP TABLE IF EXISTS booking_notes;
+  UPDATE bookings SET notes = '[{\"author\":\"mara\",\"text\":\"Need the vintage ribbon mic set up\",\"at\":\"2026-01-10T09:00:00Z\"}]' WHERE id=1;"
+```
+
+Step 6 is the measurement that matters: 12 concurrent inserts, 12 rows, every time. The same 12 writers against the cell would have left you with one or two.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Approach |
+|---|---|
+| A list of things belonging to a parent | **A child table with a foreign key.** The default |
+| Atomic append to a JSON array (stopgap) | `UPDATE … SET col = col \|\| $1::jsonb` |
+| Conflict detection on a whole-value column | Version column + CAS (L7.5) |
+| Counting without reading the list | A counter column, or `count(*)` on the child table |
+| Searching inside JSON you must keep | A GIN index: `CREATE INDEX … USING gin (notes jsonb_path_ops)` |
+| Genuinely document-shaped data | A document database — but the same rule applies (below) |
+| Real-time collaborative editing | CRDTs / operational transforms (Yjs, Automerge) — a different problem class |
+
+**The document-database caveat matters.** "Use MongoDB, it's made for this" doesn't dissolve the problem — it relocates it. Mongo has the same read-modify-write hazard if you fetch a document, push to an array in application code, and save it back. What it gives you is *atomic update operators* (`$push`, `$inc`) that do the modification server-side, which is the equivalent of the SQL `||` stopgap. Mongo's own 16MB document limit and guidance against unbounded arrays exist for the same reasons as the giant-row problem here. The anti-pattern is "many writers, one value", not "SQL".
+
+What good looks like: every list that multiple actors append to independently is a table with a foreign key and an index; `jsonb` is reserved for whole-value, single-writer data; and no row in your database is measured in hundreds of kilobytes.
+
+</Section>
+
+<Section kind="hands-on">
+
+This is the demo app's signature bug. Fix it end to end.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Measure the loss** (Operator steps 1–2). Record writes accepted versus notes kept, and confirm zero errors were logged.
+
+2. **Feel the performance cliff** (step 3). Compare the two `SELECT` timings — with and without the notes column — on a 2000-element cell. Note that a query listing bookings pays for notes it never displays.
+
+3. **Hit the queryability wall** (step 4). The cross-booking search works but must unnest every array in the table. Ask yourself what happens at 100,000 bookings.
+
+4. **Migrate** (step 5). Read the backfill query carefully — it preserves author and timestamp, which a careless migration loses.
+
+5. **Prove the fix** (step 6). 12 concurrent inserts must yield exactly 12 rows.
+
+6. **Change the application.** Rewrite [app/api/bookings/[id]/notes/route.ts](demo-app/app/api/bookings/[id]/notes/route.ts):
+   - `GET` → `SELECT … FROM booking_notes WHERE booking_id=$1 ORDER BY created_at`
+   - `PATCH` → a single `INSERT`, with no read step
+   - Update the booking detail page to read from the new table.
+
+   Then run the drill against the *application* and confirm the invariant holds:
+   ```bash
+   APP_URL=http://localhost:3001 node scripts/load/concurrent-editors.js 1
+   ```
+   Target: 20 accepted, 20 kept.
+
+7. **Enjoy the new queries** (step 7) — per-author counts and cross-booking search, both trivial now.
+
+8. **Restore the anti-pattern** (step 8) so the demo app stays teachable for the next person — and for the Phase 2 scenario `sc-single-cell-lost-updates-01`.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** An e-commerce site's carts are behaving strangely. Support reports: items vanishing from carts, quantities resetting, and — twice — a customer seeing someone *else's* item in their cart. Checkout conversion has dropped 4% since a release three weeks ago.
+
+<Evidence title="the schema and the write path">
+
+```text
+carts(user_id integer PRIMARY KEY, items jsonb NOT NULL DEFAULT '[]',
+      updated_at timestamptz)
+
+-- items shape: [{"sku":"RM-101","qty":2,"price":4999}, ...]
+```
+
+```ts
+// POST /api/cart/add
+const { rows } = await db.query("SELECT items FROM carts WHERE user_id=$1", [userId]);
+const items = rows[0]?.items ?? [];
+const existing = items.find(i => i.sku === sku);
+if (existing) existing.qty += qty; else items.push({ sku, qty, price });
+
+await db.query(
+  `INSERT INTO carts (user_id, items, updated_at) VALUES ($1,$2,now())
+   ON CONFLICT (user_id) DO UPDATE SET items=$2, updated_at=now()`,
+  [userId, JSON.stringify(items)]);
+```
+
+</Evidence>
+
+<Evidence title="the release three weeks ago">
+
+```text
+a71f3c2 feat: add to cart from product listing (no page reload)
+  - listing page "+" button now POSTs to /api/cart/add directly
+  - previously: add-to-cart only existed on the product detail page
+```
+
+</Evidence>
+
+<Evidence title="production facts">
+
+```text
+Logs, one user session (user 88142), 900ms window:
+  POST /api/cart/add sku=RM-101 → 200
+  POST /api/cart/add sku=RM-102 → 200
+  POST /api/cart/add sku=RM-103 → 200
+  final cart: [{"sku":"RM-103","qty":1,...}]      ← two items lost
+
+Largest cart: 1.1 MB (a user who added 400 items over a year)
+"someone else's item" cases: both users had been served by the same app
+  instance; both had the SAME product open in two tabs
+
+No errors. No alerts. Checkout conversion -4%.
+```
+
+</Evidence>
+
+Explain all three symptoms, including the cross-user one, and give the fix.
+
+<Reveal label="Reveal the cause">
+
+**A single-cell cart with read-modify-write, newly exposed to rapid-fire concurrent writes by the listing-page release.**
+
+**Symptom 1 — items vanishing.** The classic mechanism. Three rapid clicks on the listing page send three overlapping `POST`s. All three read the same cart state, each adds its own SKU to that snapshot, each writes the whole array back. The last write wins and the first two items are gone. The release didn't introduce the bug — it introduced the *concurrency*: before, adding to cart required a page navigation, which serialised the requests naturally. One UX improvement turned a latent race into a reproducible one, which is why it appeared three weeks ago with no change to the cart code.
+
+**Symptom 2 — quantities resetting.** Same cause, applied to the `existing.qty += qty` branch. Two adds of the same SKU both read `qty: 1`, both compute `2`, and the result is `2` instead of `3`. Each individual quantity update is a lost update.
+
+**Symptom 3 — seeing someone else's item.** This one is the serious finding, and it is *not* explained by the JSON cell alone. The cell loses *your* data; it cannot introduce *another user's* data, because every write is keyed `WHERE user_id = $1`. Two users' carts converging means user identity was wrong on at least one request — a shared or misattributed `userId`. Given "both served by the same app instance", the prime suspect is **request-scoped state stored at module scope** (M1.1, M7.1): a `currentUser` variable, a cached session, or a client reused across requests. That is a security bug, not a concurrency-of-data bug, and it needs its own investigation with top priority — cross-user data exposure outranks everything else here.
+
+**Symptom 4 — the 1.1MB cart.** Unbounded array growth. Every page that loads the cart reads 1.1MB, which is a slow path for that user and a TOAST read for the database.
+
+**The fix:**
+
+```sql
+CREATE TABLE cart_items (
+  user_id    integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sku        text    NOT NULL,
+  qty        integer NOT NULL CHECK (qty > 0),
+  price      integer NOT NULL,
+  added_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, sku)          -- ← one row per user per SKU
+);
+```
+
+The composite primary key is doing real work: it makes "this user already has this SKU" a *database* fact, which turns the whole add-to-cart operation into one atomic, conflict-free statement:
+
+```ts
+await db.query(
+  `INSERT INTO cart_items (user_id, sku, qty, price) VALUES ($1,$2,$3,$4)
+   ON CONFLICT (user_id, sku) DO UPDATE SET qty = cart_items.qty + EXCLUDED.qty`,
+  [userId, sku, qty, price]);
+```
+
+Three simultaneous adds of three SKUs touch three different rows — no overlap. Three simultaneous adds of the *same* SKU serialise on one row and **sum correctly**, because `qty = cart_items.qty + EXCLUDED.qty` is evaluated by the database, not by your process. No read step, no window, no lost update. Items are now individually removable, countable, indexable, and priceable without rewriting a blob.
+
+**Order of work:** (1) investigate the cross-user leak immediately — that's a security incident; (2) migrate carts to rows; (3) backfill, reconciling duplicate SKUs by summing; (4) add a concurrent test asserting three simultaneous adds yield three items.
+
+**The transferable lesson:** a latent single-cell race can sit quietly for as long as your UX happens to serialise requests. Any change that makes the client faster — removing a page load, adding optimistic UI, a mobile app, a retry on flaky networks — converts "theoretically racy" into "reliably broken". The data model is what makes it safe, not the client's pacing.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Find every JSON/JSONB column in this schema and classify each one: (a) whole-value data owned by a single writer — fine as-is, (b) a list that multiple requests, users or processes append to independently — must become rows, (c) unbounded growth risk. For each in group (b) or (c), show me the child table DDL with the right foreign key, indexes and any natural composite primary key, plus the backfill query that preserves ordering and timestamps."}>
+The classification is the valuable part — don't let it recommend migrating config blobs or immutable event payloads, which are legitimate uses. Check the backfill preserves authorship and timestamps (a careless `jsonb_array_elements` migration loses `created_at`), and look hard for a natural composite key like `(user_id, sku)`, which eliminates the read step entirely.
+</AgentTask>
+
+<AgentTask prompt={"Rewrite this endpoint to use a child table instead of appending to a JSON array: [paste the handler]. The write must be a single INSERT (or INSERT … ON CONFLICT … DO UPDATE for an upsert) with no read step, and quantity or counter updates must be computed by the database, not in application code. Then write the concurrent test that proves N simultaneous writes produce N rows."}>
+"No read step" is the acceptance criterion — if the rewrite still SELECTs before writing, the race survives. For counters verify the arithmetic is in SQL (`qty = table.qty + EXCLUDED.qty`), not JavaScript. The concurrent test should fail against the old code and pass against the new one.
+</AgentTask>
+
+<AgentTask prompt={"I cannot migrate this JSON column yet. Give me the safest stopgap: rewrite the append to happen atomically in SQL using jsonb concatenation so there is no read-modify-write window, and tell me explicitly which of the four problems this fixes and which three it does NOT fix."}>
+Make it state the limits plainly: atomic append fixes lost updates only. Hot-row contention, unbounded row size and unqueryability all remain, so the migration still needs to be scheduled. If it claims the stopgap solves everything, it hasn't understood why the pattern is an anti-pattern.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The test for any JSON column:
+
+- Do two different people, requests, or processes ever write to **different parts** of this value independently? → it must be rows.
+- Is it written **whole, by one owner** (config, an immutable payload, a cache)? → `jsonb` is correct.
+- Can it grow without bound? → rows, regardless of concurrency.
+
+If you have one you can't migrate yet:
+
+- Is the append done atomically in SQL (`col || $1::jsonb`) rather than read-modify-write in app code?
+- Is there a version column so conflicts are detected rather than silent?
+- Is row size monitored? (`pg_column_size`)
+
+When migrating:
+
+- Does the child table have a **foreign key** and `ON DELETE CASCADE`?
+- Is there an index on `(parent_id, created_at)` for the common query?
+- Is there a **natural composite primary key** (`user_id, sku`) that eliminates the read step via upsert?
+- Does the backfill preserve ordering, authorship and timestamps?
+- Is there a concurrent test asserting N simultaneous writes produce N rows?
+
+Red flags: `array.push()` on data read from the database; a row measured in hundreds of KB; an endpoint that reads a JSON column, mutates it in JavaScript, and writes it back; "we'll use Mongo instead" offered as the fix.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l06"
+  questions={[
+    {
+      q: "Why does appending to a JSON array lose data so much more destructively than other race conditions?",
+      options: [
+        "JSON serialisation is lossy for nested structures",
+        "The unit of conflict is the entire list, so a losing writer doesn't just lose their own item — their whole-array write erases everyone else's recent items too",
+        "jsonb columns don't support row-level locking",
+        "Postgres validates JSON only on read, not on write"
+      ],
+      answer: 1,
+      explain: "Every concurrent writer except the last loses their work. The demo app measures it: 20 writes accepted, about 6 kept, with zero errors logged."
+    },
+    {
+      q: "Which of these is a legitimate use of a jsonb column?",
+      options: [
+        "Comments on a post, since they're conceptually nested",
+        "An immutable webhook payload written once and never modified — one writer, whole-value write, no sub-updates",
+        "A shopping cart's item list, since it belongs to one user",
+        "Tags that multiple editors add to a document"
+      ],
+      answer: 1,
+      explain: "The test is whether different actors write different parts independently. The demo app's `events.payload` is fine for exactly this reason; a cart is not, because rapid adds are independent writes to different parts."
+    },
+    {
+      q: "Beyond lost writes, what three problems does a single-cell list cause?",
+      options: [
+        "Index bloat, replication lag, and connection exhaustion",
+        "Hot-row lock contention, unbounded row size that every SELECT pays for, and the inability to index, paginate or aggregate the items",
+        "Schema drift, migration failures, and backup size",
+        "Type errors, serialisation cost, and cache invalidation"
+      ],
+      answer: 1,
+      explain: "The slow-burn one is queryability: 'show me every note mentioning X across all bookings' is trivial against rows and requires unnesting every array in the table against a cell."
+    },
+    {
+      q: "In the cart break-fix, why did the bug appear three weeks ago when the cart code hadn't changed?",
+      options: [
+        "A database upgrade changed the default isolation level",
+        "A release let users add to cart from the listing page without a page reload, which removed the natural serialisation that page navigation had been providing",
+        "Traffic grew past the connection pool limit",
+        "The carts table exceeded its TOAST threshold"
+      ],
+      answer: 1,
+      explain: "The race was always there; the UX had been hiding it. Any change that makes clients faster — optimistic UI, a mobile app, network retries — converts a latent race into a reproducible one."
+    },
+    {
+      q: "What does the composite primary key `(user_id, sku)` on a cart_items table buy you?",
+      options: [
+        "Smaller storage because the id column is eliminated",
+        "It makes 'this user already has this SKU' a database fact, so add-to-cart becomes one atomic INSERT … ON CONFLICT … DO UPDATE with no read step — and simultaneous adds of the same SKU sum correctly",
+        "Automatic deduplication of identical items at read time",
+        "Faster joins against the products table"
+      ],
+      answer: 1,
+      explain: "The arithmetic (`qty = cart_items.qty + EXCLUDED.qty`) is evaluated by the database, so there's no window at all. Different SKUs touch different rows; the same SKU serialises on one and still sums correctly."
+    }
+  ]}
+/>
+
+</Section>

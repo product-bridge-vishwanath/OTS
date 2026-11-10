@@ -1,0 +1,47 @@
+id: sc-idempotency-01
+module: M7
+lesson: m07-l07
+title: "38 customers charged twice on a Tuesday"
+difficulty: realistic
+symptom: "A slow webhook handler was retried by the provider, and 38 customers have two payment records, two emails and two ledger entries."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: handler
+      apply: scripts/break/slow-webhook-handler.patch   # 1.4s handler, provider retries
+    - type: traffic
+      apply: scripts/load/webhook-replay.js
+evidence:
+  logs: true
+  metrics: [payments.created, webhook.duplicates, email.sent]
+  db_console: true
+  notes: "The simulated provider retries on timeout and exposes its delivery log, including retry attempts."
+agent:
+  context: "You believe the provider is sending duplicate webhooks in error."
+  bias: "proposes contacting the provider or filtering duplicates by timestamp proximity"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - one-payment-row-per-event        # including under simultaneous delivery
+    - duplicate-returns-2xx            # a non-2xx triggers further retries
+    - side-effects-once-per-event      # one email, one ledger entry
+  root_cause_markers:
+    - unique constraint on the provider event id
+    - insert uses ON CONFLICT DO NOTHING and branches on the row count
+    - side effects moved inside the first-delivery branch
+  symptom_only_markers:
+    - duplicates deduplicated by timestamp window
+    - handler sped up without adding idempotency
+    - duplicate delivery answered with 409 or 500
+hints:
+  - "What delivery guarantee does the provider document? Is a retry a bug on their side?"
+  - "Two deliveries arrive simultaneously. Would a SELECT-then-INSERT check have helped?"
+  - "After deduplicating the payment row, check what else the handler still does twice."
+  - "Reveal: key on the provider event id with a unique constraint, return 200 on duplicates, and guard side effects."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

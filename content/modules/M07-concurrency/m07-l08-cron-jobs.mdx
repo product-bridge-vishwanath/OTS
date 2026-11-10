@@ -1,0 +1,515 @@
+---
+id: m07-l08
+module: M7
+title: "Cron jobs: ran twice, ran never, ran at the wrong hour"
+order: 8
+difficulty: 2
+depth: both
+platforms: [postgres, vercel, render, github-actions, docker]
+concepts: [cron, idempotency, process-supervision, alerts]
+prerequisites: [m07-l07]
+lab: demo-repo
+scenario_ids: [sc-cron-twice-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A founder scaled her app from one instance to three, on a Friday, to handle a traffic spike. The deploy was uneventful.
+
+Saturday morning, 1,400 customers received the weekly digest email. Three times each.
+
+The digest was a cron job defined in her app's container — so when she scaled to three instances, she got three crons. Each one woke at 06:00, each one queried for customers due a digest, each one sent to all of them. No error, no alert; three identical successful runs, and 4,200 emails.
+
+She fixed it by moving the cron to a single dedicated worker. Two months later the *opposite* failure arrived: that worker's deploy failed silently and the digest didn't go out for nine days. Nobody noticed, because nothing was watching for a job that *didn't* run.
+
+Those two failures — **ran twice** and **ran never** — are the two things that go wrong with scheduled work, and they need two completely different defences. Neither is a bug in the job itself.
+
+</Section>
+
+<Section kind="already-did">
+
+You've written a cron without calling it that: a Vercel `crons` entry in `vercel.json`, a Render Cron Job, a GitHub Actions `schedule:`, a `setInterval` in a worker (which is what the demo app does), or a Supabase scheduled function.
+
+You've probably also hit the cron environment trap: a job that works perfectly when you run it by hand and fails silently from cron, because cron runs with almost no environment — no `PATH`, no `.env`, not your shell's variables (M1.5). That's the classic first encounter, and it has nothing to do with your code.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The five-field syntax
+
+```text
+┌───────── minute (0-59)
+│ ┌─────── hour (0-23)
+│ │ ┌───── day of month (1-31)
+│ │ │ ┌─── month (1-12)
+│ │ │ │ ┌─ day of week (0-6, Sunday=0)
+│ │ │ │ │
+* * * * *   every minute
+0 3 * * *   03:00 every day
+0 3 * * 1   03:00 on Mondays
+*/15 * * * *   every 15 minutes
+0 0 1 * *   midnight on the 1st
+```
+
+Two traps live in this syntax. **Day-of-month and day-of-week are OR'd, not AND'd** — `0 0 1 * 1` means "the 1st *or* any Monday", not "Mondays that are the 1st". And `*/7` doesn't mean "every 7 days"; it steps within the field's range and restarts each month.
+
+### The two failure modes, and their two defences
+
+| Failure | Cause | Defence |
+|---|---|---|
+| **Ran twice** | Multiple instances; overlapping runs; a retry; DST | A **lock** (one runner) + **idempotent** work |
+| **Ran never** | Service deleted, deploy failed, schedule disabled, crashed at boot | A **<Term k="dead-mans-switch">dead man's switch</Term>** |
+
+<svg viewBox="0 0 780 250" role="img" aria-label="Two opposite cron failures: ran twice produces duplicate work that is visible in the data, and ran never produces silence that no threshold alert can detect" className="diagram">
+  <rect x="8" y="16" width="372" height="186" rx="10" />
+  <text x="194" y="44" textAnchor="middle">RAN TWICE</text>
+  <text x="194" y="70" textAnchor="middle" className="sub">two runners · overlapping runs</text>
+  <text x="194" y="88" textAnchor="middle" className="sub">a retry · a repeated DST hour</text>
+  <text x="194" y="116" textAnchor="middle" className="sub">symptom: duplicate emails,</text>
+  <text x="194" y="134" textAnchor="middle" className="sub">charges, rows — VISIBLE in data</text>
+  <text x="194" y="164" textAnchor="middle" className="sub">defence: a lock (one runner)</text>
+  <text x="194" y="182" textAnchor="middle" className="sub">+ idempotent work</text>
+
+  <rect x="400" y="16" width="372" height="186" rx="10" />
+  <text x="586" y="44" textAnchor="middle">RAN NEVER</text>
+  <text x="586" y="70" textAnchor="middle" className="sub">service deleted · deploy failed</text>
+  <text x="586" y="88" textAnchor="middle" className="sub">schedule disabled · skipped DST hour</text>
+  <text x="586" y="116" textAnchor="middle" className="sub">symptom: nothing. no log, no error,</text>
+  <text x="586" y="134" textAnchor="middle" className="sub">no row — INVISIBLE to thresholds</text>
+  <text x="586" y="164" textAnchor="middle" className="sub">defence: a dead man&apos;s switch</text>
+  <text x="586" y="182" textAnchor="middle" className="sub">(the monitor alerts on silence)</text>
+
+  <text x="12" y="234" className="sub">Opposite mechanisms. A lock cannot detect silence; a switch cannot prevent duplicates. Every job needs both.</text>
+</svg>
+
+<Callout type="key">
+These need opposite mechanisms, and almost every team has one and not the other. A lock stops duplicates and cannot tell you about silence. A dead man's switch detects silence and cannot stop duplicates. **You need both on every scheduled job**, and neither is the job's own code.
+</Callout>
+
+### Defence 1: make exactly one runner win
+
+Three ways, in increasing robustness:
+
+**a) Deploy the cron once, not per instance.** A dedicated worker service or your platform's cron feature (Vercel Cron, Render Cron Jobs) — the platform guarantees one invocation. This is the right default, and it's what the founder did after the triple-email Saturday.
+
+**b) Take a lock, so correctness doesn't depend on deployment topology.** A Postgres <Term k="advisory-lock">advisory lock</Term> is ideal: it needs no table, and it's released automatically if the process dies.
+
+```sql
+-- Returns true for exactly one caller; false for everyone else.
+SELECT pg_try_advisory_lock(hashtext('weekly-digest'));
+```
+
+```ts
+const { rows } = await db.query(
+  "SELECT pg_try_advisory_lock(hashtext($1)) AS got", ["weekly-digest"]);
+if (!rows[0].got) {
+  console.log("digest: another runner holds the lock, exiting");
+  return;
+}
+try {
+  await runDigest();
+} finally {
+  await db.query("SELECT pg_advisory_unlock(hashtext($1))", ["weekly-digest"]);
+}
+```
+
+Critically, it's **session-scoped**: if the process crashes mid-run, the connection closes and the lock releases — no stuck "job is running" flag to clean up by hand, which is the failure mode of the naive table-flag approach.
+
+**c) Prevent *overlap* with the previous run of the same job.** The same lock covers this: if the 03:00 run is still going at 03:15, the 03:15 run finds the lock held and exits. Without it, a job that slows down past its own interval starts running concurrently with itself — doubling database load exactly when it's already struggling. On a VPS, `flock` does the same thing for a crontab line:
+
+```bash
+*/15 * * * * /usr/bin/flock -n /tmp/digest.lock /srv/app/bin/digest.sh
+```
+
+**d) And still make the work idempotent** (L7.7). The lock is a performance and politeness measure; idempotency is what makes a duplicate *harmless*. Belt and braces, because locks can be bypassed by a manual run.
+
+### Defence 2: notice when it doesn't run
+
+A job that doesn't run produces no logs, no errors, and no rows — there is nothing to threshold on (L8.8). Invert it: the job pings a monitor on success, and the **monitor** alerts when pings stop.
+
+```ts
+await runDigest();
+await fetch(`https://hc-ping.com/${process.env.DIGEST_PING_UUID}`, {
+  signal: AbortSignal.timeout(10_000),
+}).catch(() => {});        // never let the ping failure fail the job
+```
+
+Three details that make it actually work:
+
+1. **Ping only on success.** A ping in a `finally` block reports healthy while the job fails every night — the worst possible outcome, since it manufactures false confidence.
+2. **Test it by not pinging.** An untested switch is a belief. Disable the job for one cycle and confirm you get alerted.
+3. **Also record a heartbeat in your own database** (`job_runs(name, started_at, finished_at, status)`), so you can answer "when did this last succeed?" without a third party.
+
+### Time, briefly
+
+Platform crons generally run in **UTC**; `crontab` on a server runs in the machine's timezone. A job scheduled at a local hour will run twice on the autumn <Term k="dst">DST</Term> transition and skip the spring one. Schedule in <Term k="utc">UTC</Term> and convert deliberately if a human-local hour matters (L7.10).
+
+<Operator>
+
+The demo app's worker uses `setInterval` with no lock and no heartbeat — both failure modes are reproducible.
+
+```bash
+cd demo-app
+
+# ── 1. Reproduce "ran twice" by starting a second runner ─────────────
+docker compose exec -T db psql -U ots -d demo -c "DELETE FROM reports;"
+#   --force-recreate matters: the worker runs its first report 10s after
+#   boot, so BOTH workers must start together to fire in the same window.
+#   Without it you only see the new worker's run and the drill looks fine.
+docker compose up -d --scale worker=2 --force-recreate worker
+sleep 22
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT day, count(*) AS reports FROM reports GROUP BY day;"
+docker compose logs --since 1m worker | grep -c "report written" | xargs echo "writes logged:"
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT id, day, generated_at FROM reports ORDER BY id;"
+#   Two rows for one day, milliseconds apart — two runners, same schedule,
+#   neither aware of the other. This is the triple-email Saturday.
+docker compose up -d --scale worker=1 --force-recreate worker   # back to one
+
+# ── 2. The advisory lock, demonstrated ───────────────────────────────
+#   Hold it in one session for 5s…
+(docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT pg_try_advisory_lock(hashtext('daily-report')) AS holder; SELECT pg_sleep(5);" \
+  >/dev/null 2>&1 &)
+sleep 1
+#   …and watch a second session be refused:
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT pg_try_advisory_lock(hashtext('daily-report'));" | xargs echo "second runner got lock:"
+sleep 5
+docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT pg_try_advisory_lock(hashtext('daily-report'));" | xargs echo "after holder exits:"
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT pg_advisory_unlock_all();" >/dev/null
+#   f while held, t afterwards — and note nothing had to clean up a flag.
+
+# ── 3. See who holds advisory locks right now ────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT l.pid, l.objid, a.state, now()-a.backend_start AS session_age
+    FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+   WHERE l.locktype='advisory';"
+
+# ── 4. Make the report idempotent (so a duplicate is harmless) ───────
+docker compose exec -T db psql -U ots -d demo -c "
+  DELETE FROM reports WHERE id NOT IN (SELECT min(id) FROM reports GROUP BY day);
+  ALTER TABLE reports ADD CONSTRAINT reports_day_unique UNIQUE (day);"
+#   Now a second run can't create a second row for the same day:
+docker compose exec -T db psql -U ots -d demo -c "
+  INSERT INTO reports (day, body) VALUES (CURRENT_DATE, 'duplicate attempt')
+  ON CONFLICT (day) DO UPDATE SET body=EXCLUDED.body, generated_at=now()
+  RETURNING day;"
+#   Upsert: re-running refreshes the row instead of duplicating it.
+
+# ── 5. Reproduce "ran never" and detect it with a heartbeat ──────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT max(generated_at) AS last_run, now()-max(generated_at) AS age FROM reports;"
+docker compose stop worker                   # silent death
+sleep 20
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT now()-max(generated_at) AS age,
+         CASE WHEN now()-max(generated_at) > interval '15 minutes'
+              THEN 'ALERT: digest has not run' ELSE 'ok' END AS status
+    FROM reports;"
+#   Nothing in the logs says anything is wrong. Only the AGE of the
+#   last success reveals it — that's the dead man's switch logic.
+docker compose start worker
+
+# ── 6. Check the cron environment trap (on a VPS) ────────────────────
+#   Cron has almost no environment. Compare:
+#     * * * * * env > /tmp/cron-env.txt
+#   then diff /tmp/cron-env.txt against your interactive `env`.
+#   Fix by sourcing explicitly in the job, or using absolute paths.
+
+# ── 7. Restore the demo app's anti-pattern ───────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE reports DROP CONSTRAINT IF EXISTS reports_day_unique;"
+```
+
+Step 2 is the mechanism and step 5 is the detector. Run both; they are the two halves this lesson exists to pair.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Platform | How you schedule | One invocation? | Timezone |
+|---|---|---|---|
+| **Vercel Cron** | `crons` in `vercel.json` → hits an HTTP route | Yes | UTC |
+| **Render Cron Jobs** | A separate job service | Yes | UTC |
+| **Railway** | Cron on a service | Yes | UTC |
+| **GitHub Actions** | `on: schedule:` | Yes, but can be delayed minutes under load | UTC |
+| **pg_cron** | Inside Postgres | Yes | DB timezone |
+| **Supabase** | Scheduled Edge Functions / pg_cron | Yes | UTC |
+| **System crontab** | `/etc/crontab`, `crontab -e` | **Per machine** — scale out and you have N | Machine TZ |
+| `setInterval` in a worker | Application code | **Per instance** — the demo app's shape | Process TZ |
+
+Monitoring, which is the half people skip:
+
+| Tool | What it does |
+|---|---|
+| **Healthchecks.io** | Free dead man's switch; grace periods; alerts on silence |
+| **Cronitor** | Same plus run duration tracking |
+| Your own `job_runs` table | Durable answer to "when did this last succeed?", queryable in SQL |
+| Platform cron logs | Shows invocations — but *only* while the cron still exists |
+
+<Callout type="warn">
+Note the last row. If the cron service is deleted or disabled, the platform's own cron log shows nothing — not an error, just no entries. That's precisely the failure mode of M0.3's nine silent days, and it's why the detector must live *outside* the thing being watched.
+</Callout>
+
+An HTTP-route cron (Vercel's model) has one extra requirement: **the endpoint is on the public internet**, so protect it or anyone can trigger your job.
+
+```ts
+export async function GET(req: NextRequest) {
+  if (req.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
+    return new Response("unauthorized", { status: 401 });
+  }
+  // …
+}
+```
+
+What good looks like: every scheduled job has exactly one runner (by platform guarantee or by lock), does idempotent work, cannot overlap itself, records its runs in your database, and has a *tested* dead man's switch.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Reproduce "ran twice"** (Operator step 1) by scaling the worker to 2 **with `--force-recreate`**, so both workers boot together and both fire their startup run. You should see two rows for one day, milliseconds apart. (Without `--force-recreate` only the new worker fires in your observation window and the drill misleadingly looks healthy — worth noticing, because it's the same reason this bug hides in production between schedule ticks.)
+
+2. **Prove the advisory lock** (step 2): `f` while held, `t` after the holder exits. Note that no cleanup was required — a crash would have released it automatically, unlike a "running" flag in a table.
+
+3. **Add the lock to the worker.** Edit [worker/cron.js](demo-app/worker/cron.js) so `generateReport` takes `pg_try_advisory_lock(hashtext('daily-report'))` first, exits early if refused, and unlocks in a `finally`. Then repeat step 1 with two workers and confirm only one writes.
+
+4. **Make the work idempotent too** (step 4). Add `UNIQUE (day)` and switch the insert to an upsert. Now even a manual run or a bypassed lock can't duplicate — belt and braces.
+
+5. **Prevent self-overlap.** Make the report artificially slow (add `await pg_sleep(30)` or a long loop) with the interval set shorter than the runtime, and confirm the lock makes the second tick exit instead of piling up.
+
+6. **Reproduce "ran never" and build the detector** (step 5). Stop the worker, confirm nothing in the logs complains, then write the age-based check. Note the asymmetry: the duplicate failure was visible in the data, and this one is visible only in *absence*.
+
+7. **Add a real dead man's switch.** Create a free Healthchecks.io check, ping it from the worker on success only, then **test it by stopping the worker** and confirming you get an email. An untested switch is a belief.
+
+8. **Add a `job_runs` table** so "when did this last succeed?" is answerable in SQL without a third party:
+   ```sql
+   CREATE TABLE job_runs (
+     name text NOT NULL, started_at timestamptz NOT NULL DEFAULT now(),
+     finished_at timestamptz, status text, PRIMARY KEY (name, started_at));
+   ```
+
+9. **Restore the anti-pattern** (step 7) for the next learner.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A subscription business's dunning job emails customers whose payment failed. On 26 October, 340 customers received the same "your payment failed" email twice, an hour apart. Several replied angrily, having already updated their card.
+
+<Evidence title="the schedule and the job">
+
+```text
+# /etc/crontab on the app server (Europe/London)
+30 1 * * *  app  /srv/app/bin/dunning.sh
+```
+
+```ts
+// dunning.ts
+const failed = await db.query(
+  `SELECT customer_id, email FROM subscriptions
+    WHERE payment_status='failed' AND last_dunned_at < now() - interval '20 hours'`);
+
+for (const row of failed.rows) {
+  await sendDunningEmail(row.email);
+  await db.query(
+    "UPDATE subscriptions SET last_dunned_at=now() WHERE customer_id=$1", [row.customer_id]);
+}
+```
+
+</Evidence>
+
+<Evidence title="the logs for 26 October">
+
+```text
+Oct 26 01:30:04 app CRON[21144]: (app) CMD (/srv/app/bin/dunning.sh)
+Oct 26 01:30:05 dunning: starting, 340 customers due
+Oct 26 01:52:11 dunning: finished, 340 emails sent
+
+Oct 26 01:30:07 app CRON[21203]: (app) CMD (/srv/app/bin/dunning.sh)
+Oct 26 01:30:08 dunning: starting, 340 customers due
+Oct 26 01:51:48 dunning: finished, 340 emails sent
+
+$ timedatectl | grep -iE "time zone"
+               Time zone: Europe/London (BST, +0100)
+$ date -d "2026-10-25 02:00 Europe/London" ; date -d "2026-10-25 03:00 Europe/London"
+#   (BST ended 25 October 2026 at 02:00 — clocks went back one hour)
+```
+
+</Evidence>
+
+<Evidence title="what else is true">
+
+```text
+Server count: 1 (no scaling involved)
+Platform: a single VPS, system crontab
+No retry policy configured
+Both runs appear in cron's own log with DIFFERENT pids, seconds apart
+last_dunned_at was NULL for all 340 customers before the run
+```
+
+</Evidence>
+
+One server, no scaling, no retries — and the job ran twice within three seconds. Explain it, and note the second defect the evidence reveals.
+
+<Reveal label="Reveal the cause">
+
+**Two separate defects: a DST-related double invocation, and a job whose own guard couldn't prevent duplicate work.**
+
+**Defect 1 — why it ran twice.** The crontab is in `Europe/London`, and British Summer Time ended on 25 October. When clocks go back, the local hour between 01:00 and 02:00 **happens twice**. `cron` is scheduled on local wall-clock time, so `01:30` occurred twice that night and the job was invoked on both passes. The log confirms it: two different PIDs, seconds apart in the log's rendering, with no retry policy and no second server.
+
+The fix is to schedule in UTC. Either set the server and crontab to UTC (the standard practice), or use `CRON_TZ=UTC` in the crontab line:
+
+```text
+CRON_TZ=UTC
+30 1 * * *  app  /srv/app/bin/dunning.sh
+```
+
+UTC has no DST, so every scheduled instant happens exactly once. (Spring forward is the mirror image: a job scheduled at 01:30 local would be **skipped entirely** — the "ran never" failure, caused by the same misconfiguration.)
+
+**Defect 2 — the guard that didn't guard.** The job *tried* to protect itself with `last_dunned_at < now() - interval '20 hours'`, and that failed for two compounding reasons:
+
+- **It's check-then-act with a 22-minute window** (L7.2). Both runs executed the `SELECT` at 01:30, before either had updated anything, so both got the same 340 customers. The guard describes the past.
+- **The update happens after the email.** Even sequentially, the window between sending and recording is where a crash produces either a double-send or a missed send. The email is the irreversible part and it goes first.
+
+So even a correct schedule leaves this job unsafe against a manual re-run, an overlapping run, or a crash. Three fixes, all needed:
+
+1. **One runner, enforced** — `flock -n` in the crontab line, or an advisory lock in the job. Either would have made the second invocation exit immediately:
+   ```text
+   CRON_TZ=UTC
+   30 1 * * *  app  /usr/bin/flock -n /tmp/dunning.lock /srv/app/bin/dunning.sh
+   ```
+2. **Claim each customer before acting**, so the unit of idempotency is one customer (L7.7's invoicing shape):
+   ```sql
+   UPDATE subscriptions SET last_dunned_at = now()
+    WHERE customer_id = $1 AND payment_status='failed'
+      AND (last_dunned_at IS NULL OR last_dunned_at < now() - interval '20 hours')
+   RETURNING customer_id;
+   ```
+   Send the email **only if this returns a row.** The claim is atomic, so two runs cannot both claim the same customer — and the irreversible action now happens after the record, not before.
+3. **A dead man's switch**, because the spring-forward version of this bug is silent: the job simply never runs and nobody learns about it from a duplicate complaint.
+
+**Why `last_dunned_at IS NULL` matters:** the evidence notes it was NULL for all 340. The original `WHERE last_dunned_at < now() - interval '20 hours'` would *exclude* NULL rows (any comparison with NULL is not true), so the first-ever dunning run for a customer depended on whatever else set that column. Worth noticing while you're in there — it's a latent bug of its own.
+
+**The transferable rules:** **schedule in UTC, always** — local-time schedules have two days a year on which they run twice or not at all. And **a job's own "have I done this?" check is check-then-act unless it's an atomic claim**; put the claim before the irreversible action, keyed to the smallest unit of work.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Find every scheduled job in this repository — platform cron config, crontab entries, GitHub Actions schedules, pg_cron, and any setInterval or setTimeout loop in application code. For each, tell me: its schedule and timezone, whether multiple instances could run it simultaneously, whether it can overlap with its own previous run, whether its work is idempotent, and whether anything would alert me if it stopped running entirely."}>
+The last column is the one that will mostly be empty — that's your dead-man's-switch backlog. Check it found `setInterval` loops, which are easy to miss and are per-instance by nature (the demo app's worker is exactly this). Verify the timezone claims against the actual platform docs: most platform crons are UTC, system crontabs are not.
+</AgentTask>
+
+<AgentTask prompt={"Add single-runner protection to this job using a Postgres advisory lock: try the lock, exit cleanly with a log line if another runner holds it, release in a finally block, and explain what happens to the lock if the process is killed mid-run. Then separately make the job's work idempotent so a duplicate run is harmless even if the lock is bypassed by a manual invocation."}>
+Both halves matter and they're independent — the lock is politeness, idempotency is safety. Check the explanation says the lock releases automatically when the session ends; if it proposes a boolean "running" flag in a table instead, reject it: a crash leaves that flag stuck and the job dead until someone notices.
+</AgentTask>
+
+<AgentTask prompt={"Add a dead man's switch to this job: ping a monitoring URL only after successful completion, with a timeout, never failing the job if the ping fails, and never pinging in a finally or catch block. Also add a job_runs table recording name, start, finish and status. Then tell me exactly how to verify the alert fires, and what grace period to configure for this job's schedule."}>
+"Never in a finally" is the critical constraint — a ping that fires regardless of outcome reports healthy while the job fails nightly, which is worse than no monitoring. Then actually test it: disable the job for one cycle and confirm the alert arrives. The grace period should be comfortably longer than the job's normal runtime or you'll get false alarms.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Every scheduled job needs answers to all six:
+
+1. **One runner?** Platform guarantee, advisory lock, or `flock`.
+2. **Can it overlap itself?** If a run can exceed its interval, the lock must cover that too.
+3. **Is the work idempotent?** Assume it will run twice anyway.
+4. **Is the claim before the irreversible action?** Email after recording, never before.
+5. **Scheduled in UTC?** Local-time schedules break twice a year.
+6. **Would I know if it stopped?** A *tested* dead man's switch, plus a `job_runs` record.
+
+Also worth checking:
+
+- Does the job have the environment it needs? (Cron has almost none — M1.5.)
+- If it's an HTTP-route cron, is the endpoint authenticated?
+- Is there a grace period on the monitor longer than the job's normal runtime?
+- Does the job log start *and* finish, with a run id?
+
+What good looks like: a duplicate run is harmless, an overlapping run exits immediately, and silence pages someone within one scheduled interval.
+
+Red flags: `setInterval` in a web app that runs multiple instances; a job whose only duplicate protection is a `SELECT` check; a local-timezone crontab; platform cron logs as the only evidence a job exists.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l08"
+  questions={[
+    {
+      q: "Why do \"ran twice\" and \"ran never\" need completely different defences?",
+      options: [
+        "They're caused by different schedulers",
+        "A lock prevents duplicates but can't detect silence; a dead man's switch detects silence but can't prevent duplicates — so you need both on every job",
+        "Running twice is a code bug while running never is an infrastructure bug",
+        "Duplicates are idempotency problems and silence is a monitoring problem, so they belong to different teams"
+      ],
+      answer: 1,
+      explain: "Most teams have one and not the other. The founder in the story fixed duplicates by moving to a single worker, then lost nine days of digests to a silent failure the lock could never have revealed."
+    },
+    {
+      q: "Why is a Postgres advisory lock better than a boolean \"running\" flag in a table?",
+      options: [
+        "It's faster to acquire",
+        "It's session-scoped, so it releases automatically if the process crashes — a flag stays stuck and the job stays dead until a human notices",
+        "It works across multiple databases",
+        "It can be held for longer periods"
+      ],
+      answer: 1,
+      explain: "The crash case is what matters. The hands-on verifies the behaviour: `f` while held, `t` once the holder's session ends, with no cleanup step."
+    },
+    {
+      q: "A job scheduled `30 1 * * *` in a Europe/London crontab ran twice on 26 October with one server and no retries. Why?",
+      options: [
+        "The cron daemon was restarted during the run",
+        "Clocks went back, so the local hour 01:00–02:00 occurred twice and the wall-clock schedule fired on both passes",
+        "The job took longer than its interval and overlapped itself",
+        "Two crontab entries existed for the same job"
+      ],
+      answer: 1,
+      explain: "Local-time schedules break twice a year: autumn runs twice, spring skips entirely. UTC has no DST, which is why platform crons use it and why `CRON_TZ=UTC` is the fix."
+    },
+    {
+      q: "The dunning job guarded itself with `WHERE last_dunned_at < now() - interval '20 hours'`. Why didn't that prevent duplicates?",
+      options: [
+        "The interval was too short for the job's runtime",
+        "It's check-then-act: both runs executed the SELECT before either updated anything, so both received the same 340 customers",
+        "The timezone of now() differed between the two runs",
+        "The index on last_dunned_at was missing"
+      ],
+      answer: 1,
+      explain: "A 22-minute window between the check and the updates. The fix is an atomic per-customer claim (`UPDATE … RETURNING`) placed *before* the irreversible email, so two runs cannot both claim the same row."
+    },
+    {
+      q: "Why must a dead man's switch ping only on success, never in a finally block?",
+      options: [
+        "Pings in finally blocks are rate-limited by monitoring providers",
+        "A ping that fires regardless of outcome reports healthy while the job fails every night — manufacturing false confidence, which is worse than no monitoring",
+        "The finally block runs before the job's transaction commits",
+        "It would double-count runs that throw and are retried"
+      ],
+      answer: 1,
+      explain: "The switch exists to detect 'this didn't work'. Pinging unconditionally converts it into a liveness check for the *process*, not the job — and you'd never learn the work stopped happening."
+    }
+  ]}
+/>
+
+</Section>

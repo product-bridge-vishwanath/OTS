@@ -1,0 +1,50 @@
+id: sc-partial-write-01
+module: M7
+lesson: m07-l03
+title: "Refunds in Stripe with no record, and records with no refund"
+difficulty: hard
+symptom: "Finance reports 23 cancellations refunded in Stripe with no refunds row, and 4 refunds rows with no Stripe refund."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/external-call-in-transaction.patch   # 800ms provider call inside BEGIN/COMMIT
+    - type: config
+      apply: scripts/break/aggressive-statement-timeout.sh      # statement_timeout = 1s
+    - type: provider
+      apply: scripts/break/provider-intermittent-errors.sh
+evidence:
+  logs: true
+  metrics: [db.connections, refunds.created, provider.errors]
+  db_console: true
+  notes: "A simulated provider with its own log of what it actually performed is available for reconciliation."
+agent:
+  context: "You wrapped this flow in a transaction specifically to make it atomic."
+  bias: "defends the transaction and proposes raising the statement timeout"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-orphan-provider-refunds       # every provider refund has a local record
+    - no-orphan-local-records          # and vice versa, or an explicit pending state
+    - connections-not-held-during-provider-call
+    - reconciliation-query-exists
+  root_cause_markers:
+    - external call moved outside the transaction
+    - explicit status state machine (pending -> succeeded/failed)
+    - deterministic idempotency key on the provider call
+    - reconciliation path for interrupted operations
+  symptom_only_markers:
+    - statement timeout raised with the call still inside the transaction
+    - rollback handler patched without moving the call
+hints:
+  - "A transaction rolled back. Why does the customer still have their money?"
+  - "What can a ROLLBACK undo, and what can it not?"
+  - "Look at the connection metrics during a refund. What is holding them?"
+  - "Reveal: the provider call sits inside the transaction. Move it out, record intent first, and reconcile pending rows."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 50
+  stability: 25
+  agent_verification: 25

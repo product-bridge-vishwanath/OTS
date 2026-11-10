@@ -95,8 +95,33 @@ for (const l of lessons) {
       errors.push(`${l.id}: missing lesson section "${section}"`);
     }
   }
+  // Component/section checks must ignore fenced code blocks: MDX treats their
+  // contents as literal text, so a TypeScript generic like `<T>` is not a
+  // component reference. Blank the fenced regions, preserving line numbers.
+  let fenced = false;
+  const prose = l.content
+    .split("\n")
+    .map((line) => {
+      if (/^\s*```/.test(line)) {
+        fenced = !fenced;
+        return "";
+      }
+      return fenced ? "" : line;
+    })
+    .join("\n");
+
+  // An escaped backtick inside an inline code span ends the span early,
+  // spilling the rest into prose — where `${x}` becomes a JSX expression and
+  // the build fails with "x is not defined". Rewrite without nested backticks.
+  if (/\\`/.test(prose)) {
+    errors.push(
+      `${l.id}: escaped backtick (\\\`) in prose — it terminates the inline code ` +
+        `span early; rewrite the phrase without a nested backtick`
+    );
+  }
+
   // Unknown components throw at render time; catch them here.
-  for (const m of l.content.matchAll(/<([A-Z][A-Za-z0-9]*)[\s/>]/g)) {
+  for (const m of prose.matchAll(/<([A-Z][A-Za-z0-9]*)[\s/>]/g)) {
     if (!KNOWN_COMPONENTS.has(m[1])) {
       errors.push(
         `${l.id}: unknown component <${m[1]}> — not provided by components/mdx.tsx`
@@ -123,14 +148,14 @@ for (const l of lessons) {
   if (inFence) errors.push(`${l.id}: unclosed code fence`);
 
   // Every Section must declare a kind the renderer knows.
-  for (const m of l.content.matchAll(/<Section\s+kind="([^"]+)"/g)) {
+  for (const m of prose.matchAll(/<Section\s+kind="([^"]+)"/g)) {
     if (!REQUIRED_SECTIONS.includes(m[1])) {
       errors.push(`${l.id}: <Section kind="${m[1]}"> is not a known section kind`);
     }
   }
 
   // Quizzes must be bound to their own lesson, or progress records the wrong one.
-  for (const m of l.content.matchAll(/<Quiz\s+lessonId="([^"]+)"/g)) {
+  for (const m of prose.matchAll(/<Quiz\s+lessonId="([^"]+)"/g)) {
     if (m[1] !== l.id) {
       errors.push(`${l.id}: <Quiz lessonId="${m[1]}"> does not match this lesson's id`);
     }
@@ -190,6 +215,8 @@ for (const l of lessons) {
       errors.push(`${l.id}: <Term k="${m[1]}"> has no glossary entry`);
     }
   }
+  // Section-kind coverage is checked against raw content above; the
+  // fence-aware `prose` pass is what guards component names.
 }
 
 const commands = getCommandGroups().reduce((n, g) => n + g.commands.length, 0);
@@ -203,6 +230,21 @@ if (errors.length) {
   console.error(`✗ content lint failed (${errors.length}):\n`);
   for (const e of errors) console.error("  -", e);
   process.exit(1);
+}
+
+// Not an error — some lessons are legitimately table- or procedure-shaped —
+// but the plan asks for a diagram per mental model, so surface the coverage.
+const withDiagram = lessons.filter((l) =>
+  l.content.includes('className="diagram"')
+);
+if (withDiagram.length < lessons.length) {
+  const missing = lessons
+    .filter((l) => !l.content.includes('className="diagram"'))
+    .map((l) => l.id);
+  console.log(
+    `  note: ${withDiagram.length}/${lessons.length} lessons have a mental-model diagram ` +
+      `(no SVG in: ${missing.join(", ")})`
+  );
 }
 
 console.log(

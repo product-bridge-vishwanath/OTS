@@ -1,0 +1,418 @@
+---
+id: m07-l01
+module: M7
+title: "Multiple users at once: what \"concurrent\" actually means"
+order: 1
+difficulty: 2
+depth: both
+platforms: [postgres, redis, vercel, render]
+concepts: [concurrency, processes, race-conditions]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-concurrency-basics-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder tested her booking flow about two hundred times before launch. She tried every edge case she could imagine: invalid dates, missing fields, a room that didn't exist, double-clicking the submit button. Everything behaved.
+
+Launch day. Eleven minutes in, two customers booked the same studio for the same evening. Then a third pair did it. Her inventory of available slots went negative. A customer's payment succeeded while their booking row didn't exist.
+
+She had tested every path through her code. What she had never tested was **two people arriving at the same instant**, because every test she wrote ran one request at a time, in order, alone. Her code was correct for the only situation it had ever been in: a world with one user.
+
+Production is never that world. And the failures that only appear with two users don't throw errors — they produce wrong data, silently, while every log line says 200.
+
+</Section>
+
+<Section kind="already-did">
+
+You have already hit concurrency without naming it. A double-clicked submit button creating two records. A webhook that fired twice. A test that passes alone and fails in CI when the suite runs in parallel. A "works on my machine" bug that only appeared under real traffic.
+
+You've also been protected from it by accident. If your app has one user at a time — you, in development — requests queue up neatly and every read-then-write sequence completes undisturbed. **Development is a concurrency-free environment,** which is precisely why these bugs ship.
+
+And if you've followed an agent's instructions to "add a transaction" or "use `FOR UPDATE`", you've applied a concurrency fix without necessarily knowing what it was defending against. This module makes that explicit.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What a server is actually doing
+
+Your app does not handle one request at a time. While request A waits for the database (milliseconds of doing nothing), the process picks up request B. Requests **interleave**.
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Two requests interleaving on one process: request A reads, then request B reads the same value before A writes, so A's write is overwritten by B's" className="diagram">
+  <defs>
+    <marker id="arrcc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <text x="12" y="20" className="sub">TIME →</text>
+
+  <text x="12" y="52" className="sub">Request A</text>
+  <rect x="100" y="34" width="120" height="30" rx="5" />
+  <text x="160" y="54" textAnchor="middle" className="sub">read notes = [1]</text>
+  <rect x="470" y="34" width="150" height="30" rx="5" />
+  <text x="545" y="54" textAnchor="middle" className="sub">write notes = [1,A]</text>
+
+  <text x="12" y="112" className="sub">Request B</text>
+  <rect x="250" y="94" width="120" height="30" rx="5" />
+  <text x="310" y="114" textAnchor="middle" className="sub">read notes = [1]</text>
+  <rect x="640" y="94" width="130" height="30" rx="5" />
+  <text x="705" y="114" textAnchor="middle" className="sub">write notes = [1,B]</text>
+
+  <path d="M 100 150 L 770 150" className="arrow" />
+  <path d="M 160 64 L 160 146" className="arrow" />
+  <path d="M 310 124 L 310 146" className="arrow" />
+  <path d="M 545 64 L 545 146" className="arrow" />
+  <path d="M 705 124 L 705 146" className="arrow" />
+
+  <text x="12" y="186" className="sub">Both read the SAME starting value. B&apos;s write lands last and erases A&apos;s note.</text>
+  <text x="12" y="208" className="sub">Final state: [1,B]. Note A is gone. Both requests returned 200.</text>
+  <text x="12" y="240" className="sub">Nothing crashed. No error was logged. No alert fired.</text>
+  <text x="12" y="262" className="sub">This is a LOST UPDATE, and it is the shape of most concurrency bugs.</text>
+</svg>
+
+**The analogy.** Two people editing the same paper form. Each photocopies it, writes a line, and files their copy back. Whoever files second wins; the other line never existed. Neither person did anything wrong, and nobody is told.
+
+### Three places concurrency comes from
+
+Even with *one* server process, you have concurrency. But it arrives from three directions, and knowing which applies to you matters:
+
+| Source | When | Shares memory? |
+|---|---|---|
+| **Interleaved requests in one process** | Always, from your second simultaneous user | Yes — module state is shared |
+| **Multiple instances / replicas** | Scaling out, or any PaaS with >1 instance | **No** — separate memory, same database |
+| **Background workers and crons** | A worker, a scheduled job, a webhook handler | No — separate process, same database |
+
+<Callout type="key">
+The thing all three share is **the database**. That's why the database is where concurrency problems get *solved* — it's the only component that all concurrent actors can see. An in-process lock protects you from source 1 and does nothing about sources 2 and 3, which is why in-memory solutions are a trap (M1.1's module-scope problem, met again from the other side).
+</Callout>
+
+### The two dangerous shapes
+
+Almost every concurrency bug in a web app is one of these two patterns. Learn to recognise them in code.
+
+**1. <Term k="read-modify-write">Read-modify-write</Term>** — read a value, change it in your code, write it back:
+
+```ts
+const booking = await db.query("SELECT notes FROM bookings WHERE id=$1", [id]);
+const notes = booking.notes;            // ← read
+notes.push(newNote);                    // ← modify (in your process)
+await db.query("UPDATE bookings SET notes=$1 WHERE id=$2", [notes, id]);  // ← write
+```
+
+Two requests both read the old value; the second write erases the first. Result: a <Term k="lost-update">lost update</Term>.
+
+**2. <Term k="check-then-act">Check-then-act</Term>** — verify something is allowed, then do it:
+
+```ts
+const clashes = await db.query("SELECT id FROM bookings WHERE room_id=$1 AND ...");
+if (clashes.length > 0) return conflict();   // ← check
+await db.query("INSERT INTO bookings ...");  // ← act
+```
+
+Two requests both check, both find the slot free, both insert. Result: a double booking.
+
+**The tell in both cases is a gap between two database calls where your code holds a decision based on data that can go stale.** Anything that makes the gap wider — an `await` on a third-party API, a slow query, a `fraudCheck()` — widens the window. The demo app's booking endpoint has a 150ms fraud check sitting in exactly that gap, which is why its race is so easy to hit.
+
+### Why your tests don't catch it
+
+| Test style | Catches concurrency bugs? |
+|---|---|
+| Unit tests | No — one call at a time by construction |
+| Integration tests | No — sequential requests |
+| Manual QA | Almost never — you can't click fast enough |
+| **Concurrent load test** | **Yes** — N simultaneous identical requests |
+
+That last row is a test you can write in ten lines, and almost nobody does. `Promise.all` with fifteen identical requests is the entire technique, and it's what `scripts/load/booking-rush.js` does.
+
+<Operator>
+
+Demonstrate interleaving yourself, then measure its consequences.
+
+```bash
+cd demo-app
+
+# ── Prove requests overlap in time (not queued) ───────────────────────
+#   Sequential: 5 requests, one after another
+time (for i in 1 2 3 4 5; do curl -s -o /dev/null localhost:3001/api/bookings; done)
+#   Concurrent: the same 5 at once
+time (for i in 1 2 3 4 5; do curl -s -o /dev/null localhost:3001/api/bookings & done; wait)
+#   Concurrent total ≈ the slowest single request, not the sum. They overlapped.
+
+# ── See several requests in flight inside the database ───────────────
+(for i in $(seq 1 20); do curl -s -o /dev/null localhost:3001/api/bookings & done) >/dev/null 2>&1
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT count(*) AS in_flight, state FROM pg_stat_activity
+   WHERE datname='demo' GROUP BY state;"
+
+# ── One process, many requests: confirm the shape (M1.1) ─────────────
+docker compose exec app sh -c 'ps -o pid,comm -e | grep -c "[n]ode"'
+#   One PID serving everything ⇒ module-level state is SHARED between
+#   all those interleaved requests.
+
+# ── The ten-line concurrency test you should own ─────────────────────
+cat > /tmp/concurrent-test.mjs <<'EOF'
+const APP = "http://localhost:3001";
+const N = 15;
+const body = { room_id: 4, customer_name: "concurrency-probe",
+               date: "2026-12-20", start_hour: 14, end_hour: 16 };
+const results = await Promise.all(
+  Array.from({ length: N }, () =>
+    fetch(`${APP}/api/bookings`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(r => r.status))
+);
+const created = results.filter(s => s === 201).length;
+console.log(`statuses: ${results.join(",")}`);
+console.log(created === 1 ? "PASS: exactly one won" : `FAIL: ${created} of ${N} succeeded`);
+EOF
+node /tmp/concurrent-test.mjs
+
+# ── Clean up probe rows so the demo data stays sensible ──────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name='concurrency-probe';"
+```
+
+That test is the thing to steal. Any endpoint that must happen "at most once" — booking, charging, claiming, redeeming — deserves fifteen simultaneous identical requests in CI, asserting that exactly one succeeded.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+You don't need special tooling to find these bugs — you need to *generate concurrency*, which is a few lines in anything.
+
+| Tool | Use | Note |
+|---|---|---|
+| `Promise.all` in a script | Hitting one endpoint N times simultaneously | The ten-line test above; start here |
+| `xargs -P` / `&` + `wait` in bash | Same, from a shell | `seq 20 \| xargs -P20 -I{} curl -s …` |
+| **`oha`, `hey`, `vegeta`** | Sustained load with concurrency control | `oha -n 200 -c 20 URL` — good for latency under load |
+| `k6` | Scripted scenarios, assertions, CI | Worth it when load testing becomes routine |
+| `pgbench -c` | Concurrency against Postgres directly | Isolates database-level behaviour from app code |
+| Two `psql` sessions side by side | Watching locks and transactions interact | The best *teaching* tool there is (L7.4) |
+
+What good looks like: every endpoint with an "at most once" or "exactly N available" rule has a concurrent test asserting the invariant, running in CI. Not a load test for performance — a **correctness** test with concurrency.
+
+The mental shift worth making: concurrency bugs aren't performance problems, they're **correctness** problems. They belong with your tests, not with your monitoring, because monitoring will never tell you about them (nothing errors).
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Prove requests interleave** with the sequential-vs-concurrent timing commands above. Write down both totals and explain the difference.
+
+2. **Hit a real race.** Run the booking rush against a fresh slot:
+   ```bash
+   APP_URL=http://localhost:3001 node scripts/load/booking-rush.js
+   ```
+   You should see a large number of 201s for one slot. Then look at the damage:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c "
+     SELECT room_id, date, start_hour, end_hour, count(*), string_agg(customer_name, ', ')
+       FROM bookings WHERE customer_name LIKE 'rush-customer-%'
+      GROUP BY 1,2,3,4 ORDER BY 5 DESC LIMIT 3;"
+   ```
+
+3. **Identify the shape in the code.** Open [app/api/bookings/route.ts](demo-app/app/api/bookings/route.ts). Find the check (the clash query), find the act (the insert), and find what sits between them. Write down the window in milliseconds.
+
+4. **Hit the other shape.** Run the notes drill and count the loss:
+   ```bash
+   APP_URL=http://localhost:3001 node scripts/load/concurrent-editors.js 1
+   ```
+   Then confirm **nothing was logged as an error** — this is the crucial observation:
+   ```bash
+   docker compose logs --since 2m app | grep -icE "error|warn" | xargs echo "errors logged:"
+   ```
+   Twenty writes accepted, six kept, zero errors. No monitoring you could buy would have told you.
+
+5. **Write the concurrent test** from the Operator block, run it, and watch it fail. Keep it — you'll make it pass in L7.2.
+
+6. **Clean up** so later lessons start from sane data:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "DELETE FROM bookings WHERE customer_name LIKE 'rush-customer-%' OR customer_name='concurrency-probe';"
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team added per-user rate limiting to their signup endpoint — five attempts per minute. It tested perfectly. In production, a bot comfortably made forty signups a minute, and legitimate users occasionally got rate-limited after only two attempts.
+
+<Evidence title="the implementation">
+
+```ts
+// lib/rate-limit.ts
+const attempts = new Map<string, number[]>();        // ip → timestamps
+
+export function allow(ip: string, limit = 5, windowMs = 60_000): boolean {
+  const now = Date.now();
+  const recent = (attempts.get(ip) ?? []).filter(t => now - t < windowMs);
+  if (recent.length >= limit) return false;
+  recent.push(now);
+  attempts.set(ip, recent);
+  return true;
+}
+```
+
+</Evidence>
+
+<Evidence title="production facts">
+
+```text
+Platform: Render, web service, autoscaling 2–6 instances
+Current instances: 4
+Logs (bot IP 203.0.113.88, one minute):
+  instance-a: signup.attempt ip=203.0.113.88 (5 allowed, then blocked)
+  instance-b: signup.attempt ip=203.0.113.88 (5 allowed, then blocked)
+  instance-c: signup.attempt ip=203.0.113.88 (5 allowed, then blocked)
+  instance-d: signup.attempt ip=203.0.113.88 (5 allowed, then blocked)
+  → 20 signups from one IP in a minute, each instance believing it blocked at 5
+
+Legitimate user complaints: "it says too many attempts and I only tried twice"
+Load balancer: no session affinity (requests distributed round-robin)
+```
+
+</Evidence>
+
+Two opposite symptoms — too permissive for the bot, too strict for users — from one cause. Name it.
+
+<Reveal label="Reveal the cause">
+
+**The rate limiter's state lives in each instance's process memory, so there are four independent limiters instead of one shared one.**
+
+**Why the bot got 20 signups:** each of the four instances has its own `Map`. The bot's requests are distributed round-robin, so each instance sees roughly a quarter of them and allows 5 before blocking. The effective limit is `limit × instances` — and because the platform autoscales from 2 to 6, the *real* limit silently varies with traffic. Under heavy load it scales up and the limit gets *looser* precisely when you need it tighter.
+
+**Why legitimate users were blocked after two attempts:** the opposite face of the same bug. A user's three earlier attempts landed on instance-a. Their fourth lands on instance-b, which has no record… but a user who retries several times can also land repeatedly on *one* instance whose `Map` already holds entries from a previous burst — and there's a second defect making this worse: `attempts` is **never cleaned up for inactive IPs**. The map only filters when an IP is seen again, so memory grows unbounded (M1.6's leak) and stale state persists per instance. Users experience the limiter as random, because which instance answers is random.
+
+**Map it onto the mental model.** This is concurrency source 2 — multiple instances with separate memory. The limiter is correct for source 1 (interleaved requests in one process) and useless for sources 2 and 3. And there's a read-modify-write race *within* each instance too: two simultaneous requests both read `recent`, both find it under the limit, both push. On a single instance the limit is already soft.
+
+**The fix: shared state, and make the check atomic.** The limiter must live where every actor can see it — Redis, which the app already has:
+
+```ts
+// Atomic: INCR and EXPIRE in one round trip, correct across all instances.
+const key = `rl:signup:${ip}:${Math.floor(Date.now() / 60_000)}`;
+const count = await redis.incr(key);
+if (count === 1) await redis.expire(key, 120);
+if (count > 5) return tooManyRequests();
+```
+
+`INCR` is a single atomic operation — no read-modify-write gap, no per-instance divergence, and the key expires itself so nothing leaks. (A sliding window via a sorted set is more precise; a fixed bucket like this is usually enough and far simpler.)
+
+**Two general rules this establishes:**
+1. **Any counter, limiter, lock or session shared between users must live outside the process** — Redis or the database. In-process is correct only for things genuinely local to one instance (a connection pool, a prepared-statement cache).
+2. **Prefer an operation the store performs atomically** (`INCR`, `UPDATE … SET n = n + 1`, a unique constraint) over reading a value into your code and writing it back. The gap in read-modify-write is where the bug lives, and the way to be safe is to not have a gap.
+
+**And the deeper point for this module:** if you'd been asked "is this rate limiter correct?", reading the function alone would tell you yes. It's only wrong in the presence of concurrency and multiple instances — context that doesn't appear in the code. That's why these bugs survive code review, your tests, and your agent.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit this codebase for state shared between requests or users that lives in process memory: module-level Maps, arrays, objects, counters, caches, rate limiters, locks, or session stores. For each give file:line, say what breaks when the app runs as multiple instances, and whether there is also a read-modify-write race within a single instance."}>
+Two defects per hit are common — the per-instance divergence *and* an in-process race — so check it reports both. Verify a couple yourself with `grep -rn "new Map()"`. Anything shared between *users* needs to move to Redis or the database; per-instance caches of immutable data can stay.
+</AgentTask>
+
+<AgentTask prompt={"Write a concurrency correctness test for this endpoint: [route]. It must fire N identical requests simultaneously with Promise.all, then assert the invariant that should hold — exactly one succeeded, or the final count equals the number of accepted writes. Make it fail against the current code and explain which line of the handler allows the violation."}>
+The test must **fail now** — a passing test means it isn't exercising the race, usually because the requests aren't truly simultaneous or N is too small. Check it asserts a *data invariant* (query the database afterwards) rather than only inspecting response codes; the demo app returns 201 fifteen times while the data is wrong.
+</AgentTask>
+
+<AgentTask prompt={"Find every read-modify-write and check-then-act sequence in this codebase: places where we SELECT a value, make a decision or mutation in application code, then UPDATE or INSERT based on it. For each, show the gap between the two database calls, note anything awaited inside the gap that widens the window, and rank them by how damaging a lost update or duplicate would be."}>
+The ranking is what turns an audit into a plan — a lost note is annoying, a double charge is a refund and a support ticket. Check it spotted awaits inside the gap (third-party calls, slow queries); those widen the window from microseconds to hundreds of milliseconds, which is the difference between a rare race and a reproducible one.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Questions to ask about any endpoint that changes data:
+
+- Does it read a value, decide, then write? (Read-modify-write.)
+- Does it check whether something is allowed, then do it? (Check-then-act.)
+- What sits in the gap between those two database calls? Does anything `await` there?
+- What happens if two requests execute this simultaneously? Write down the end state.
+- Is there any shared counter, limit or lock in process memory?
+- How many instances does this run on in production? (If more than one, in-process state is already wrong.)
+- Is there a test that fires N simultaneous identical requests and asserts the invariant?
+
+What good looks like: every "at most once" rule has a concurrent correctness test in CI; shared state lives in Redis or the database; counters use atomic operations rather than read-modify-write.
+
+Red flags: a rate limiter, counter, or session store in a module-level variable; "it works, I tested it" about an endpoint never tested concurrently; concurrency treated as a performance topic rather than a correctness one.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m07-l01"
+  questions={[
+    {
+      q: "Why do concurrency bugs survive thorough testing and code review?",
+      options: [
+        "They only occur under extremely high traffic",
+        "Tests and reviews examine one execution at a time, while the bug requires two executions interleaving — so the code is genuinely correct in every situation it has been observed in",
+        "They are caused by compiler optimisations that don't appear in source",
+        "They only affect production databases, not development ones"
+      ],
+      answer: 1,
+      explain: "Development is a concurrency-free environment by construction. The rate limiter in the break-fix reads as correct on its own; it's only wrong in the presence of concurrency and multiple instances — context absent from the code."
+    },
+    {
+      q: "What do interleaved requests in one process, multiple instances, and background workers all have in common?",
+      options: [
+        "They share process memory, so in-memory locks work for all three",
+        "They all share the database — which is why the database is where concurrency problems get solved",
+        "They are all prevented by using transactions",
+        "They each require a separate connection pool"
+      ],
+      answer: 1,
+      explain: "The database is the only component every concurrent actor can see. An in-process lock handles the first source and is useless against the other two, which is why in-memory solutions are a trap."
+    },
+    {
+      q: "Which two code shapes account for most concurrency bugs in web apps?",
+      options: [
+        "Recursion and deep object cloning",
+        "Read-modify-write (read a value, change it in code, write it back) and check-then-act (verify, then do)",
+        "Synchronous file I/O and blocking loops",
+        "Unhandled promise rejections and missing awaits"
+      ],
+      answer: 1,
+      explain: "Both have the same tell: a gap between two database calls during which your code holds a decision based on data that can go stale. Anything awaited in that gap widens the window."
+    },
+    {
+      q: "A per-instance in-memory rate limiter allows 5 requests per minute. The app autoscales across 4 instances. What's the real limit?",
+      options: [
+        "Still 5, because the load balancer routes consistently",
+        "About 20 — each instance enforces its own limit independently, and the effective limit grows as the platform scales up",
+        "Unlimited, because the Map is never populated",
+        "5 per instance only for authenticated users"
+      ],
+      answer: 1,
+      explain: "limit × instances, and it varies with autoscaling — so the limit gets looser exactly when traffic is heaviest. The fix is shared state in Redis using an atomic INCR."
+    },
+    {
+      q: "Why prefer `UPDATE counters SET n = n + 1` or Redis `INCR` over reading a value and writing it back?",
+      options: [
+        "They use fewer database connections",
+        "The store performs the whole operation atomically, so there is no gap between read and write for another actor to interleave into",
+        "They are faster because they avoid parsing",
+        "They automatically create an index on the counter column"
+      ],
+      answer: 1,
+      explain: "The gap *is* the bug. The safest fix is not guarding the gap but eliminating it — pushing the whole operation into something the store does indivisibly."
+    }
+  ]}
+/>
+
+</Section>
