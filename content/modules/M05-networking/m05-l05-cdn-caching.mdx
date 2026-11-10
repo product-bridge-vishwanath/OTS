@@ -1,0 +1,304 @@
+---
+id: m05-l05
+module: M5
+title: "CDNs and caching headers: Cloudflare as proxy, cache, and shield"
+order: 5
+difficulty: 2
+depth: both
+platforms: [cloudflare, vercel]
+concepts: [cdn]
+prerequisites: [m05-l04, m06-l05]
+lab: demo-repo
+scenario_ids: [sc-cdn-stale-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A news site published a correction to a factual error in a widely-shared article. The correction went live instantly in their CMS, the database updated immediately, and for the next four hours, roughly 60% of readers kept seeing the **original, uncorrected** version — served not by their origin server, which had the fix, but by a CDN edge node somewhere that had cached the old HTML and had no reason to think it was stale.
+
+The team had set `Cache-Control: public, max-age=14400` on that page months earlier — four hours, which had seemed reasonable for a page that rarely changed. It was exactly correct for *that* assumption and exactly wrong for "we need this specific page to be right, immediately, right now." Nobody had planned for the moment the assumption would break, because by definition you don't know which page you'll need to urgently fix until it's the one that's wrong.
+
+The fix wasn't lowering `max-age` everywhere — that would have thrown away the entire benefit of caching for every page that didn't need the panic. It was knowing, in the moment, which single command **purges one URL from the edge**, instead of waiting out a TTL you set for an entirely different situation.
+
+</Section>
+
+<Section kind="already-did">
+
+You've seen a page not update after a deploy and been told to "clear your cache" — your browser's cache, sometimes, but often actually a CDN's. You've probably also benefited enormously from a CDN without ever configuring one yourself, if your platform (Vercel, Netlify) puts one in front of your static assets automatically.
+
+M6.5 already taught you the Redis side of caching — a server-side cache your own code reads and writes. A CDN is the same fundamental idea (a faster copy, closer to the reader, with a staleness budget) operating one layer further out, between your server and the actual internet, and it has its own completely separate cache to reason about.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Three jobs, one Cloudflare
+
+<svg viewBox="0 0 780 220" role="img" aria-label="Cloudflare sitting in front of an origin server does three jobs: proxying every request, caching responses at the edge close to users, and shielding the origin from traffic spikes and attacks" className="diagram">
+  <rect x="8" y="80" width="140" height="50" rx="8" />
+  <text x="78" y="110" textAnchor="middle" className="sub">Users, worldwide</text>
+  <rect x="300" y="80" width="180" height="50" rx="8" />
+  <text x="390" y="110" textAnchor="middle" className="sub">Cloudflare edge</text>
+  <rect x="616" y="80" width="156" height="50" rx="8" />
+  <text x="694" y="110" textAnchor="middle" className="sub">Your origin</text>
+
+  <text x="12" y="30" className="sub">1 · PROXY — every request flows through here; it can modify, route, or block</text>
+  <text x="12" y="160" className="sub">2 · CACHE — a cache HIT answers from the edge, never reaching your origin at all</text>
+  <text x="12" y="190" className="sub">3 · SHIELD — a traffic spike or attack hits the edge's absorbing capacity, not your server's</text>
+</svg>
+
+### Reading cache headers for real
+
+```bash
+curl -sI https://www.cloudflare.com/favicon.ico | grep -iE "cf-cache-status|cache-control"
+```
+```text
+cf-cache-status: HIT
+cache-control: public, max-age=0, must-revalidate
+```
+
+<Callout type="key">
+**`cf-cache-status: HIT` means this specific response came from the edge, never touching the origin — the origin server has no idea this request even happened.** `MISS` means the edge asked the origin and is now caching the answer. `DYNAMIC`/`BYPASS` mean the CDN deliberately didn't cache this response at all — often correctly, for anything personalized or that must always be fresh. Reading this one header is the fastest way to know whether you're debugging the edge's cached copy or the origin's live behavior.
+</Callout>
+
+### `Cache-Control` directives that actually matter
+
+| Directive | Meaning |
+|---|---|
+| `public` | Anyone (browsers, CDNs, any cache) may store this |
+| `private` | Only the end user's own browser may cache it — a CDN must not |
+| `no-store` | Never cache this, anywhere, ever |
+| `no-cache` | Confusingly named — *may* be cached, but must be revalidated with the origin before being reused |
+| `max-age=N` | Seconds this may be served from cache before it's considered stale |
+| `s-maxage=N` | Like `max-age`, but specifically for shared caches (CDNs) — lets you cache longer at the edge than in a user's own browser |
+| `stale-while-revalidate=N` | Serve the stale copy immediately while fetching a fresh one in the background — fast and eventually-correct |
+
+### Purging: the lever for "I need this specific thing fixed NOW"
+
+A TTL is a bet made in advance about how often something changes. A purge is the deliberate override for the moment that bet turns out wrong for one specific URL, right now:
+
+```bash
+# Cloudflare: purge a single URL immediately, bypassing its TTL entirely.
+curl -X POST "https://api.cloudflare.com/client/v4/zones/{zone_id}/purge_cache" \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"files":["https://example.com/corrected-article"]}'
+```
+
+Every CDN offers some form of this. **Know where it is before you need it** — the news site's four-hour exposure window is exactly the cost of discovering a purge button exists only after you need to click it.
+
+<Operator>
+
+```bash
+# ── Real, live cache headers from a CDN-fronted site ───────────────────
+curl -sI https://www.cloudflare.com/ | grep -iE "cf-cache-status|cache-control|server"
+curl -sI https://www.cloudflare.com/favicon.ico | grep -iE "cf-cache-status|cache-control"
+#   Verified live: the dynamic homepage is cache-control: no-store;
+#   the static favicon shows cf-cache-status: HIT. Same site, two
+#   completely different caching postures, by design.
+
+cd demo-app
+
+# ── Does the demo app currently send any Cache-Control header at all? ──
+curl -sI http://localhost:3001/api/rooms | grep -i "cache-control"
+#   Likely nothing — Next.js API routes with `dynamic = "force-dynamic"`
+#   (as this one has) explicitly opt out of any HTTP-level caching,
+#   which is correct here: this endpoint has its OWN cache, in Redis
+#   (M6.5), and layering an HTTP cache on top would be a second,
+#   independently-stale copy to reason about.
+
+# ── Compare: the homepage's ACTUAL header, and why it's the opposite ───
+curl -sI http://localhost:3001/ | grep -iE "cache-control|etag"
+#   Verified: "private, no-cache, no-store, max-age=0, must-revalidate"
+#   — Next.js's own default for this page, because it's server-rendered
+#   per request (it fetches live room/booking data on every load) and
+#   the framework can't prove it's safe to cache. This is the "unreviewed
+#   default" case from this lesson's checklist: correct for THIS page's
+#   current behavior, but worth a deliberate look — a page that fetches
+#   live data doesn't automatically mean every byte of it must be
+#   uncacheable; it means someone has to decide, not inherit the default.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| CDN + proxy + basic DDoS absorption | **Cloudflare** — the default recommendation for most products (D14) |
+| Platform-native edge caching | Vercel/Netlify's built-in CDN for static assets, zero config |
+| Fine-grained purge control | Cloudflare's API (single URL, by tag, or full zone purge) |
+| See what a specific response's cache status is | `curl -I` + grep for the provider's cache-status header name |
+
+The decision worth making explicitly, per response type: **does this need to be fast-and-shared (cache aggressively, know how to purge), fast-and-private (browser-only caching), or always-fresh (`no-store`)?** The demo app's `/api/rooms` chose "cache aggressively, but in Redis, not HTTP" — a valid answer, and a deliberate one.
+
+What good looks like: every response's caching posture (public/private/no-store, and a TTL if cacheable) is a decision someone made, not a framework default nobody checked; and the purge mechanism for your CDN is something you've located and tested *before* the day you urgently need it.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Read real cache headers from two different responses on the same CDN-fronted site** (the Operator block's Cloudflare examples) and explain why they differ.
+
+2. **Check the demo app's own responses** for `Cache-Control`. Confirm `/api/rooms` sends none at all (correct — it's cached in Redis instead, per M6.5), and that `/` sends `private, no-cache, no-store, max-age=0, must-revalidate` (Next.js's own default for a server-rendered page). For the homepage specifically: is that default actually the right call here, or just unreviewed? Justify your answer.
+
+3. **Design the caching posture for three different hypothetical endpoints**: a public product catalog page, a logged-in user's account settings page, and a payment webhook receiver. Write down `public`/`private`/`no-store` and a TTL (or lack of one) for each, and justify each choice.
+
+4. **Find your CDN's purge mechanism** (Cloudflare's dashboard, or any CDN you use) without actually triggering it, and write down the exact steps — this is the five-minutes-now-versus-four-hours-later lesson from the story, made concrete.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A SaaS product's pricing page shows the old price for 20 minutes after a deliberate, confirmed price change — but only for users in one specific country. Everyone else sees the new price instantly.
+
+<Evidence title="the response headers, compared">
+
+```text
+# From a US-based request, 2 minutes after the change:
+cache-control: public, s-maxage=1200
+cf-cache-status: MISS
+x-price-shown: 49
+
+# From a UK-based request, same moment:
+cache-control: public, s-maxage=1200
+cf-cache-status: HIT
+x-price-shown: 39        ← the OLD price
+```
+
+</Evidence>
+
+<Evidence title="CDN configuration">
+
+```text
+Caching mode: Cache Everything (static + dynamic responses)
+Cache key: URL only (no Vary on any header)
+Edge locations: global, with per-region cache populated independently
+```
+
+</Evidence>
+
+Both requests hit the exact same URL, with the exact same `s-maxage`. One is a cache `MISS` showing the new price; the other is a `HIT` showing the old one. Why would geography affect this?
+
+<Reveal label="Reveal the cause">
+
+**Each CDN edge location caches independently — the US edge had already expired and refetched the page by the time of this check; the UK edge's copy, cached a few minutes earlier, simply hadn't reached its own 1200-second expiry yet.** This isn't a bug in the CDN or a configuration error — it's the same TTL applying correctly, at each edge, on each edge's own independent clock.
+
+**Map it onto M5.1's DNS lesson, because it's the identical shape:** a CDN's edge caches are exactly like DNS resolver caches — many independent copies, each respecting a TTL from the moment *it* fetched the value, with no synchronization between them. "Global propagation" of a cache purge has the same non-instant, staggered character as DNS propagation, for the same underlying reason: distributed, independent caches don't all refresh in lockstep just because one of them did.
+
+**Why this specific case ISN'T actually a bug, but still needed a real fix:** the price *will* correct itself everywhere within `s-maxage`'s window, with zero intervention — this is the system working as configured, just not instantly everywhere. The real question is whether 20 minutes of a wrong price, to a subset of users, in a subset of geographies, is an acceptable cost for a price *change* specifically — and for most products, the answer for pricing (unlike, say, a blog post typo) is no, it's genuinely a correctness incident while it lasts.
+
+**The fix for right now:** purge the specific URL explicitly, which propagates the invalidation immediately to every edge rather than waiting for each one's independent TTL to naturally elapse:
+```bash
+curl -X POST ".../purge_cache" --data '{"files":["https://example.com/pricing"]}'
+```
+
+**The fix going forward, for anything price-sensitive:** either lower `s-maxage` specifically on pages where a stale window has real cost (accepting more origin traffic in exchange), or — the more surgical answer — **purge as part of the price-change deploy itself**, automated, so a human doesn't have to remember to do it manually during the one moment it actually matters. The caching strategy doesn't need to change for every page; the deploy process for *this specific class* of change does.
+
+**The transferable lesson:** a CDN is not one cache with one clock — it's many independent caches, each honoring the same TTL from a different starting moment, exactly like the many independent DNS resolvers from M5.1. "It updated for me" proves nothing about whether it's updated everywhere, and the only deterministic fix for "I need this specific thing correct everywhere, right now" is an explicit purge, not patience.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"For this deploy/change [describe it — a price update, a correction to published content, a critical bug fix on a cached page], do we need to purge anything from our CDN, and if so, which specific URLs? Show me the exact purge command for our CDN provider, and tell me whether this should be automated as part of future deploys of this type rather than done manually."}>
+The automation question is the one that prevents recurrence — a manual purge remembered once and forgotten the next time is the same failure mode as every other "someone has to remember" problem in this program (M7.8's cron locks, M6.4's backup monitoring). If this class of change happens repeatedly, the purge belongs in the deploy pipeline.
+</AgentTask>
+
+<AgentTask prompt={"Audit our caching headers across these endpoints [list them]: for each, is the Cache-Control directive (public/private/no-store, and any max-age/s-maxage) an intentional choice matching what that endpoint actually needs, or a framework default nobody reviewed? Flag anything personalized or sensitive that's marked public or has no explicit directive at all."}>
+A personalized or sensitive response with no explicit Cache-Control (or worse, marked `public`) is a real risk — a CDN or shared proxy could cache one user's personalized response and serve it to a different user. Verify it specifically checks for this class of mistake, not just generic TTL tuning.
+</AgentTask>
+
+<AgentTask prompt={"We have a page/endpoint that currently sends no explicit Cache-Control header (relying on the framework's default). Tell me what that default actually is for our framework, whether it's the right choice for this specific response, and if not, the exact header value to set — including whether s-maxage differs from max-age for our use case."}>
+This is the demo app's actual homepage situation (`private, no-cache, no-store` by Next.js default) made into a general audit — verify it checks the REAL current header via curl rather than assuming the framework's documented default, since actual behavior can differ by rendering mode.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For any response your product serves:
+
+- Is its `Cache-Control` directive (`public`/`private`/`no-store`, plus a TTL) a deliberate choice, or an unreviewed default?
+- For anything cached publicly: do you know the exact command to purge it from your CDN, and have you located it before needing it under pressure?
+- For anything price-, content-correction-, or security-sensitive: is purging part of the automated deploy process for that class of change, rather than a manual step someone has to remember?
+
+What good looks like: nobody discovers a CDN's purge mechanism for the first time during an actual incident; caching posture is reviewed per endpoint, not inherited blindly from a framework default.
+
+Red flags: a personalized response with no cache directive or marked `public`; "it updated for me" treated as proof a global change has taken effect; a purge step that exists only in someone's memory, not in a runbook or an automated pipeline.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l05"
+  questions={[
+    {
+      q: "What does `cf-cache-status: HIT` tell you that's useful for debugging?",
+      options: [
+        "The request was authenticated successfully",
+        "This specific response was served entirely from the CDN edge and never reached your origin server at all — your origin has no record of this request happening",
+        "The response was compressed before sending",
+        "The CDN detected and blocked a malicious request"
+      ],
+      answer: 1,
+      explain: "Reading this header is the fastest way to know whether a debugging session should focus on the edge's cached copy or the origin server's live behavior — they can disagree completely."
+    },
+    {
+      q: "Why did two users in different countries see different prices for the same URL at the same moment, with identical s-maxage settings?",
+      options: [
+        "The CDN had a bug in its geo-routing",
+        "Each CDN edge location caches independently with its own clock — one edge's cache had already expired and refetched, while another's, populated a few minutes earlier, simply hadn't reached its own expiry yet",
+        "One user had a browser extension altering prices",
+        "The origin server returned different responses based on IP geolocation"
+      ],
+      answer: 1,
+      explain: "This is the exact same mechanism as M5.1's DNS resolver caches — many independent caches, each honoring a TTL from its own fetch time, with no synchronization between them."
+    },
+    {
+      q: "Why is `s-maxage` a different, useful lever from plain `max-age`?",
+      options: [
+        "s-maxage only works over HTTPS",
+        "s-maxage specifically targets shared caches like CDNs, letting you cache longer at the edge than you'd want an individual user's own browser to cache the same response",
+        "s-maxage is measured in minutes while max-age is measured in seconds",
+        "s-maxage disables caching entirely for security-sensitive responses"
+      ],
+      answer: 1,
+      explain: "This separation lets you tune edge caching (which serves many users, so staleness risk is shared) independently from browser caching (which only affects one user's own view)."
+    },
+    {
+      q: "Why does a deliberate purge fix the stale-price problem faster than just waiting?",
+      options: [
+        "Purging also clears the origin server's own cache",
+        "A purge propagates the invalidation to every edge immediately, rather than each edge independently waiting out its own TTL from whenever it happened to cache the old value",
+        "Purging resets s-maxage to a lower value permanently",
+        "Purging only works for static assets, not dynamic pages"
+      ],
+      answer: 1,
+      explain: "Patience means waiting for the SLOWEST edge's TTL to naturally elapse. A purge is the deterministic override — exactly analogous to why there's no way to force someone else's DNS resolver to recheck early (M5.1), except a CDN purge is a lever you DO control for your own edge network."
+    },
+    {
+      q: "Why was it correct for the demo app's /api/rooms endpoint to send NO Cache-Control header at all?",
+      options: [
+        "Next.js API routes cannot send custom headers",
+        "It already has its own cache in Redis (M6.5) — layering an independent HTTP-level cache on top would create a second, separately-stale copy of the same data to reason about",
+        "Caching is only relevant for static HTML pages",
+        "The endpoint changes too frequently to ever be cacheable"
+      ],
+      answer: 1,
+      explain: "Two caches for one piece of data means two independent staleness windows and two invalidation paths to keep in sync — more complexity for no benefit when one well-managed cache already does the job."
+    }
+  ]}
+/>
+
+</Section>

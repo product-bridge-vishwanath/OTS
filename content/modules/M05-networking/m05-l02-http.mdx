@@ -1,0 +1,325 @@
+---
+id: m05-l02
+module: M5
+title: "HTTP: methods, headers, and reading curl -v like a sentence"
+order: 2
+difficulty: 1
+depth: both
+platforms: [nginx, vercel]
+concepts: [http]
+prerequisites: [m05-l01]
+lab: demo-repo
+scenario_ids: [sc-http-method-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A developer's agent generated an endpoint for "toggling" a booking's status — flip it from pending to confirmed, or back. The agent wired it up as a `GET` request, because that's what the frontend button's `fetch()` call defaulted to and it worked immediately in testing.
+
+Three weeks later, a browser extension that prefetches links for faster navigation — entirely standard, well-behaved software — visited the booking page, saw the toggle link, and **prefetched it**, exactly as it's designed to do for any link it encounters, because prefetching a `GET` is supposed to be free of side effects. It toggled forty bookings from confirmed to pending, silently, across several customers' browsers, with zero malicious intent anywhere in the chain. The developer spent a day convinced they'd been hacked.
+
+Nobody was hacked. HTTP methods carry a *meaning*, not just a mechanism, and `GET` promises — to browsers, proxies, crawlers, prefetchers, caches, everyone — "reading this causes nothing to change." The code broke that promise, and every tool built on trusting it broke something in return.
+
+</Section>
+
+<Section kind="already-did">
+
+You've typed a URL and had the page load — that's a `GET`. You've submitted a form and had something change — usually a `POST`. If you've used `curl` following an agent's instructions, you've probably pasted a command with `-X POST` or `-H` without fully parsing what each flag meant, and gotten a response back that was either reassuring or confusing depending on whether you could read it.
+
+This lesson is about reading that response — and the request — the way someone experienced does: as a structured sentence with a subject, a verb, and a set of modifiers, not as a wall of text to skim past to find the status code.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Methods are promises, not just verbs
+
+| Method | Promise | Safe to retry blindly? | Safe to prefetch/cache? |
+|---|---|---|---|
+| `GET` | Read-only, no side effects | Yes | Yes |
+| `HEAD` | Like GET, headers only, no body | Yes | Yes |
+| `POST` | Create/do something, may not be repeatable safely | **No** — may double-create | No |
+| `PUT` | Replace a resource entirely, idempotent by definition | Yes (same result either way) | No |
+| `PATCH` | Partially update a resource | Depends on the update | No |
+| `DELETE` | Remove a resource | Usually yes (deleting twice = still deleted) | No |
+
+<svg viewBox="0 0 780 200" role="img" aria-label="A GET is assumed safe to fetch freely by browsers, crawlers, prefetchers and email scanners with no side effects, while a POST is assumed to change state and is never fetched automatically" className="diagram">
+  <text x="12" y="20" className="sub">GET — every tool assumes this is free to fetch, any time, without asking</text>
+  <rect x="8" y="30" width="130" height="36" rx="6" />
+  <text x="73" y="53" textAnchor="middle" className="sub">browser</text>
+  <rect x="150" y="30" width="130" height="36" rx="6" />
+  <text x="215" y="53" textAnchor="middle" className="sub">crawler</text>
+  <rect x="292" y="30" width="130" height="36" rx="6" />
+  <text x="357" y="53" textAnchor="middle" className="sub">prefetcher</text>
+  <rect x="434" y="30" width="170" height="36" rx="6" />
+  <text x="519" y="53" textAnchor="middle" className="sub">email image proxy</text>
+  <rect x="616" y="30" width="156" height="36" rx="6" />
+  <text x="694" y="53" textAnchor="middle" className="sub">link scanner</text>
+  <text x="12" y="90" className="sub">…all freely fetch any GET link they encounter, with zero hesitation, by design.</text>
+
+  <text x="12" y="134" className="sub">POST — nothing fetches this automatically; it requires a deliberate action</text>
+  <rect x="8" y="144" width="200" height="36" rx="6" />
+  <text x="108" y="167" textAnchor="middle" className="sub">a real form submit</text>
+  <text x="12" y="200" className="sub">If your GET changes state, every tool in the top row becomes an attacker without meaning to.</text>
+</svg>
+
+<Callout type="key">
+**"Idempotent" here means something specific and different from M7.7's meaning, worth distinguishing: an HTTP method is idempotent if making the SAME request twice produces the SAME end state as making it once** — not "safe to retry a job," but "repeating this exact call changes nothing further." `GET`, `PUT`, `DELETE` are specified as idempotent; `POST` is explicitly not. This is exactly why browsers warn before resubmitting a form (a `POST`) on back/refresh, and never warn about reloading a page (a `GET`) — and it's exactly the promise the prefetcher in the story assumed the toggle endpoint was keeping.
+</Callout>
+
+### Reading `curl -v` as a sentence
+
+```text
+> GET /api/health HTTP/1.1          ← you, asking: "read this resource"
+> Host: localhost:3001              ← which site, on a shared IP
+> User-Agent: curl/8.1.2
+>
+< HTTP/1.1 200 OK                   ← the answer: "here it is, succeeded"
+< Content-Type: application/json    ← what shape the body is in
+< Content-Length: 46
+<
+{"ok":true,"checks":{"postgres":"ok","redis":"ok"}}
+```
+
+Lines starting `>` are what you sent; `<` is what came back. Read the request as "verb, path, protocol version" and the response as "protocol version, status, reason phrase" — everything else is a header, a labeled fact about the message.
+
+### Headers worth actually knowing
+
+| Header | What it tells you |
+|---|---|
+| `Content-Type` | How to parse the body — `application/json`, `text/html`, etc. |
+| `Content-Length` | Body size in bytes — a mismatch here is a real bug signal |
+| `Cache-Control` | Whether and how long this response may be cached (M5.5) |
+| `Authorization` | Credentials for this request — **never log this** (M8.3) |
+| `Set-Cookie` / `Cookie` | Session state, handled specially (M5.6) |
+| `X-Forwarded-For` | The original client IP, when behind a proxy (M5.4) |
+
+### Status code families, briefly (the full reference has every code)
+
+2xx succeeded, 3xx redirected, 4xx your request was the problem, 5xx the server's side failed. The [status code reference](/reference/status-codes) is the detailed version; what matters here is recognizing the family fast enough to know which side of the connection to investigate first.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Read a request/response as a full conversation ────────────────────
+curl -v http://localhost:3001/api/health 2>&1
+#   Every line prefixed > is sent; every line prefixed < is received.
+
+# ── GET vs POST, and what each promises ───────────────────────────────
+curl -s http://localhost:3001/api/bookings | head -c 100; echo
+curl -s -X POST http://localhost:3001/api/bookings \
+  -H "Content-Type: application/json" \
+  -d '{"room_id":1,"customer_name":"http-test","date":"2026-12-15","start_hour":9,"end_hour":10}'
+#   The POST created a row. Running it again creates ANOTHER row — that's
+#   the non-idempotent promise, kept. Clean it up after:
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name='http-test';"
+
+# ── See the headers alone, fast ────────────────────────────────────────
+curl -sI http://localhost:3001/api/health
+curl -s -o /dev/null -D - http://localhost:3001/api/bookings | head -10
+
+# ── Timing breakdown — where did the time actually go? ─────────────────
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup}s connect:%{time_connect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  http://localhost:3001/api/bookings
+
+# ── OPTIONS: what methods does this endpoint actually allow? ──────────
+curl -v -X OPTIONS http://localhost:3001/api/bookings 2>&1 | grep -iE "< allow|< HTTP"
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Manual requests, scripting | `curl` |
+| Interactive exploration with history | Postman, Insomnia, HTTPie |
+| Browser-side inspection | DevTools Network tab — same request/response structure, visual |
+| Full reference for any status code | The [status code reference](/reference/status-codes) |
+
+What good looks like: `GET` and `HEAD` never change anything, ever, in your own API — no exceptions for convenience. Methods are chosen by what they promise, not by what was easiest to wire up in the frontend first.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Read a full `curl -v` exchange** line by line and narrate it out loud as a sentence — subject, verb, modifiers, answer.
+
+2. **Prove the idempotency distinction** directly: run the `POST /api/bookings` example twice and confirm two rows exist. Then run `GET /api/bookings` twice and confirm nothing changed between the two reads.
+
+3. **Audit your own product (or the demo app) for GET requests that aren't read-only.** Would a prefetcher, a crawler, or a browser's "open in new tabs" feature accidentally trigger a side effect?
+
+4. **Time a request's phases** with the `-w` timing format and identify which phase (DNS, connect, time-to-first-byte) dominates for a local request versus a request to a real external site.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** An app's "unsubscribe from emails" link, sent in every marketing email, works when clicked from the email client — but a security scanner flags it as vulnerable, and shortly after, several users report being unsubscribed without clicking anything.
+
+<Evidence title="the link and the handler">
+
+```html
+<a href="https://app.example.com/unsubscribe?token=abc123">Unsubscribe</a>
+```
+
+```ts
+// GET /unsubscribe
+export async function GET(req: NextRequest) {
+  const token = req.nextUrl.searchParams.get("token");
+  await db.query("UPDATE subscribers SET subscribed=false WHERE token=$1", [token]);
+  return NextResponse.redirect("/unsubscribed");
+}
+```
+
+</Evidence>
+
+<Evidence title="server logs for an affected user">
+
+```text
+GET /unsubscribe?token=abc123   200   (User-Agent: Mozilla/5.0 ... GmailImageProxy)
+GET /unsubscribe?token=abc123   200   (User-Agent: Mozilla/5.0 ... Outlook-prefetch)
+```
+
+</Evidence>
+
+The user never clicked the link. Two different requests for it still appear in the logs. What happened?
+
+<Reveal label="Reveal the cause">
+
+**The unsubscribe link is a `GET`, and email clients — Gmail's image proxy, Outlook's link prescanning for security — both fetch `GET` links automatically to prefetch images or scan for malware, exactly as they're designed to, because `GET` is supposed to be safe to fetch without asking.**
+
+This is the identical mechanism as the story's booking toggle, in a more common, well-documented form: email clients proxy and prescan links constantly, and every reputable one does so believing `GET` requests carry no side effects — that belief is the entire HTTP specification's promise about the method. An unsubscribe action that changes state on a `GET` will be silently triggered by security scanning, image proxying, link previews, and browser prefetching, all of which are *correctly implemented* software trusting a promise this endpoint broke.
+
+**Why the security scanner flagged it too, independently:** this is also a <Term k="idor">CSRF</Term>-adjacent concern — a `GET` request can be triggered from anywhere (an `<img src>` tag on a completely unrelated malicious page, for instance), with no user interaction and no cross-origin restriction, because browsers don't apply the same protections to simple `GET` navigation that they do to cross-origin `POST`s with credentials. A state-changing `GET` is doubly wrong: it breaks the idempotency promise AND it's trivially triggerable by a third party.
+
+**The fix:** make the actual unsubscribe a `POST`, triggered by a confirmation page the `GET` link lands on:
+
+```ts
+// GET /unsubscribe?token=... — shows a confirmation page, changes NOTHING
+export async function GET(req: NextRequest) {
+  const token = req.nextUrl.searchParams.get("token");
+  return renderConfirmationPage(token);   // "Click to confirm unsubscribe"
+}
+
+// POST /unsubscribe — the actual state change, from a real user click
+export async function POST(req: NextRequest) {
+  const { token } = await req.json();
+  await db.query("UPDATE subscribers SET subscribed=false WHERE token=$1", [token]);
+  return NextResponse.json({ ok: true });
+}
+```
+
+This is standard practice specifically because of this failure mode — nearly every unsubscribe flow you've used that shows a confirmation page before actually unsubscribing exists for exactly this reason, not as unnecessary friction.
+
+**The transferable rule:** anything that changes state must never be reachable by `GET` alone, because you don't control who or what issues `GET` requests to your app — browsers, crawlers, scanners, proxies and prefetchers all assume they can, freely, because the specification tells them they can.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit every GET endpoint in this codebase and tell me whether any of them change data — an UPDATE, INSERT, or DELETE triggered by a GET request. For each one found, show me the fix: moving the state change to a POST/PUT/DELETE, with a GET-served confirmation step if a human click needs to trigger it from an email or external link."}>
+This audit catches both this lesson's break-fix and the common real-world variant it's based on. Verify a hit or two yourself by reading the handler — the test is simply "does this GET handler write to a database or otherwise change state," not whether it LOOKS like a toggle or action verb in its name.
+</AgentTask>
+
+<AgentTask prompt={"Explain, for this specific endpoint [paste it], whether it's safe for a browser, crawler, or email client to prefetch or revisit this URL automatically without asking. If not, tell me exactly which HTTP method it should be and what UI change is needed to trigger it correctly (a form submit, a button with a POST, a confirmation step)."}>
+A good answer names the specific category of automated fetcher that would misfire (prefetchers, email proxies, link scanners) rather than giving a generic "use POST for actions" answer — understanding WHY matters for catching the next instance that doesn't look like an obvious action verb.
+</AgentTask>
+
+<AgentTask prompt={"Review this API's response headers across a few representative endpoints: are Content-Type and Content-Length always correct and consistent with the actual body? Is Authorization or any credential ever present in a logged request? Flag any endpoint whose status code family (2xx/4xx/5xx) doesn't match what actually happened — a 200 returned alongside an error body, for instance."}>
+The status-code-mismatch check catches a common AI-generated-API smell: returning 200 with `{"error": "..."}` in the body instead of an actual 4xx/5xx, which breaks every generic HTTP client's error handling and monitoring that relies on the status code rather than parsing every body.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every endpoint in your product:
+
+- Does a `GET` or `HEAD` request ever change data? (It must not, ever, no exceptions.)
+- Is the method chosen by what it promises (idempotent? side-effect-free?) rather than by what was easiest to wire up?
+- Would a prefetcher, crawler, or automated link scanner trigger this unexpectedly if it found the URL?
+
+What good looks like: you can state, for any endpoint, which HTTP method it uses and why that method's specific promise is the right one for what it does — and `curl -v` output reads as a sentence, not a wall of text.
+
+Red flags: a "toggle" or "delete" or "unsubscribe" action reachable via `GET`; a frontend's `fetch()` default method chosen without considering what it implies; status codes read without distinguishing which family they're in.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l02"
+  questions={[
+    {
+      q: "Why did a browser extension's link prefetcher accidentally toggle forty bookings in the story?",
+      options: [
+        "The extension was malicious",
+        "The toggle was implemented as a GET request, which every well-behaved prefetcher, crawler and email proxy assumes is safe to fetch freely because GET promises no side effects",
+        "The server had a caching bug unrelated to the request method",
+        "The extension bypassed the server's authentication"
+      ],
+      answer: 1,
+      explain: "Nothing malicious happened anywhere in the chain. GET is a promise to every tool built on trusting it — browsers, proxies, crawlers, prefetchers — and breaking that promise breaks all of them in return."
+    },
+    {
+      q: "What does \"idempotent\" mean for an HTTP method specifically?",
+      options: [
+        "The request can be retried safely if it fails due to a network error",
+        "Making the SAME request twice produces the SAME end state as making it once — repeating the call changes nothing further",
+        "The request requires authentication",
+        "The response is always cached"
+      ],
+      answer: 1,
+      explain: "This is distinct from M7.7's idempotency-key meaning. GET, PUT and DELETE are specified as idempotent; POST explicitly is not — which is why browsers warn before resubmitting a form on refresh."
+    },
+    {
+      q: "In curl -v output, what do the `>` and `<` prefixes mean?",
+      options: [
+        "> means an error, < means success",
+        "> is what you sent (the request), < is what came back (the response)",
+        "They indicate which HTTP version was used",
+        "> is the request header, < is the request body"
+      ],
+      answer: 1,
+      explain: "Reading the request as 'verb, path, protocol' and the response as 'protocol, status, reason' turns a wall of text into a legible exchange — the core reading skill this lesson teaches."
+    },
+    {
+      q: "Why did an unsubscribe link implemented as GET get triggered without the user clicking it?",
+      options: [
+        "The link was shared publicly by accident",
+        "Email clients routinely prefetch and prescan GET links automatically (image proxying, security scanning) — trusting, correctly, that GET requests carry no side effects",
+        "The token in the URL was guessable",
+        "A caching proxy replayed an old request"
+      ],
+      answer: 1,
+      explain: "Gmail's image proxy and Outlook's link prescanning both fetched the link automatically, exactly as designed. The fix is a GET that shows a confirmation page, with the actual state change behind a POST triggered by a real click."
+    },
+    {
+      q: "Why must a state-changing action never be reachable via a plain GET request?",
+      options: [
+        "GET requests are slower than POST requests",
+        "You don't control who or what issues GET requests to your app — browsers, crawlers, scanners and prefetchers all assume they're free to fetch GETs without asking, per the HTTP specification's own promise",
+        "GET requests cannot carry a request body",
+        "Servers are configured to ignore GET requests with side effects"
+      ],
+      answer: 1,
+      explain: "This is also why a state-changing GET is a security concern, not just a correctness one — it's trivially triggerable from an unrelated page via something as simple as an <img src> tag, with no cross-origin restriction applied."
+    }
+  ]}
+/>
+
+</Section>

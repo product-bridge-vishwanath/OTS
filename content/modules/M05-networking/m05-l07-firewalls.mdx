@@ -1,0 +1,288 @@
+---
+id: m05-l07
+module: M5
+title: "Firewalls and open ports: 0.0.0.0 vs localhost, and who can actually reach you"
+order: 7
+difficulty: 2
+depth: both
+platforms: [aws, gcp, docker, nginx]
+concepts: [firewalls]
+prerequisites: [m01-l04, m05-l04]
+lab: demo-repo
+scenario_ids: [sc-exposed-port-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A team put their Postgres database on a VPS "behind" their application, reachable only through the app, as far as anyone had checked. Six months later, a security researcher emailed them: their database was indexed by Shodan — a search engine for internet-connected devices — openly accepting connections from anywhere on the internet, no password attempted yet, just discovered.
+
+Nobody had "opened" the port in any dashboard. What had actually happened: when they'd set up Postgres, following a tutorial's exact steps, one line in the config was `listen_addresses = '*'` — meaning "accept connections on every network interface this machine has," including its public one. Combined with a cloud firewall rule that had been opened for "just a moment" during initial setup to let a teammate connect remotely, and never closed again, the database had been sitting fully exposed the entire time. Their application connecting to it locally had worked identically whether the database was listening on `127.0.0.1` only or on every interface — which is exactly why nobody noticed.
+
+</Section>
+
+<Section kind="already-did">
+
+You've followed a tutorial's instruction to "allow inbound traffic on port 5432" in a cloud console, clicked through it, and moved on without necessarily understanding you'd just made a decision about who on the entire internet could attempt to connect to your database. M1.4 already introduced the `0.0.0.0` vs `127.0.0.1` distinction for a single app process; this lesson is the same idea with the stakes raised to "the thing listening is your database, and the network it's reachable from is the whole internet."
+
+</Section>
+
+<Section kind="mental-model">
+
+### Two independent gates, and both must be closed
+
+<svg viewBox="0 0 780 220" role="img" aria-label="Two independent layers decide reachability: the firewall decides which ports are open on the network, and the application's own bind address decides which network interfaces it listens on" className="diagram">
+  <rect x="8" y="30" width="360" height="70" rx="8" />
+  <text x="188" y="56" textAnchor="middle">Layer 1: the FIREWALL</text>
+  <text x="188" y="78" textAnchor="middle" className="sub">which ports may receive traffic AT ALL, from where</text>
+
+  <rect x="412" y="30" width="360" height="70" rx="8" />
+  <text x="592" y="56" textAnchor="middle">Layer 2: the BIND ADDRESS</text>
+  <text x="592" y="78" textAnchor="middle" className="sub">which network interface the process LISTENS on</text>
+
+  <text x="12" y="135" className="sub">Verified: a process bound to 127.0.0.1 is reachable ONLY from this exact machine —</text>
+  <text x="12" y="157" className="sub">even with the firewall wide open, nothing outside this host can reach it.</text>
+  <text x="12" y="185" className="sub">A process bound to 0.0.0.0 is reachable from EVERY interface — the firewall is now</text>
+  <text x="12" y="207" className="sub">the ONLY thing standing between it and the public internet.</text>
+</svg>
+
+<Callout type="key">
+**You need BOTH gates closed, independently, and getting one right doesn't compensate for the other.** A locked-down firewall with a database bound to `0.0.0.0` is one firewall misconfiguration away from full exposure. A database correctly bound to `127.0.0.1` with a wide-open firewall is actually *safe* from the network, because nothing outside the machine can reach a `127.0.0.1`-only listener no matter what the firewall allows — the story's database would have been protected by bind address alone, firewall rule notwithstanding, had `listen_addresses` been left at its safer default.
+</Callout>
+
+### Verified: the practical difference, empirically
+
+```bash
+docker run -d -p 127.0.0.1:9191:80 nginx:alpine    # bind-restricted
+docker run -d -p 9192:80 nginx:alpine               # default, all interfaces
+```
+```text
+127.0.0.1-bound: netstat shows "127.0.0.1.9191  LISTEN" — only this host can connect
+0.0.0.0-bound:   netstat shows "*:9192  LISTEN"          — every interface, reachable from the network
+```
+
+Both respond identically to `curl http://127.0.0.1:...` from the same machine — the difference only becomes visible, and only matters, when something *else* on the network tries to connect. This is exactly why the story's team never noticed: every test they ran was from the one vantage point that can't tell the difference.
+
+### Firewalls and security groups: the vocabulary across platforms
+
+| Term | Means | Where |
+|---|---|---|
+| **Firewall** / `ufw`/`iptables` | Rules on a single machine about allowed traffic | A VPS you manage directly |
+| **Security group** | The same idea, managed by the cloud provider, attached to an instance | AWS, mapped in M12 |
+| **Network ACL** | A broader, subnet-level version of the same idea | AWS VPCs; usually left at defaults |
+| **Firewall rules** | Same concept, GCP's naming | GCP |
+
+The universal default-deny principle: **allow only the specific ports you need, from only the sources that need them** — your app's public port from everywhere, your database's port from nothing except your app server's own address (or, better, not exposed to the public network at all, reachable only over a private network/VPC).
+
+### What "behind the app" should actually mean
+
+The safest version of a database "behind" an application isn't a firewall rule that merely narrows who can reach a public port — it's the database **not having a public IP at all**, reachable only via a private network (a VPC) that the application server is also on. A firewall rule is a policy that can be (and, as in the story, often is) accidentally loosened; a database with no path to the public internet at all has no such failure mode to loosen.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── See exactly which interface each service binds to, right now ──────
+docker exec demo-app-proxy-1 sh -c "netstat -tln 2>/dev/null || cat /proc/net/tcp"
+#   Verified: the nginx proxy listens 0.0.0.0:80 — correct, it's MEANT
+#   to be reachable from outside the container's own localhost.
+
+# ── Check the database's own exposure ───────────────────────────────────
+docker port demo-app-db-1
+#   compose.yaml publishes 5432 with no explicit bind IP, meaning
+#   0.0.0.0 on the HOST — reachable from your LAN, not just this
+#   machine. Fine for local development; this exact configuration
+#   on a cloud VM with a public IP is the story's mistake.
+cat compose.yaml | grep -A2 "5432"
+
+# ── Reproduce the bind-address distinction directly ────────────────────
+docker run -d --rm --name bind-demo -p 127.0.0.1:9191:80 nginx:alpine
+docker run -d --rm --name bind-demo2 -p 9192:80 nginx:alpine
+sleep 1
+lsof -iTCP:9191 -sTCP:LISTEN -P    # shows 127.0.0.1:9191 specifically
+lsof -iTCP:9192 -sTCP:LISTEN -P    # shows *:9192 — every interface
+docker rm -f bind-demo bind-demo2
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| VPS-level firewall | `ufw` (simple), `iptables`/`nftables` (full control) |
+| Cloud security groups | AWS Security Groups, GCP Firewall Rules, Azure NSGs (full comparison in M12) |
+| Check what's actually listening, and where | `ss -tlnp` or `lsof -iTCP -sTCP:LISTEN` (M1.4) |
+| Private networking so a database never needs a public IP | VPC peering, Railway/Render private networking, Supabase/Neon's connection pooling over a private endpoint |
+| External scan of your own exposure | Shodan (see what the story's researcher saw), or a simple port scan from outside your network |
+
+What good looks like: databases and internal services have no public IP at all where a provider supports it; anything that must be on a public port is bound deliberately, not by an unexamined default; and the firewall and the bind address are both independently checked, not treated as one problem with one fix.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Check what's actually listening and where**, for every service in the stack, using the Operator block's first two commands.
+
+2. **Reproduce the bind-address distinction yourself** with the two throwaway nginx containers, and read the `lsof`/`netstat` output carefully — `127.0.0.1:PORT` versus `*:PORT` is the entire distinction, visible in one line.
+
+3. **Audit the demo app's `compose.yaml`** for every `ports:` entry. Which ones are bound to all interfaces by default? For each, ask: if this were a cloud VM with a public IP instead of your laptop, would this be safe?
+
+4. **Design the fix for the story.** The database should not be reachable from the public internet at all. Write down, concretely, what changes: the bind address, the firewall rule, and ideally, whether it needs a public IP at all if the app server can reach it over a private network instead.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A startup's Redis instance, meant to be used only by their own application server, gets compromised — an attacker connects, flushes all keys, and leaves a ransom note as the only remaining data. The team insists their firewall only allows their application server's IP to reach Redis's port.
+
+<Evidence title="the firewall rule, confirmed correct">
+
+```text
+Security group: redis-sg
+Inbound rule: port 6379, source: 10.0.1.15/32 (the app server's private IP)
+  — correctly restrictive, verified multiple times
+```
+
+</Evidence>
+
+<Evidence title="what actually happened">
+
+```text
+$ redis-cli -h <redis-public-ip> ping
+PONG     ← reachable from the researcher's own laptop, nowhere near the allowed IP
+
+$ dig +short redis-instance.example.com
+203.0.113.77          ← a PUBLIC IP, not the private 10.0.1.x range
+
+$ cat redis.conf | grep bind
+# bind 127.0.0.1    ← commented out
+```
+
+</Evidence>
+
+The firewall rule genuinely does restrict port 6379 to one private IP. Redis is still reachable from anywhere. How?
+
+<Reveal label="Reveal the cause">
+
+**Redis is bound to all interfaces (the `bind` directive is commented out, which defaults to listening everywhere) AND has a public IP address — meaning the security group's inbound rule on port 6379 was never actually the only gate, because the instance has its OWN public-facing listener independent of whatever a security group claims to restrict.**
+
+**Why the firewall rule "working" didn't matter:** the team verified the security group's rule was correctly scoped to one private IP, and that check was genuinely accurate — for traffic arriving at the instance's **private** network interface. But this Redis instance was provisioned with a public IP as well (a common default on some cloud setups unless explicitly disabled), and traffic to the **public** IP may be governed by an entirely different rule, or — as the evidence shows here — may not have had an equivalently restrictive rule applied to that interface at all. Two network paths to the same machine, only one of which was actually locked down.
+
+**The deeper, more fundamental problem the firewall rule was papering over:** even a perfectly-scoped firewall rule on every interface wouldn't be the *right* architecture here. Redis, like a database, should have **no public IP at all** — not a public IP with a tight firewall rule, which is one misconfiguration (a rule accidentally widened, a new interface provisioned, a load balancer mistakenly placed in front) away from exactly this outcome, but genuinely no path from the public internet whatsoever.
+
+**The fix:**
+1. **Immediate:** rotate/restore from backup (M6.4's restore drill, now for real), and audit what the attacker could have reached from inside Redis if any other credentials or sensitive data were cached there.
+2. **Remove the public IP entirely.** Most cloud providers let you provision an instance with only a private IP, reachable solely from within the VPC. This eliminates the entire class of "which interface does this rule apply to" confusion, because there's no public interface to misconfigure in the first place.
+3. **Set `bind 127.0.0.1` or the specific private interface IP explicitly** in `redis.conf` as well — belt and suspenders, exactly as M5's "two independent gates" principle recommends: don't rely on the firewall alone when the bind address is an equally real, independently-checkable control.
+4. **Require authentication** (`requirepass`, or better, Redis ACLs) regardless of network restriction — a network-level control should never be the *only* thing standing between an open port and full access, for exactly the reason this incident demonstrates: network-level assumptions can be wrong in ways that are invisible until tested from the actual outside.
+
+**The transferable lesson:** a firewall rule that's correct for the interface you checked says nothing about other interfaces the machine might also have. "I verified the firewall rule" and "I verified this service is actually unreachable from the public internet" are different claims — the second one requires testing from *outside*, from an address that isn't on your allowed list, exactly as the researcher in this story did by simply trying.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit every service in this infrastructure [describe it] for public IP exposure: does the database, cache, or any internal-only service have a public IP at all, regardless of what firewall rules claim to restrict? For anything that does and shouldn't need to, show me how to remove the public IP or move it to a private-network-only configuration for our provider."}>
+The key question is whether a public IP EXISTS, independent of firewall rules governing it — this catches the break-fix's exact failure mode, where a correctly-scoped rule on one interface said nothing about another interface entirely. Verify by actually attempting a connection from outside any allowed range, not just reading the configuration.
+</AgentTask>
+
+<AgentTask prompt={"For every service in this stack that should only be reachable internally (database, cache, internal APIs), check both independently: what does it bind to (0.0.0.0 vs a specific private interface), and what does the firewall/security group actually allow. Flag anything where either check alone would give false confidence."}>
+Insist on both checks being run and reported separately — the break-fix is precisely a case where checking only the firewall gave false confidence. A good audit explicitly states both the bind address AND the firewall rule for each service, not just one or the other.
+</AgentTask>
+
+<AgentTask prompt={"For every internal-only service in this infrastructure (database, cache, message queue), tell me whether our cloud provider supports provisioning it with no public IP at all, reachable only over a private network/VPC. If so, show me the exact change needed. If a public IP is unavoidable for our setup, tell me what that implies for how seriously we need to treat the firewall rule and authentication as the only remaining controls."}>
+This pushes toward the strongest available fix (no public IP) rather than settling for a tighter firewall rule, which is the lesson's actual recommendation. Verify it correctly identifies which of your services' providers actually support private-only networking — this varies significantly by provider and plan tier.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every service that shouldn't be public:
+
+- Does it have a public IP at all? (If a provider lets you avoid one entirely, that's the strongest fix.)
+- What does its own config bind to — `0.0.0.0`/all interfaces, or a specific restricted address?
+- What does the firewall/security group actually allow, checked independently of the bind address?
+- Has reachability been tested from genuinely OUTSIDE any allowed range — not just confirmed by reading a configuration?
+- Does it require authentication regardless of network restriction, as a second independent control?
+
+What good looks like: internal services have no public IP where avoidable; bind addresses and firewall rules are both checked, separately, for every service; and "I read the firewall rule" is never treated as equivalent to "I tested from outside and confirmed it's actually unreachable."
+
+Red flags: a database or cache with a public IP "protected" only by a firewall rule; `bind 0.0.0.0` or a commented-out bind directive left at its permissive default; no authentication on an internal service because "the network already restricts it."
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l07"
+  questions={[
+    {
+      q: "Why are a firewall rule and a process's bind address described as two INDEPENDENT gates?",
+      options: [
+        "They're actually the same setting, configured in two places",
+        "A process bound to 127.0.0.1 is unreachable from outside the machine regardless of firewall rules, and a wide-open firewall with a correctly bound process is still safe — each gate alone can provide protection, so both must independently fail for exposure to occur",
+        "Firewalls only apply to incoming traffic, bind addresses only to outgoing",
+        "Bind addresses are deprecated in favor of firewall rules on modern cloud platforms"
+      ],
+      answer: 1,
+      explain: "Verified empirically: a container bound to 127.0.0.1 shows up in netstat as reachable only from that exact host, regardless of any firewall policy — the bind address alone is a real, independent control."
+    },
+    {
+      q: "In the story, why did the team's own testing never reveal the database was publicly exposed?",
+      options: [
+        "They never actually tried connecting to the database",
+        "Every test they ran was FROM the same machine, which can't distinguish a 127.0.0.1-bound listener from a 0.0.0.0-bound one — both respond identically to local connections, and the difference only appears when something else on the network tries to connect",
+        "Their monitoring tool had a bug",
+        "The database only became exposed after their testing was complete"
+      ],
+      answer: 1,
+      explain: "This is exactly why `curl localhost` or a local psql connection proves nothing about external reachability — the test needs to originate from outside, which is precisely what the security researcher eventually did."
+    },
+    {
+      q: "In the Redis break-fix, why did a correctly-scoped firewall rule not actually protect the instance?",
+      options: [
+        "The firewall rule was syntactically wrong despite appearing correct",
+        "The instance had a public IP in addition to its private one, and the restrictive rule only applied to the interface the team checked — a different, unrestricted path existed via the public interface",
+        "Redis ignores firewall rules by design",
+        "The attacker had valid credentials from an insider"
+      ],
+      answer: 1,
+      explain: "Two network paths to the same machine, only one of which was locked down. 'I verified the firewall rule' and 'I verified this is actually unreachable from the public internet' are different claims, and only testing from outside confirms the second."
+    },
+    {
+      q: "What is the strongest fix for a database or cache that should never be publicly reachable?",
+      options: [
+        "A very long, complex firewall rule covering every possible source",
+        "Removing the public IP entirely, so there's no public network path to misconfigure in the first place — rather than relying solely on a firewall rule that could be accidentally widened",
+        "Changing the default port to something non-standard",
+        "Enabling verbose logging to detect intrusion attempts faster"
+      ],
+      answer: 1,
+      explain: "A firewall rule is a policy that can be loosened by accident (as both the story and the break-fix demonstrate); a service with genuinely no public IP has eliminated that entire failure mode rather than just mitigating it."
+    },
+    {
+      q: "Why should an internal service require authentication even when network access is already restricted?",
+      options: [
+        "Authentication is required by most compliance frameworks regardless of network setup",
+        "Network-level assumptions can be wrong in ways invisible until tested from outside (as the break-fix shows) — authentication is a second, independent control that doesn't rely on the network restriction being correct",
+        "Authentication improves performance by caching credentials",
+        "It's only necessary for services with more than one legitimate client"
+      ],
+      answer: 1,
+      explain: "This is the 'two independent gates' principle extended one layer further: don't let a network-level control be the ONLY thing standing between an open port and full access, because the network assumption itself might be silently wrong."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,329 @@
+---
+id: m05-l06
+module: M5
+title: "CORS, cookies and preflight: the vibe-coder classics"
+order: 6
+difficulty: 2
+depth: both
+platforms: [nginx, vercel]
+concepts: [cors]
+prerequisites: [m05-l02]
+lab: demo-repo
+scenario_ids: [sc-cors-preflight-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A developer split his app into a frontend (deployed on Vercel) and a backend API (deployed separately on Render), following an agent's suggestion to "separate concerns." Locally, on `localhost`, everything worked — frontend and backend both ran on `localhost`, different ports, and the browser let it through without complaint.
+
+The moment he deployed both pieces, every API call from the frontend failed with a console error he'd never seen before: `blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present`. He pasted the exact request into `curl` to debug it — and it worked perfectly, every time, no error at all.
+
+That inconsistency is the whole lesson in miniature: **CORS is enforced by the browser, not the server, and not the network.** `curl` has no concept of "origin" and never checks this header at all — it simply isn't a client that enforces the policy. The server was always answering correctly; the browser was the only party in the room applying a rule that `curl` had never agreed to follow.
+
+</Section>
+
+<Section kind="already-did">
+
+You've hit this error. Nearly everyone who's split a frontend and backend across different domains or ports has seen `blocked by CORS policy` at least once, usually right after a deploy that worked fine locally. You've probably also been confused that the exact same request works from Postman or `curl` — which feels like it should mean the server is fine, and it does mean that; it just doesn't mean what you assumed it meant about the browser.
+
+</Section>
+
+<Section kind="mental-model">
+
+### CORS is the browser's rule, enforced by the browser, for the browser's users
+
+<svg viewBox="0 0 780 220" role="img" aria-label="A browser enforces CORS by checking a response header before handing data to JavaScript, while curl, Postman and server-to-server calls never check this header at all" className="diagram">
+  <text x="12" y="20" className="sub">BROWSER — fetches, checks the response, then decides whether JS may see the result</text>
+  <rect x="8" y="30" width="150" height="40" rx="6" />
+  <text x="83" y="55" textAnchor="middle" className="sub">page JS</text>
+  <rect x="200" y="30" width="180" height="40" rx="6" />
+  <text x="290" y="55" textAnchor="middle" className="sub">request sent normally</text>
+  <rect x="420" y="30" width="180" height="40" rx="6" />
+  <text x="510" y="55" textAnchor="middle" className="sub">response arrives</text>
+  <rect x="620" y="30" width="152" height="40" rx="6" />
+  <text x="696" y="55" textAnchor="middle" className="sub">browser CHECKS header</text>
+  <text x="12" y="90" className="sub">Origin allowed? → JS gets the data.  Not allowed? → JS gets an error. The SERVER'S RESPONSE ARRIVED EITHER WAY.</text>
+
+  <text x="12" y="140" className="sub">curl / Postman / server-to-server — no browser, no "origin" concept, NOTHING checks this header</text>
+  <rect x="8" y="150" width="200" height="40" rx="6" />
+  <text x="108" y="175" textAnchor="middle" className="sub">curl</text>
+  <rect x="300" y="150" width="200" height="40" rx="6" />
+  <text x="400" y="175" textAnchor="middle" className="sub">request sent</text>
+  <rect x="580" y="150" width="192" height="40" rx="6" />
+  <text x="676" y="175" textAnchor="middle" className="sub">response returned to caller, always</text>
+</svg>
+
+<Callout type="key">
+**The response always arrives at the browser — CORS doesn't stop the network request or hide server data from the network. It stops JavaScript from reading the result.** This is why opening the Network tab shows you a `200` with a real body even on a "CORS error" — the data got there; the browser just refused to let your script touch it. And it's exactly why CORS is a browser-only concern: it exists to protect a *user's browser* from a malicious page silently reading data from sites the user is logged into, not to protect your server from unwanted traffic (that's a different job — authentication, and rate limiting).
+</Callout>
+
+### Simple requests vs. preflighted requests
+
+A `GET` with no custom headers, or a `POST` with a simple content type, is a "simple request" — the browser just sends it and checks the response header. Anything more interesting (a custom header, `Content-Type: application/json` on some setups, `PUT`/`DELETE`) triggers a **preflight**: the browser sends an `OPTIONS` request *first*, asking permission, before sending the real one.
+
+<Callout type="warn">
+**A 204 response to an `OPTIONS` request does NOT mean CORS is configured.** Verified on the demo app: Next.js answers every `OPTIONS` request automatically with `204` and an `Allow` header listing supported methods — this looks like a successful preflight and grants **nothing**, because it contains no `Access-Control-Allow-Origin` at all. The browser checks for that specific header; a 204 with the wrong headers (or missing ones) still fails the real request that follows.
+</Callout>
+
+### The three headers that actually implement CORS
+
+```ts
+// This is the minimum that actually grants cross-origin access —
+// not just answering OPTIONS, but answering it with the RIGHT headers.
+export async function OPTIONS(req: NextRequest) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "https://partner-widget.example.com",
+      "Access-Control-Allow-Methods": "GET",
+    },
+  });
+}
+
+export async function GET(req: NextRequest) {
+  const res = NextResponse.json({ rooms: [...] });
+  res.headers.set("Access-Control-Allow-Origin", "https://partner-widget.example.com");
+  return res;
+}
+```
+
+**`Access-Control-Allow-Origin` must be set on both the preflight AND the real response** — setting it only on one is a common half-fix that looks right until tested against an actual browser.
+
+### Cookies and `SameSite`: a related, separate rule
+
+`SameSite` controls whether a cookie is sent on a *cross-site* request at all — a different mechanism from CORS, often confused with it because both involve "is this request from somewhere else."
+
+| Value | Cookie sent on cross-site requests? |
+|---|---|
+| `Strict` | Never — not even clicking a link from another site |
+| `Lax` (the modern default) | On top-level navigation (clicking a link), not on background `fetch`/XHR |
+| `None` | Yes, always — but **requires `Secure`** (HTTPS only) |
+
+A cross-site API call that needs to carry a session cookie needs `SameSite=None; Secure` on the cookie **and** `Access-Control-Allow-Credentials: true` **and** a specific (not wildcard `*`) `Access-Control-Allow-Origin` on the response — all three, together, or the browser silently drops the cookie or refuses the response.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Confirm: NO CORS headers currently exist on this API ──────────────
+curl -sI -H "Origin: https://evil.example.com" http://localhost:3001/api/rooms \
+  | grep -i "access-control"
+#   Verified: nothing. This endpoint currently only works same-origin.
+
+# ── The preflight trap: 204 that grants nothing ────────────────────────
+curl -sI -X OPTIONS -H "Origin: https://evil.example.com" \
+  -H "Access-Control-Request-Method: POST" http://localhost:3001/api/bookings
+#   Verified: "204 No Content" with an "allow: GET, HEAD, OPTIONS, POST"
+#   header — looks successful, but NO access-control-allow-origin at all.
+#   A browser would still block the real request that follows this.
+
+# ── Add real CORS for one allowed origin, and verify both directions ──
+#   (See this lesson's hands-on for the exact code change.)
+#   After adding it:
+curl -sI -H "Origin: https://partner-widget.example.com" http://localhost:3001/api/rooms \
+  | grep -i "access-control"
+#   → access-control-allow-origin: https://partner-widget.example.com
+curl -sI -H "Origin: https://evil.example.com" http://localhost:3001/api/rooms \
+  | grep -i "access-control"
+#   → nothing. Correctly blocked, by the ORIGIN CHECK IN YOUR CODE —
+#   CORS headers don't block anything server-side; your code deciding
+#   what to send based on the Origin header is what blocks it.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| See exactly what CORS headers a response sends | `curl -I` + grep, or browser DevTools Network tab |
+| Debug a real browser CORS error | DevTools Console — it names the exact missing/mismatched header |
+| CORS middleware (so you don't hand-roll headers) | `cors` npm package (Express), Next.js middleware, framework-specific equivalents |
+| Cookie attribute inspection | DevTools Application/Storage tab shows `SameSite`, `Secure`, `HttpOnly` per cookie |
+
+What good looks like: CORS configuration specifies an exact allowed origin (or a validated list), never a blanket `*` alongside credentials; preflight responses carry the actual CORS headers, not just a 204; and cookie `SameSite`/`Secure` attributes are a deliberate choice matching whether the cookie needs to cross origins at all.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Confirm the current state**: no CORS headers anywhere on the API (first Operator block).
+
+2. **Hit the preflight trap directly.** Send an `OPTIONS` request with an `Origin` header and confirm you get a `204` with an `allow` header but nothing CORS-specific. Explain why a browser would still block the real request despite this "successful" preflight.
+
+3. **Add real CORS to one endpoint.** Edit `app/api/rooms/route.ts` to add an `OPTIONS` handler and set `Access-Control-Allow-Origin` on the `GET` response, allowing exactly one origin (e.g. `https://partner-widget.example.com`) — not a wildcard. Rebuild and verify:
+   ```bash
+   curl -sI -H "Origin: https://partner-widget.example.com" http://localhost:3001/api/rooms | grep -i access-control
+   curl -sI -H "Origin: https://evil.example.com" http://localhost:3001/api/rooms | grep -i access-control
+   ```
+   Confirm the allowed origin gets the header and everything else doesn't.
+
+4. **Revert the change** so the demo app stays in its default (same-origin-only) state for the next learner.
+
+5. **Design the cookie configuration** for a hypothetical scenario: your app's frontend is on `app.example.com` and needs to call an API on `api.example.com`, carrying a session cookie. Write down every setting needed on both the cookie and the CORS response for this to work — and what happens if you miss just one of them.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A payment form embedded as an iframe on partner sites works everywhere except inside one specific partner's site, where submitting the form silently does nothing — no error visible to the end user, no server-side record of the attempt.
+
+<Evidence title="the embed and the request">
+
+```html
+<!-- on the partner's site -->
+<iframe src="https://payments.example.com/embed?merchant=acme"></iframe>
+```
+
+```text
+# The form POSTs with credentials: 'include' to carry the session cookie
+# set when the merchant's customer first authenticated.
+Response headers from payments.example.com:
+  Set-Cookie: session=abc123; SameSite=Lax; Secure
+  Access-Control-Allow-Origin: https://partner-site.example.com
+  Access-Control-Allow-Credentials: true
+```
+
+</Evidence>
+
+<Evidence title="browser console on the failing partner site">
+
+```text
+(no error logged at all — the request appears to complete, but the
+ session cookie is simply absent on the follow-up request)
+```
+
+</Evidence>
+
+Everything in the headers looks correctly configured for cross-origin credentialed requests. Why does the cookie not make it through?
+
+<Reveal label="Reveal the cause">
+
+**`SameSite=Lax` does not permit the cookie to be sent on a cross-site request originating from inside an iframe — only `SameSite=None` does, and `Lax` is exactly wrong for this specific embedding pattern even though it's the modern, generally-recommended default.**
+
+**Read the table from the mental model again, specifically for this shape:** `Lax` sends the cookie on top-level navigation (a user clicking a link to your domain) but withholds it on background requests from a *third-party context* — and a form submitted from inside an iframe embedded on someone else's page is exactly that: a cross-site request, from a context the browser doesn't trust by default. `CORS` headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Credentials`) govern whether the *response* is readable by the embedding page's script — they say nothing about whether the *cookie* gets attached to the request in the first place. Both mechanisms have to independently agree to allow this, and here only one of them did.
+
+**Why it worked on OTHER partner sites:** if other partners embed the same payment form differently — as a top-level redirect/popup rather than an iframe, for instance — `Lax` would be perfectly sufficient there, because top-level navigation is exactly what `Lax` permits. The failure is specific to the iframe embedding pattern, which makes "it works for most partners" a genuinely confusing, misleading signal rather than evidence the configuration is broadly correct.
+
+**The fix:**
+```text
+Set-Cookie: session=abc123; SameSite=None; Secure
+```
+`SameSite=None` is required for any cookie that must be sent from a genuinely cross-site context like an iframe — and it **mandates** `Secure` (HTTPS-only) as a non-optional pairing; browsers will silently reject a `SameSite=None` cookie without `Secure` as well, so both must change together.
+
+**What this doesn't fix on its own, worth checking too:** some browsers (notably Safari, under various anti-tracking features) restrict third-party cookies in iframes even with `SameSite=None; Secure` correctly set, depending on browser version and user settings. For a payment flow specifically, this is a strong argument for considering whether the embed *needs* to be an iframe with a shared session cookie at all, versus a redirect-based flow or a token-based alternative that doesn't depend on third-party cookie behavior that's actively being restricted across the browser ecosystem, with the trend only continuing.
+
+**The transferable lesson:** CORS headers and cookie `SameSite` attributes are two **independent** gates that both have to open for a cross-origin, credentialed request to fully succeed. A correctly configured CORS response with an incorrectly configured cookie attribute (or vice versa) produces exactly this symptom — everything *looks* right on inspection of either piece alone, and the request still silently fails.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review this cross-origin setup: [describe the frontend/backend domains, whether cookies/credentials are involved, and how the request is made — fetch, iframe, top-level redirect]. Tell me exactly what CORS headers AND what cookie SameSite/Secure attributes are needed, together, for this specific pattern to work — and which browser contexts (iframe vs top-level) each requirement applies to."}>
+The "together" framing matters — CORS and SameSite are independent gates, and a correct answer addresses both explicitly rather than only the one that happens to be the asker's current focus. Verify the iframe-vs-top-level distinction specifically if credentials are involved; it's the detail that broke the break-fix's payment form.
+</AgentTask>
+
+<AgentTask prompt={"Our OPTIONS endpoint returns 204 but a browser still reports a CORS error on the real request. Check: does the OPTIONS response itself include Access-Control-Allow-Origin matching the requesting origin, or does it only return a generic 204 with an Allow header listing methods? These look similar but only one actually implements CORS."}>
+This is the preflight trap from the mental model, directly. Verify the diagnosis names the specific missing header rather than a vague 'CORS is misconfigured' — the 204-without-CORS-headers case is subtle enough that it's worth confirming the agent actually distinguishes it from a genuinely correct preflight response.
+</AgentTask>
+
+<AgentTask prompt={"Audit this codebase for Access-Control-Allow-Origin: '*' anywhere, and for each instance tell me whether credentials (cookies, Authorization headers) are also involved in requests to that endpoint. If both are true, explain exactly why browsers reject that combination and show me the fix — a specific validated origin instead of a wildcard."}>
+Verify it understands WHY the combination is rejected (the security reasoning, not just "browsers don't allow it") — an agent that can explain the reasoning is less likely to suggest removing the wildcard restriction as a workaround rather than fixing the actual origin-scoping.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For any cross-origin API:
+
+- Is `Access-Control-Allow-Origin` set on BOTH the preflight (`OPTIONS`) response AND the real response?
+- Is it an exact origin or validated allowlist — never a wildcard `*` combined with credentials?
+- Does a `curl -I -X OPTIONS` check actually show the CORS-specific headers, not just a generic `204`?
+
+For any cookie that might cross origins:
+
+- Is `SameSite` the right value for how it's actually used — `Lax` for top-level navigation, `None` (with mandatory `Secure`) for iframes or background cross-site requests?
+- If using `SameSite=None`, is `Secure` also set? (Browsers reject the combination otherwise.)
+- For anything embedded as an iframe: have you specifically tested in a browser, not just verified headers with curl?
+
+What good looks like: a `curl` test and a real browser test agree, because you've checked both the CORS headers and the cookie attributes independently, rather than assuming one correct piece means the whole chain works.
+
+Red flags: a 204 on `OPTIONS` treated as proof CORS is configured; `Access-Control-Allow-Origin: *` alongside `Access-Control-Allow-Credentials: true` (browsers reject this combination); a `SameSite=Lax` cookie expected to work inside an iframe.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l06"
+  questions={[
+    {
+      q: "Why did an API call fail in the browser with a CORS error but succeed perfectly from curl against the exact same endpoint?",
+      options: [
+        "curl uses a different network protocol than browsers",
+        "CORS is enforced entirely by the browser — curl has no concept of 'origin' and never checks the Access-Control-Allow-Origin header at all; the server responded identically to both",
+        "The server was rate-limiting browser requests specifically",
+        "curl automatically adds an Authorization header that bypasses CORS"
+      ],
+      answer: 1,
+      explain: "The response always arrives at the browser too — CORS doesn't block the network request. It blocks JavaScript from reading the result, which is why the Network tab shows a 200 with a real body even on a 'CORS error.'"
+    },
+    {
+      q: "Why is a 204 response to an OPTIONS request not proof that CORS is correctly configured?",
+      options: [
+        "204 responses are always cached incorrectly",
+        "A 204 can come from generic method-listing behavior (an Allow header) with no Access-Control-Allow-Origin at all — the browser's real check is for that specific header, not the status code",
+        "OPTIONS requests don't require a response body",
+        "204 only applies to GET requests, not preflighted ones"
+      ],
+      answer: 1,
+      explain: "Verified directly on the demo app: Next.js answers every OPTIONS with 204 and an Allow header automatically, which looks like a successful preflight and grants nothing — the browser still blocks the real request that follows."
+    },
+    {
+      q: "What's the difference between what CORS headers control and what a cookie's SameSite attribute controls?",
+      options: [
+        "They control the same thing, just with different syntax",
+        "CORS headers govern whether a script can READ the response; SameSite governs whether the cookie is ATTACHED to the request in the first place — two independent gates that both must open",
+        "SameSite is deprecated in favor of CORS",
+        "CORS applies to cookies specifically, SameSite applies to all other headers"
+      ],
+      answer: 1,
+      explain: "This is exactly why the payment-form break-fix failed silently: correctly configured CORS headers said nothing about whether SameSite=Lax would let the cookie through from an iframe — it didn't, and both pieces had to be checked independently."
+    },
+    {
+      q: "Why did SameSite=Lax work for most partners embedding a payment form but fail for one specific partner?",
+      options: [
+        "That partner's site had an outdated browser",
+        "Lax permits the cookie on top-level navigation but withholds it from third-party contexts like an iframe — the failing partner specifically embedded the form in an iframe, while others likely used a different embedding pattern (redirect/popup)",
+        "The failing partner's domain was on a CORS blocklist",
+        "Lax only works for GET requests, and the form used POST"
+      ],
+      answer: 1,
+      explain: "This is what makes 'it works for most partners' a misleading signal rather than evidence of broad correctness — the failure is specific to one embedding SHAPE, not a general misconfiguration."
+    },
+    {
+      q: "Why does Access-Control-Allow-Origin: * combined with Access-Control-Allow-Credentials: true get rejected by browsers?",
+      options: [
+        "It's a syntax error in the header format",
+        "Allowing credentials (cookies, auth) to be sent to literally any origin would let any malicious site read a logged-in user's authenticated data — browsers refuse this combination as a safety backstop",
+        "Wildcards are only supported in older browser versions",
+        "The two headers must be set in a specific order"
+      ],
+      answer: 1,
+      explain: "This is why a validated, specific allowlist (checking the Origin header against known-good values in your own code, as the fixed /api/rooms example does) is required whenever credentials are involved — the wildcard shortcut simply isn't available for that case."
+    }
+  ]}
+/>
+
+</Section>

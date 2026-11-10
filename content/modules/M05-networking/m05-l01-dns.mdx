@@ -1,0 +1,298 @@
+---
+id: m05-l01
+module: M5
+title: "DNS: the phone book, and why changes seem to take forever"
+order: 1
+difficulty: 1
+depth: both
+platforms: [cloudflare, vercel, render]
+concepts: [dns]
+prerequisites: [m00-l01]
+lab: self
+scenario_ids: [sc-dns-propagation-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder migrated her app from one host to another on a Tuesday. She updated her domain's DNS record, confirmed it in her registrar's dashboard — green checkmark, new IP showing — and told her 40 beta users the migration was done.
+
+For the next nine hours, roughly a third of her users still hit the **old** server, which she'd already shut down. They got "this site can't be reached." She hadn't made a mistake. The record was correct the instant she saved it. What she didn't know was that she'd set that record's <Term k="ttl">TTL</Term> to 43,200 seconds — 12 hours — eight months earlier, during setup, without ever thinking about it again. Every resolver that had looked up her domain in the last 12 hours was still confidently handing out the old answer, because she'd told it, months ago, that the answer was good for half a day.
+
+"DNS propagation" is the phrase people reach for here, and it's slightly wrong. Nothing was propagating. Thousands of resolvers around the world were doing exactly what she'd configured them to do: trust a cached answer until its self-declared expiry.
+
+</Section>
+
+<Section kind="already-did">
+
+You've pointed a domain at a hosting platform by adding a record in a dashboard — a CNAME to `cname.vercel-dns.com`, an A record to an IP a VPS provider gave you. You've probably also waited anxiously after doing this, reloading the site every few minutes, and felt relief when it finally "took."
+
+What you likely never configured, because almost no onboarding flow asks you to, is the one number that determines how long that wait actually is: the TTL. This lesson makes that number visible and controllable, instead of a mystery you wait out.
+
+</Section>
+
+<Section kind="mental-model">
+
+### DNS is a cache of a cache of a cache
+
+<svg viewBox="0 0 780 240" role="img" aria-label="A DNS lookup asks a local resolver, which asks upstream resolvers, which eventually ask the domain's authoritative nameserver — and caches the answer at every layer for the record's TTL" className="diagram">
+  <defs>
+    <marker id="arrdns" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <rect x="8" y="30" width="140" height="50" rx="8" />
+  <text x="78" y="60" textAnchor="middle" className="sub">Your browser</text>
+  <rect x="190" y="30" width="160" height="50" rx="8" />
+  <text x="270" y="55" textAnchor="middle" className="sub">ISP / OS resolver</text>
+  <text x="270" y="72" textAnchor="middle" className="sub">caches for TTL</text>
+  <rect x="392" y="30" width="160" height="50" rx="8" />
+  <text x="472" y="55" textAnchor="middle" className="sub">Recursive resolver</text>
+  <text x="472" y="72" textAnchor="middle" className="sub">(1.1.1.1, 8.8.8.8…)</text>
+  <rect x="594" y="30" width="180" height="50" rx="8" />
+  <text x="684" y="55" textAnchor="middle" className="sub">Authoritative NS</text>
+  <text x="684" y="72" textAnchor="middle" className="sub">the real, current answer</text>
+
+  <path d="M 148 55 L 186 55" className="arrow" markerEnd="url(#arrdns)" />
+  <path d="M 350 55 L 388 55" className="arrow" markerEnd="url(#arrdns)" />
+  <path d="M 552 55 L 590 55" className="arrow" markerEnd="url(#arrdns)" />
+
+  <text x="12" y="130" className="sub">You update the record at the authoritative nameserver — instantly correct, right there.</text>
+  <text x="12" y="155" className="sub">Every cache between you and it keeps answering with the OLD value until ITS copy's TTL expires.</text>
+  <text x="12" y="180" className="sub">Different resolvers cached it at different times, so they expire at different moments —</text>
+  <text x="12" y="202" className="sub">which is what "propagation" actually looks like: a staggered, independent cache expiry, not a wave.</text>
+</svg>
+
+<Callout type="key">
+**Your change is correct the instant you save it. What takes time is every cache between you and your users independently deciding its old answer has expired.** There is no global "propagation" process to wait on — there are thousands of independent caches, each honoring the TTL it was given when it first looked up your domain, at whatever time that happened to be.
+</Callout>
+
+### The record types you'll actually touch
+
+| Record | Points a name to | Example |
+|---|---|---|
+| **A** | An IPv4 address | `app.example.com → 160.79.104.10` |
+| **AAAA** | An IPv6 address | Same idea, newer address format |
+| **CNAME** | Another name (which then resolves) | `www.example.com → cname.vercel-dns.com` |
+| **TXT** | Arbitrary text | Domain verification, SPF/DMARC email policy |
+| **MX** | Which server handles email for this domain | `example.com → aspmx.l.google.com` (priority-ordered) |
+| **NS** | Which nameservers are authoritative for this domain | Set at your registrar, rarely touched after setup |
+
+A CNAME can't coexist with other records on the same name (a known, frequently-hit limitation — you can't have both a CNAME and a TXT on the bare domain, which is why many providers offer "CNAME flattening" or ask you to use a subdomain).
+
+### TTL: the number that decides how long "wrong" lasts
+
+TTL is seconds the record may be cached before a resolver should ask again. **Set it low (300s = 5 minutes) before any planned change**, let that propagate, make the change, then raise it back up once things are stable. An unplanned emergency fix doesn't get this luxury — which is exactly why planning ahead matters here specifically.
+
+<Operator>
+
+```bash
+# ── The basic lookup, and reading the real answer ─────────────────────
+dig +short anthropic.com A
+dig anthropic.com A | grep -A2 "ANSWER SECTION"
+#   Verified live: "anthropic.com. 300 IN A 160.79.104.10"
+#   That "300" IS the TTL for this specific cached answer, in seconds.
+
+# ── Other record types ─────────────────────────────────────────────────
+dig +short anthropic.com MX     # mail routing
+dig +short anthropic.com NS     # who's authoritative
+dig +short www.anthropic.com    # often a CNAME elsewhere; here it resolves
+                                 # straight to an A record — both are valid.
+
+# ── Compare different resolvers — this IS what "propagation" looks like ─
+dig +short anthropic.com @1.1.1.1    # Cloudflare's resolver
+dig +short anthropic.com @8.8.8.8    # Google's resolver
+#   If a record just changed, these can legitimately disagree for a
+#   while — each is independently honoring whatever TTL it last saw.
+
+# ── See the FULL chain, including where the authoritative answer lives ─
+dig anthropic.com NS +short
+dig @isla.ns.cloudflare.com anthropic.com A +short
+#   Asking the authoritative server directly always gets the CURRENT
+#   value — no caching layer in between. This is your ground truth
+#   during a migration, when every other resolver might still be stale.
+
+# ── nslookup, the other common tool (same underlying facts) ────────────
+nslookup anthropic.com
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Query any record type, any resolver | `dig` (the deeper, scriptable tool) |
+| Quick interactive lookup | `nslookup` |
+| Visual propagation check across many resolvers worldwide | whatsmydns.net, dnschecker.org |
+| Managing records | Your registrar, or Cloudflare/Route 53 if you've delegated nameservers there |
+
+What good looks like: before any planned DNS change, you lower the TTL first, wait out the *old* TTL, make the change, verify against the authoritative nameserver directly (not just your own browser), and only then raise the TTL back.
+
+</Section>
+
+<Section kind="hands-on">
+
+1. **Run the full Operator block** against a real domain (anthropic.com works, or your own). Note the TTL in the answer section.
+
+2. **Compare two resolvers** for the same domain. If they agree, the record has been stable longer than its TTL. If you can find a domain that was recently changed, try to catch a disagreement.
+
+3. **Find the authoritative nameservers** for a domain you control, and query them directly, bypassing every cache in between.
+
+4. **If you own a domain**, find its current TTL in your DNS provider's dashboard. Is it something you ever deliberately chose, or a default nobody touched? Write down what you'd set it to before your next planned change.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team migrates `api.example.com` from one provider to another. Twenty minutes later, half their mobile app users report login failures; the other half are fine. The team swears the DNS change is complete — their own browser shows the new server.
+
+<Evidence title="what they check">
+
+```text
+$ dig +short api.example.com
+203.0.113.50          ← the NEW server, correct
+
+$ curl -I https://api.example.com/health
+HTTP/1.1 200 OK        ← works from the team's own machine
+```
+
+</Evidence>
+
+<Evidence title="what a failing user's phone shows, screen-shared">
+
+```text
+$ dig +short api.example.com
+198.51.100.9           ← the OLD server, which has been decommissioned
+
+$ dig api.example.com | grep -A1 "ANSWER SECTION"
+api.example.com.  38400  IN  A  198.51.100.9
+```
+
+</Evidence>
+
+<Evidence title="the DNS provider's change log">
+
+```text
+A record updated: api.example.com → 203.0.113.50
+Changed: 14 minutes ago
+Previous TTL on the OLD record: 43200 (12 hours)
+```
+
+</Evidence>
+
+Both the team and the failing user ran `dig`. Both got consistent, repeatable answers — just different ones. Why, and whose fault is it?
+
+<Reveal label="Reveal the cause">
+
+**Nobody's fault, and nothing is broken: the failing user's phone (or their carrier's DNS resolver) cached the old answer before the change, with a 12-hour TTL, and that cache is still well within its validity window.** The team's own machine happens to have a resolver that either never cached the old answer or already expired it — plausible if they'd been testing DNS changes recently and their local cache had a shorter remaining TTL, or if their ISP's resolver simply refreshed more often.
+
+**The mechanism, stated precisely:** the 43200-second TTL was set on the *old* record, presumably long before anyone planned this migration. Every resolver that looked up `api.example.com` in the last 12 hours — including, very plausibly, this user's mobile carrier's resolver, which mobile networks often share across huge numbers of subscribers for efficiency — is still inside that 12-hour window and has no reason to ask again. It isn't ignoring the change; it genuinely doesn't know to check yet.
+
+**Why this is worse on mobile specifically:** carrier-level DNS resolvers serve enormous numbers of devices and are *tuned* to cache aggressively for efficiency, which is normally a good thing and specifically bad during a migration — a single carrier resolver's 12-hour cache can affect a large fraction of a company's mobile users simultaneously, with no way to flush it from the outside.
+
+**What actually fixes it:** waiting. There is no remote command that flushes someone else's resolver cache. The old server being fully decommissioned during this window is the real risk — the correct sequence, which this team skipped, is: lower the TTL to something short (300s) *well before* the planned migration, wait out the *old* TTL so every cache has refreshed to the short value, make the change, and **keep the old server answering** until the *new*, short TTL's safety margin has definitely elapsed — only then decommission it.
+
+**The transferable rule:** `dig` from your own machine proves what *your* resolver currently believes, nothing more. During a migration, the question isn't "is the record correct" — it already is — the question is "how many caches out there haven't asked again yet," and the honest answer is a number you can't directly observe, bounded only by the TTL you set in the past.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"I'm planning to migrate [domain] from [old host] to [new host] on [date]. Walk me through the DNS change sequence that avoids a propagation-related outage: when to lower the TTL, how long to wait before making the actual change, what to verify and against which nameserver, and how long to keep the old server running afterward."}>
+The sequence should explicitly include a step where you query the AUTHORITATIVE nameserver directly (not a public resolver) to confirm the change landed, and should name a concrete "keep the old server up until X" duration tied to the TTL you lowered to — not a vague "a while."
+</AgentTask>
+
+<AgentTask prompt={"A DNS record was just changed, and we're seeing inconsistent behavior across users — some reach the new server, some the old one. Confirm this is TTL-related rather than a misconfiguration: show me how to check the record directly at the authoritative nameserver versus at a couple of public resolvers, and interpret any disagreement."}>
+Verify it actually distinguishes "the authoritative answer is wrong" (a real misconfiguration, needing a fix) from "the authoritative answer is right but caches haven't caught up" (needs only time) — these look identical from a symptom report and require completely different responses.
+</AgentTask>
+
+<AgentTask prompt={"Audit every DNS record for [domain]: current TTL on each, and whether any of them are set to an unreviewed default rather than a deliberate choice. Flag any record whose TTL would make a planned future migration painful, and propose a lowering schedule for records likely to change soon."}>
+This is the preventive version of the story's mistake — catching a forgotten high-TTL record before it causes a 12-hour cutover tail, rather than discovering it mid-migration. Verify it checks the records that actually matter for your infrastructure (the apex A/CNAME, not just decorative TXT records nobody will touch).
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before any planned DNS change:
+
+- What's the CURRENT TTL on the record you're about to change?
+- Have you lowered it in advance, and waited out the OLD TTL before making the real change?
+- Do you know which nameservers are authoritative for this domain, and can you query them directly?
+- Is the old destination staying up long enough to cover stragglers, rather than being shut down the moment the new record is saved?
+
+What good looks like: DNS changes are planned days ahead when possible, TTLs are lowered deliberately before any cutover, and "propagation" is something you've already accounted for rather than something you discover mid-incident.
+
+Red flags: decommissioning the old server the moment a DNS change is saved; treating "it works on my machine" as proof the change has taken effect everywhere; a TTL nobody has ever deliberately set.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l01"
+  questions={[
+    {
+      q: "What does \"DNS propagation\" actually refer to?",
+      options: [
+        "A background process that copies your new record to servers worldwide",
+        "Thousands of independent caches, each honoring the TTL it was given when it first looked up your domain, expiring and re-checking on their own separate schedules",
+        "The time it takes your registrar to apply a change",
+        "A delay imposed by ICANN for security verification"
+      ],
+      answer: 1,
+      explain: "There's no wave moving outward. Your change is correct instantly at the authoritative nameserver; what takes time is every independent cache between you and your users deciding its old answer has expired."
+    },
+    {
+      q: "A team and a user both run `dig` on the same domain minutes after a DNS change and get DIFFERENT, both internally-consistent answers. What does this mean?",
+      options: [
+        "One of them made a typo",
+        "Each resolver cached the record at a different time and is honoring its own remaining TTL — both answers are 'correct' for what that resolver currently believes",
+        "The DNS change hasn't actually been saved",
+        "One of them has a corrupted local hosts file"
+      ],
+      answer: 1,
+      explain: "This is exactly the break-fix: the authoritative answer was already correct; a mobile carrier's shared resolver was still inside its old 12-hour TTL window and had no reason to ask again yet."
+    },
+    {
+      q: "What's the correct sequence before a planned DNS migration?",
+      options: [
+        "Make the change, then tell users to clear their DNS cache if it doesn't work",
+        "Lower the TTL in advance and wait out the OLD TTL, make the change, keep the old server up for a safety margin, then raise the TTL back",
+        "Change the TTL and the record simultaneously",
+        "Contact every major ISP to flush their caches"
+      ],
+      answer: 1,
+      explain: "You can't flush someone else's cache remotely, so the only lever is time — and the old TTL has to fully elapse BEFORE the change, or the new low TTL hasn't taken effect everywhere yet when you need it."
+    },
+    {
+      q: "Why does querying a public resolver like 1.1.1.1 not prove a DNS record is correct?",
+      options: [
+        "Public resolvers are frequently wrong",
+        "It only proves what THAT resolver currently has cached — querying the authoritative nameserver directly is the only way to see the real, current, uncached value",
+        "Public resolvers require authentication to return accurate results",
+        "dig cannot query public resolvers directly"
+      ],
+      answer: 1,
+      explain: "During a migration, the authoritative nameserver is your ground truth. Every other resolver is a cache that might legitimately be stale and still answering truthfully about what IT believes."
+    },
+    {
+      q: "Why are mobile carrier DNS resolvers a specific risk during a migration?",
+      options: [
+        "They don't support all DNS record types",
+        "They serve huge numbers of subscribers and are tuned to cache aggressively for efficiency — one carrier resolver's long TTL cache can affect a large fraction of your mobile users simultaneously, with no way to flush it externally",
+        "Mobile networks use a different DNS protocol entirely",
+        "They only update once per day on a fixed schedule"
+      ],
+      answer: 1,
+      explain: "This is why the break-fix's symptom split cleanly along a line that had nothing to do with the company's own infrastructure — it was entirely about which resolver each user's traffic happened to be cached behind."
+    }
+  ]}
+/>
+
+</Section>

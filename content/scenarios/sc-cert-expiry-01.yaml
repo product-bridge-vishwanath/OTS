@@ -1,0 +1,43 @@
+id: sc-cert-expiry-01
+module: M5
+lesson: m05-l03
+title: "The renewal cron job that vanished eight months ago"
+difficulty: realistic
+symptom: "Every user's browser suddenly shows NET::ERR_CERT_DATE_INVALID. The app had been running fine for ten months on the same server."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: tls
+      apply: scripts/break/dropped-renewal-crontab.sh   # simulates a renewal cron silently removed months ago
+evidence:
+  logs: true
+  metrics: [cert.days_until_expiry]
+  db_console: false
+  notes: "Server crontab history and certificate issuance dates are both inspectable."
+agent:
+  context: "You can see the certificate just expired and assume Let's Encrypt itself had an outage."
+  bias: "investigates the certificate authority's status rather than the local renewal mechanism"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - cert-renewed-and-valid
+    - external-expiry-monitoring-added
+  root_cause_markers:
+    - learner finds the renewal cron job is missing/not running, not a CA-side issue
+    - certificate manually renewed to restore service
+    - monitoring added that is external to the server itself
+  symptom_only_markers:
+    - certificate renewed with no monitoring added to prevent recurrence
+    - renewal moved to a different cron with no external check of whether it ran
+hints:
+  - "Is Let's Encrypt actually down right now, or is that assumption worth checking first?"
+  - "When was this certificate actually issued, and what should have renewed it before now?"
+  - "Does the renewal mechanism's crontab entry still exist on this server?"
+  - "Reveal: the renewal cron was silently dropped months ago. Renew now, and add monitoring EXTERNAL to this server."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

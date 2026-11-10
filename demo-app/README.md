@@ -16,6 +16,7 @@ docker compose up --build
 ```
 
 - App: http://localhost:3001 (3000 inside the container; the platform site uses 3000 locally)
+- Via reverse proxy (for M5's networking lessons): http://localhost:8080
 - Health: http://localhost:3001/api/health
 - Postgres: `docker compose exec db psql -U ots -d demo`
 - Logs: `docker compose logs -f app worker`
@@ -52,6 +53,8 @@ The AI assistant works in offline mode by default; set `ANTHROPIC_API_KEY`
   - `missing-index-growth.sql` — 400k rows of growth, no indexes
   - `notes-json-blob.sql` — seed a hot, oversized notes cell (scenario `sc-single-cell-lost-updates-01`)
   - `double-worker.sh` — second worker, duplicated cron runs
+  - `proxy-upstream-down.sh` / `proxy-upstream-slow.sh` / `proxy-restore.sh` — the
+    reverse proxy's upstream is dead (502) vs. accepting-but-hanging (504); M5.4
 - `scripts/load/` — generate traffic that exposes the breakage:
   - `booking-rush.js`, `concurrent-editors.js`, `webhook-replay.js`, `steady-browse-and-order.js`
 
@@ -60,12 +63,16 @@ compose); break scripts take `DATABASE_URL` or a psql connection string.
 
 Observed on a fresh stack: `booking-rush.js` created **15 bookings for one
 slot**; `concurrent-editors.js` accepted 20 notes and kept **6**;
-`webhook-replay.js` produced **two payment rows for one event**.
+`webhook-replay.js` produced **two payment rows for one event**;
+`proxy-upstream-down.sh` produces a **502 in ~2.6ms** (connection refused);
+`proxy-upstream-slow.sh` produces a **504 at exactly ~5.0s** (matching
+`proxy_read_timeout`) — the timing difference alone distinguishes them.
 
 ## Stack
 
 Next.js (App Router) · Postgres 16 (`pg`, raw SQL on purpose — you can read
-every query) · Redis (`ioredis`) · a plain Node worker · Anthropic SDK for the
+every query) · Redis (`ioredis`) · a plain Node worker · nginx reverse proxy
+(real config in `nginx/nginx.conf`, for M5) · Anthropic SDK for the
 assistant. The platform site in the repo root teaches with this exact stack.
 
 Postgres runs with `pg_stat_statements` loaded via `shared_preload_libraries`

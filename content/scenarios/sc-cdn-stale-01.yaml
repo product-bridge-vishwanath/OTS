@@ -1,0 +1,43 @@
+id: sc-cdn-stale-01
+module: M5
+lesson: m05-l05
+title: "The pricing page shows two different prices by country"
+difficulty: realistic
+symptom: "20 minutes after a confirmed price change, users in one country see the old price while everyone else sees the new one. Response headers are otherwise identical."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: cdn
+      apply: scripts/break/stale-edge-cache.sh   # simulates independent per-edge cache TTLs
+evidence:
+  logs: true
+  metrics: [cdn.cache_status_by_region]
+  db_console: false
+  notes: "Per-region cf-cache-status and s-maxage values are inspectable and show HIT vs MISS at different moments."
+agent:
+  context: "You confirmed the origin server and database both have the correct new price."
+  bias: "suspects a CDN misconfiguration or bug rather than normal per-edge TTL behavior"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - price-correct-everywhere-immediately
+    - purge-step-added-to-price-change-process
+  root_cause_markers:
+    - learner identifies independent per-edge caching as expected behavior, not a bug
+    - a targeted purge issued for the specific URL
+    - purging automated as part of future price-change deploys
+  symptom_only_markers:
+    - s-maxage lowered globally as the fix
+    - caching disabled entirely for the page
+hints:
+  - "Is this a CDN bug, or is each edge location just independently honoring the same TTL from a different starting moment?"
+  - "Compare cf-cache-status across the two regions at the same moment. What does HIT vs MISS tell you?"
+  - "Is there a way to force an immediate update to every edge, rather than waiting out the TTL?"
+  - "Reveal: each edge caches independently, like DNS resolvers. Purge the URL explicitly, and automate that purge for future price changes."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

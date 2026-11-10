@@ -1,0 +1,43 @@
+id: sc-http-method-01
+module: M5
+lesson: m05-l02
+title: "An unsubscribe link that unsubscribes nobody clicked"
+difficulty: guided
+symptom: "Several users report being unsubscribed from emails without clicking anything. A security scanner independently flags the unsubscribe link."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/get-request-side-effect.patch   # a state-changing action implemented as GET
+evidence:
+  logs: true
+  metrics: [http.get_requests, subscribers.unsubscribed]
+  db_console: true
+  notes: "Server logs show GET requests from email-client user agents (image proxies, link prescanning) hitting the unsubscribe URL."
+agent:
+  context: "You can see the unsubscribe token is unique per user and assume it can't be guessed."
+  bias: "focuses on token security rather than the HTTP method itself"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - get-request-is-side-effect-free
+    - unsubscribe-requires-post
+  root_cause_markers:
+    - learner identifies the GET method itself as the defect, not the token
+    - state change moved to a POST triggered by an explicit confirmation click
+    - GET endpoint still works for showing a confirmation page
+  symptom_only_markers:
+    - token made longer or less guessable with the GET side effect left in place
+    - email client prefetching blamed as the bug rather than the endpoint design
+hints:
+  - "The token isn't guessed in these log lines — the EXACT right token is used, by a user agent that isn't the user."
+  - "What do email clients do with links automatically, without anyone clicking?"
+  - "Is this a GET or a POST? What does each promise to anyone who might fetch it?"
+  - "Reveal: email clients prefetch/prescan GET links. Make the actual change a POST behind a confirmation click."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

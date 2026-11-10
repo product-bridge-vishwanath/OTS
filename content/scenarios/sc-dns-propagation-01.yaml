@@ -1,0 +1,43 @@
+id: sc-dns-propagation-01
+module: M5
+lesson: m05-l01
+title: "Half the mobile users still hit the decommissioned server"
+difficulty: realistic
+symptom: "Twenty minutes after a DNS migration, half of mobile users report login failures while the web team's own machines show the new server working fine."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: dns
+      apply: scripts/break/stale-resolver-cache.sh   # simulates a long-TTL resolver still serving the old answer
+evidence:
+  logs: true
+  metrics: [http.2xx, http.5xx]
+  db_console: false
+  notes: "Learner has dig access to multiple simulated resolvers and the authoritative nameserver directly."
+agent:
+  context: "You confirmed the record is correct from your own machine and believe the migration is complete."
+  bias: "suspects a misconfiguration on the new server rather than DNS caching"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - old-server-kept-available-during-transition
+    - authoritative-record-confirmed-correct
+  root_cause_markers:
+    - learner queries the authoritative nameserver directly and confirms the record is already correct
+    - learner identifies the OLD record's long TTL as the cause of the split, not a misconfiguration
+    - learner does not shut down the old server prematurely
+  symptom_only_markers:
+    - new server redeployed or reconfigured looking for a bug that doesn't exist
+    - old server decommissioned anyway, stranding remaining cached users
+hints:
+  - "Query the authoritative nameserver directly. Is the record actually wrong, or just not yet seen by everyone?"
+  - "What TTL was on the OLD record, and when was it last looked up by a resolver that hasn't asked again since?"
+  - "Is there anything you can do to force someone else's resolver to recheck right now?"
+  - "Reveal: the record is correct; old caches haven't expired yet. Keep the old server up and wait out the TTL next time you plan this."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

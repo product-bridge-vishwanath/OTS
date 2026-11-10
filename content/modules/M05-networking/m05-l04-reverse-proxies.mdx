@@ -1,0 +1,319 @@
+---
+id: m05-l04
+module: M5
+title: "Reverse proxies and load balancers: reading 502 vs 503 vs 504"
+order: 4
+difficulty: 2
+depth: both
+platforms: [nginx, caddy, cloudflare]
+concepts: [reverse-proxy, load-balancing]
+prerequisites: [m05-l02, m01-l04]
+lab: demo-repo
+scenario_ids: [sc-proxy-timeout-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A support engineer spent forty minutes debugging a "server is down" ticket by checking the application server — logs clean, process running, health check passing when hit directly. The customer insisted the site was broken. The engineer insisted it wasn't.
+
+Both were right. The customer was hitting the site through the public domain, which routed through a reverse proxy; the engineer was checking the app server directly, bypassing the proxy entirely without realizing it. The proxy's own configuration had a `proxy_read_timeout` of 5 seconds, and one specific endpoint had started taking 8 seconds under load that week — well within what the *application* considered a normal, if slow, response, and entirely outside what the *proxy* was willing to wait for. The app was never down. The proxy was timing out on it and returning its own 504 to the customer, a full network layer away from anywhere the engineer was looking.
+
+Once someone thought to check from *outside*, through the actual public path, it took ninety seconds.
+
+</Section>
+
+<Section kind="already-did">
+
+You've seen a platform's branded error page — "Application Error," a 502 page with a sad icon — and had no idea whether the problem was your code, your database, or something in between that you've never configured directly. If you've ever been told "your app is fine, but something in front of it isn't," you've met a reverse proxy without necessarily naming it.
+
+M7.4 already taught you that a database can have a queue of waiting requests invisible from outside; this lesson is the same idea one layer up the stack — a proxy sitting between the internet and your app, with its own timeouts, its own opinions, and its own distinct error codes for distinct failure shapes.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What a reverse proxy actually does
+
+It receives every public request, and forwards it to one of potentially several backend servers (your app). From the outside, there's one address; behind it, the proxy decides which actual server answers. This single layer does several jobs at once: TLS termination (M5.3 — the proxy often holds the certificate, talking plain HTTP to the app behind it), routing, and — the part this lesson focuses on — translating backend failures into a specific, diagnostic HTTP status.
+
+<svg viewBox="0 0 780 220" role="img" aria-label="A reverse proxy sits between the internet and the app; when the app is unreachable it returns 502, when the app is alive but too slow it returns 504, and when no healthy instance exists at all it returns 503" className="diagram">
+  <defs>
+    <marker id="arrrp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <rect x="8" y="80" width="140" height="50" rx="8" />
+  <text x="78" y="110" textAnchor="middle" className="sub">The internet</text>
+  <rect x="300" y="80" width="180" height="50" rx="8" />
+  <text x="390" y="110" textAnchor="middle" className="sub">Reverse proxy</text>
+  <rect x="616" y="20" width="156" height="40" rx="8" />
+  <text x="694" y="45" textAnchor="middle" className="sub">app instance A</text>
+  <rect x="616" y="150" width="156" height="40" rx="8" />
+  <text x="694" y="175" textAnchor="middle" className="sub">app instance B</text>
+
+  <path d="M 148 105 L 296 105" className="arrow" markerEnd="url(#arrrp)" />
+  <path d="M 480 95 L 612 50" className="arrow" markerEnd="url(#arrrp)" />
+  <path d="M 480 115 L 612 160" className="arrow" markerEnd="url(#arrrp)" />
+
+  <text x="12" y="30" className="sub">502 — reached out, got connection refused or garbage back (app is DOWN)</text>
+  <text x="12" y="200" className="sub">504 — reached out, app accepted but never answered in time (app is SLOW/STUCK)</text>
+</svg>
+
+### The three codes, and what each one eliminates
+
+| Code | What it means | What you've just ruled out |
+|---|---|---|
+| **502 Bad Gateway** | The proxy tried to connect and got refused, or got a response it couldn't parse | DNS, TLS, and the proxy itself are fine — look at whether the app process is even running |
+| **503 Service Unavailable** | The proxy has no healthy backend to send this to at all | Often deliberate (maintenance mode, every health check failing, autoscaler between instances) |
+| **504 Gateway Timeout** | The proxy connected fine, but the app never responded within the configured wait | The app is ALIVE — look at what it's doing that's slow (M6.1's missing index, M7.4's lock wait, M7.9's unthrottled backfill) |
+
+<Callout type="key">
+**502 and 504 point you at completely different investigations, and the difference is entirely in whether the proxy's connection attempt succeeded.** A 502 means "nobody answered the phone" — check if the process exists. A 504 means "someone picked up and then said nothing" — the process is running; something *inside* it is stuck. Conflating these wastes exactly the kind of time the story's engineer spent.
+</Callout>
+
+### Verified on this exact stack
+
+The demo app's `proxy` service (nginx, real config, in `demo-app/nginx/nginx.conf`) demonstrates both:
+
+```text
+502 — proxy_pass pointed at a port nothing listens on → connection refused
+      Verified: ~17ms response, 502, immediately — no waiting, because
+      refusal is instant.
+
+504 — proxy_pass pointed at something that ACCEPTS the connection but
+      never sends a response → proxy_read_timeout (5s) elapses
+      Verified: exactly 5.022s, then 504 — the delay IS the timeout
+      setting, not network latency.
+```
+
+That timing difference is itself diagnostic: an *instant* failure is a refused connection (502-shaped); a failure that takes exactly as long as a configured timeout is a hang (504-shaped). You can often tell which one you're looking at just by how long the error took to arrive, before reading any log at all.
+
+<Operator>
+
+```bash
+cd demo-app
+docker compose up -d --build
+
+# ── Baseline: everything healthy through the real proxy ───────────────
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" http://localhost:8080/api/health
+
+# ── Trigger a REAL 502 (nothing listening) ─────────────────────────────
+sh scripts/break/proxy-upstream-down.sh
+sleep 1
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" http://localhost:8080/
+#   Verified: 502, in milliseconds — instant refusal.
+
+# ── Trigger a REAL 504 (accepts, never answers) ────────────────────────
+sh scripts/break/proxy-upstream-slow.sh
+sleep 2
+time curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
+#   Verified: 504, taking exactly ~5s — the configured proxy_read_timeout.
+
+# ── Restore ─────────────────────────────────────────────────────────────
+sh scripts/break/proxy-restore.sh
+
+# ── See the proxy's own config — the timeouts that define these codes ──
+cat nginx/nginx.conf | grep -E "timeout|proxy_pass"
+
+# ── Confirm: bypassing the proxy entirely changes the picture ─────────
+curl -s -o /dev/null -w "direct to app: %{http_code}\n" http://localhost:3001/api/health
+curl -s -o /dev/null -w "through proxy: %{http_code}\n" http://localhost:8080/api/health
+#   Both 200 normally — but during a proxy-side issue, these two can
+#   disagree completely, which is exactly the engineer-vs-customer
+#   confusion from the story, reproduced on your own machine.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Self-managed reverse proxy | **nginx** (what the demo app uses), **Caddy** (simpler config, automatic TLS) |
+| Managed load balancing | Your PaaS's built-in edge, cloud ALB/NLB |
+| CDN acting as a proxy too | Cloudflare (M5.5 covers this role specifically) |
+| See exactly what a proxy is doing | Its own access/error logs — nginx's error log names the upstream and the specific failure |
+
+What good looks like: when something is reported broken, you check from *outside*, through the real public path, before trusting a direct check of the app server — and you can read 502 vs 503 vs 504 as three different diagnoses, not three flavors of "down."
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Confirm the baseline** — healthy through the proxy at `:8080` and direct to the app at `:3001`.
+
+2. **Trigger and time the 502.** Run `proxy-upstream-down.sh`, then curl through the proxy, timing it. Note how fast the failure arrives.
+
+3. **Trigger and time the 504.** Run `proxy-upstream-slow.sh`, then `time curl` through the proxy. Note the delay matches the configured `proxy_read_timeout` almost exactly.
+
+4. **Restore**, and confirm both the direct and proxied paths agree again.
+
+5. **Reproduce the story's confusion deliberately.** Trigger the 504 state, then check the app *directly* at `:3001/api/health` — it will likely still return 200 (the app itself never broke; only the specific slow upstream did). Write down, in your own words, why "I checked the app and it's fine" and "the proxy is returning errors" can both be true statements at the same time.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** During a traffic spike, roughly 1 in 20 requests return 503. The engineering team confirms the app servers are healthy, not overloaded, and have spare capacity. The 503s stop the moment traffic drops back to normal.
+
+<Evidence title="the load balancer's health check config">
+
+```text
+Health check path: /api/health
+Interval: 10s
+Timeout: 2s
+Unhealthy threshold: 2 consecutive failures
+Healthy threshold: 2 consecutive successes
+```
+
+</Evidence>
+
+<Evidence title="app instance metrics during the spike">
+
+```text
+Instance A: CPU 45%, p95 latency 180ms, health check: passing
+Instance B: CPU 52%, p95 latency 310ms, health check: FAILED at 14:02:11, 14:02:21
+                                          PASSED at 14:02:31
+Instance C: CPU 48%, p95 latency 190ms, health check: passing
+```
+
+</Evidence>
+
+<Evidence title="what /api/health actually does">
+
+```ts
+export async function GET() {
+  await db.query("SELECT count(*) FROM bookings");  // a real query, every time
+  return NextResponse.json({ ok: true });
+}
+```
+
+</Evidence>
+
+Instance B has spare CPU and isn't overloaded by any obvious measure, yet its health check failed twice in a row — enough to get it pulled from rotation for twenty seconds, during which its share of traffic got 503s from the load balancer (no healthy instance to route *those specific* requests to, momentarily). Why would a healthy-looking instance fail its health check under load?
+
+<Reveal label="Reveal the cause">
+
+**The health check itself runs a real database query with a 2-second timeout, and under traffic-spike load the connection pool briefly had no spare connection available for the health check specifically — not because the instance was broken, but because every connection was busy serving real, successful requests at that exact moment.**
+
+**The mechanism:** instance B's own application traffic (180-310ms p95, perfectly healthy) was legitimately using its connection pool near capacity during the spike. The health check's `SELECT count(*) FROM bookings` has to wait in line for a connection just like any other query — and if it waits more than 2 seconds because the pool is momentarily saturated with real traffic, the health check times out and *reports failure*, even though every actual user-facing request on that instance succeeded throughout.
+
+**This is a self-inflicted wound: the health check competes with real traffic for the exact resource (M6.2's connection pool) that traffic pressure is already stressing.** The instance isn't unhealthy; the health check is measuring the wrong thing under the wrong conditions and drawing the wrong conclusion from contention it's partly causing.
+
+**The fix, in order:**
+1. **Make the health check cheap and dependency-light** for routing decisions — `SELECT 1` or no database call at all for the basic liveness check, reserving the "check I can actually reach the database" version for a separate, less time-pressured deep-check endpoint not used for second-by-second routing decisions.
+2. **Give the health check its own small, reserved connection** or a short-circuit path that doesn't compete with the main pool, if a real dependency check is genuinely needed in the routing path.
+3. **Raise the health check timeout slightly and require more consecutive failures** before pulling an instance — M8.8's alert-fatigue lesson applies here too: a check that can be defeated by a 2-second traffic blip isn't measuring the thing you actually care about (is this instance able to serve users), only a narrower, noisier proxy for it.
+
+**The transferable lesson:** a health check that calls a real downstream dependency is itself a consumer of that dependency's limited capacity, and under exactly the load conditions you most want accurate health data, it can be the thing that fails first — reporting an outage that's actually just contention it's contributing to.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review this health check endpoint: [paste it]. Does it make a real database or external call? If so, could it compete for the same limited resource (connection pool, rate limit) as real application traffic under load, causing false negatives exactly when the system is busy? Propose a cheap liveness check plus a separate, less time-critical deep-health endpoint if a real dependency check is needed."}>
+This audit catches the break-fix's exact failure mode. Verify the proposed cheap check genuinely avoids the shared resource — a `SELECT 1` still needs A connection, just a much cheaper one; confirm it still has a plan for the pool being briefly exhausted.
+</AgentTask>
+
+<AgentTask prompt={"I'm getting 502/503/504 errors intermittently and need to isolate where. Give me the exact curl commands to check: the app server directly (bypassing any proxy), the proxy itself, and the proxy's own logs — in the right order to distinguish 'app is down' from 'app is slow' from 'load balancer has no healthy instance.'"}>
+A good answer puts the direct-to-app check FIRST or very early — it's the cheapest way to rule the app server in or out entirely, exactly as the ninety-second resolution in the story did once someone thought to check from outside the usual path.
+</AgentTask>
+
+<AgentTask prompt={"Review our reverse proxy / load balancer configuration: what are the configured connect and read timeouts, and are they appropriate for our slowest legitimate endpoint (not just the fastest)? If any real endpoint can legitimately take longer than the configured timeout under normal conditions, that's a false-504 risk waiting to happen."}>
+This catches the opposite failure to the break-fix: a timeout set too aggressively for a genuinely slow-but-fine endpoint produces false 504s on normal traffic. Verify it checks against your actual slowest legitimate endpoint's measured latency (M8.4), not a guess.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+When you see a 5xx reported by a user but can't reproduce it internally:
+
+- Are you checking through the SAME public path the user hit (proxy/LB included), or bypassing it by checking the app server directly?
+- Is it a 502 (instant, connection refused) or a 504 (delayed, matching a configured timeout)? Time it.
+- If 503: is there a load balancer with a health check that could be marking an instance unhealthy for a reason unrelated to real user-facing health?
+
+For any health check used in routing decisions:
+
+- Does it make a real database or dependency call?
+- Could that call compete with real traffic for a limited resource under exactly the load conditions you care most about?
+
+What good looks like: 502, 503 and 504 are read as three different diagnoses pointing at three different investigations, and nobody confuses "I checked the app directly" with "I checked what the user actually experienced."
+
+Red flags: a health check that's more expensive than the traffic it's meant to protect against false-negative-ing; debugging a user-reported 5xx exclusively from inside the app server, never from outside through the real path.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l04"
+  questions={[
+    {
+      q: "What's the key difference between what a 502 and a 504 each rule out?",
+      options: [
+        "502 is a client error, 504 is a server error",
+        "502 means the proxy's connection attempt was refused (nobody home — check if the process is running); 504 means the connection succeeded but the app never responded in time (somebody's home but stuck)",
+        "502 happens on GET requests, 504 on POST requests",
+        "They're interchangeable names for the same failure"
+      ],
+      answer: 1,
+      explain: "Verified directly: pointing the proxy at a dead port gave an instant 502; pointing it at something that accepts but never answers gave a 504 at exactly the configured timeout. The timing itself is diagnostic."
+    },
+    {
+      q: "Why did an engineer spend forty minutes debugging a 'server is down' ticket that turned out to be real?",
+      options: [
+        "The customer was using an outdated browser",
+        "The engineer checked the app server directly, bypassing the reverse proxy entirely, while the customer's traffic went through the proxy — which was timing out on one slow endpoint and returning its own 504",
+        "The app server's logs were corrupted",
+        "DNS was resolving to a different server for the customer"
+      ],
+      answer: 1,
+      explain: "Both were telling the truth about what they observed. Checking from OUTSIDE, through the real public path the customer actually used, resolved it in ninety seconds."
+    },
+    {
+      q: "In the break-fix, why did a healthy instance with spare CPU fail its health check under a traffic spike?",
+      options: [
+        "The load balancer's health check interval was misconfigured",
+        "The health check itself ran a real database query that competed with legitimate traffic for the same limited connection pool — under load, it occasionally couldn't get a connection within its 2-second timeout",
+        "The instance was running an outdated version of the application",
+        "Network latency between the load balancer and the instance increased"
+      ],
+      answer: 1,
+      explain: "The health check was a consumer of the exact resource it was trying to verify the health of. Under precisely the load conditions you most want accurate data, it became the thing most likely to report a false negative."
+    },
+    {
+      q: "Why is the TIMING of a 502 vs 504 itself useful diagnostic information, even before reading any logs?",
+      options: [
+        "Status codes always arrive at a fixed, predictable speed",
+        "An instant failure indicates a refused connection (502-shaped, nobody listening); a failure that takes exactly as long as a configured timeout indicates a hang (504-shaped, something accepted but never answered)",
+        "Timing has no diagnostic value for HTTP errors",
+        "Faster failures always indicate client-side problems"
+      ],
+      answer: 1,
+      explain: "Verified on the demo stack: the 502 arrived in ~17ms; the 504 arrived at exactly ~5 seconds, matching proxy_read_timeout precisely. The delay IS the configured timeout, not incidental network latency."
+    },
+    {
+      q: "What should a health check used for routing decisions generally avoid?",
+      options: [
+        "Returning a JSON response body",
+        "Making real calls to shared, limited-capacity dependencies (a database connection pool, a rate-limited API) that could themselves become contended under exactly the load the check is meant to detect problems during",
+        "Running more often than once per minute",
+        "Including a status code other than 200"
+      ],
+      answer: 1,
+      explain: "A cheap liveness check (no dependency calls, or SELECT 1 at most) for routing decisions, with a separate deep-health endpoint for genuine dependency verification, avoids the health check becoming a victim of the load it's supposed to help manage."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,302 @@
+---
+id: m05-l03
+module: M5
+title: "TLS/HTTPS: what a certificate actually proves, and why it expires"
+order: 3
+difficulty: 2
+depth: both
+platforms: [cloudflare, nginx, caddy, vercel]
+concepts: [tls]
+prerequisites: [m05-l01]
+lab: self
+scenario_ids: [sc-cert-expiry-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder's app had been running fine for ten months on a VPS with Let's Encrypt, auto-renewing every 90 days via a cron job someone had set up when the server was first provisioned. On month eleven, every user's browser started showing `NET::ERR_CERT_DATE_INVALID` — a full-page scary warning, no way through it for most users.
+
+The certificate hadn't failed to renew because Let's Encrypt was down, or because the domain had changed, or because of anything dramatic. The renewal script's cron job ran under a user account whose crontab had been silently dropped during an unrelated server migration eight months earlier — nobody had moved it, because nobody remembered it existed; it had been working so reliably that it had become invisible. Three renewals' worth of silence (roughly 270 days of a 90-day cycle) finally caught up at the exact moment the last valid certificate's 90-day clock ran out.
+
+The fix took five minutes once found. The eight months of silent failure happened because a thing that "just works" and a thing that "is being monitored" are not the same claim, and nobody had been asking the second question.
+
+</Section>
+
+<Section kind="already-did">
+
+You've seen the padlock icon in a browser's address bar and not thought about it, because that's the entire point — it's supposed to be invisible when working. You've probably also seen the alternative: a full-page red warning, `NET::ERR_CERT_DATE_INVALID` or similar, usually at the worst possible moment, usually with no warning beforehand unless someone was specifically watching for it.
+
+If you've deployed to a modern PaaS, you've likely never set up TLS yourself at all — Vercel, Render and similar platforms provision and renew certificates automatically the moment you add a custom domain. This lesson is partly about understanding what that automation is doing for you, and partly about the VPS/self-managed case where nothing does it for you unless you've set it up — and kept it working.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What a certificate actually proves
+
+A TLS certificate is a signed statement: *"the owner of `example.com`'s private key is the entity this certificate describes, and a Certificate Authority verified that at the time of issuance."* Two things follow directly from that sentence:
+
+1. **"At the time of issuance" is why certificates expire.** A certificate issued a year ago made a claim about domain ownership *then*. Domains change hands; expiry forces periodic re-verification rather than trusting a years-old claim forever.
+2. **It proves identity, not safety.** A certificate says "this is really `example.com`," not "this site is trustworthy" — a phishing site can have a perfectly valid certificate for its own, different domain. This is why a valid cert on the wrong domain is still a real attack, not a non-issue.
+
+### The handshake, at the level you actually need
+
+<svg viewBox="0 0 780 220" role="img" aria-label="TLS handshake: the client and server exchange certificates and agree on encryption keys before any HTTP request is sent" className="diagram">
+  <defs>
+    <marker id="arrtls" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <rect x="8" y="16" width="150" height="50" rx="8" />
+  <text x="83" y="46" textAnchor="middle" className="sub">Client (browser)</text>
+  <rect x="616" y="16" width="156" height="50" rx="8" />
+  <text x="694" y="46" textAnchor="middle" className="sub">Server</text>
+
+  <path d="M 158 40 L 610 40" className="arrow" markerEnd="url(#arrtls)" />
+  <text x="390" y="34" textAnchor="middle" className="sub">"let's talk securely" + supported ciphers</text>
+
+  <path d="M 616 80 L 162 80" className="arrow" markerEnd="url(#arrtls)" />
+  <text x="390" y="74" textAnchor="middle" className="sub">certificate (signed claim of identity) + chosen cipher</text>
+
+  <text x="12" y="120" className="sub">Client checks: is this cert signed by someone my browser already trusts (a CA),</text>
+  <text x="12" y="142" className="sub">does it match the domain I typed, and has it NOT expired?</text>
+
+  <path d="M 158 170 L 610 170" className="arrow" markerEnd="url(#arrtls)" />
+  <text x="390" y="164" textAnchor="middle" className="sub">key exchange — both sides now share a secret, no eavesdropper does</text>
+
+  <text x="12" y="204" className="sub">Only AFTER this entire exchange does your actual HTTP request travel, now encrypted.</text>
+</svg>
+
+### Reading a real certificate
+
+```bash
+echo | openssl s_client -connect anthropic.com:443 -servername anthropic.com 2>/dev/null \
+  | openssl x509 -noout -subject -dates -issuer
+```
+```text
+subject=CN=anthropic.com
+notBefore=Nov  3 18:24:44 2026 GMT
+notAfter=Feb  1 18:24:43 2027 GMT
+issuer=C=US, O=Let's Encrypt, CN=YE2
+```
+
+Three facts, every time: **who** it's for (`subject`), **how long it's valid** (`notBefore`/`notAfter` — this one is a roughly 90-day Let's Encrypt certificate, their standard short lifetime, which is *why* automated renewal is load-bearing rather than optional), and **who vouches for it** (`issuer`).
+
+<Callout type="key">
+**Let's Encrypt's short (90-day) lifetime is a deliberate design choice, not a limitation** — it forces renewal automation to exist and be exercised constantly, rather than letting a manual yearly process quietly rot the one time nobody remembers to run it. The story's eight-month silent failure is exactly the failure mode short lifetimes are designed to surface quickly — and it still took that long, because the *monitoring* of the renewal job, not the renewal mechanism itself, was what was missing.
+</Callout>
+
+### Mixed content: the other common TLS-adjacent failure
+
+A page loaded over `https://` that tries to load a script, image, or API call over plain `http://` gets blocked by the browser — "mixed content." This usually surfaces after a migration from HTTP to HTTPS where one hardcoded `http://` URL survived the move, often in a third-party embed or an old config value nobody re-checked.
+
+<Operator>
+
+```bash
+# ── Inspect a real certificate's three facts ──────────────────────────
+echo | openssl s_client -connect anthropic.com:443 -servername anthropic.com 2>/dev/null \
+  | openssl x509 -noout -subject -dates -issuer
+#   Verified live: Let's Encrypt, ~90-day validity window.
+
+# ── curl shows the same facts during a normal request ─────────────────
+curl -vI https://anthropic.com 2>&1 | grep -iE "SSL connection|subject:|expire date|TLSv"
+#   Verified: "SSL connection using TLSv1.3", subject and expire date lines.
+
+# ── Calculate days until expiry — the number that should drive an alert ─
+echo | openssl s_client -connect anthropic.com:443 -servername anthropic.com 2>/dev/null \
+  | openssl x509 -noout -enddate \
+  | sed 's/notAfter=//' \
+  | xargs -I{} date -j -f "%b %d %T %Y %Z" "{}" +%s 2>/dev/null \
+  | xargs -I{} sh -c 'echo "days left: $(( ({} - $(date +%s)) / 86400 ))"'
+#   On Linux, swap the `date -j -f` macOS syntax for: date -d "{}" +%s
+
+# ── Check for mixed content risk after a migration ────────────────────
+grep -rn "http://" --include="*.ts" --include="*.tsx" --include="*.html" . 2>/dev/null | head -10
+#   Any hardcoded http:// in a codebase serving itself over https:// is a
+#   mixed-content risk waiting for the day someone actually hits that path.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Automatic issuance + renewal (PaaS) | Vercel, Render, Netlify — zero setup, included |
+| Automatic issuance + renewal (self-managed) | Caddy (renews automatically, zero config), certbot + Let's Encrypt |
+| CDN-provided TLS | Cloudflare (terminates TLS at their edge, can even proxy to an HTTP-only origin — understand this trade-off before relying on it) |
+| Inspect any certificate | `openssl s_client` + `openssl x509`, or just a browser's padlock → certificate details |
+| Monitor expiry externally | UptimeRobot, Better Stack, or any uptime checker with a cert-expiry check — **external**, so it doesn't depend on the same server that might be the one failing |
+
+The lesson from the story, generalized: **certificate renewal automation needs its own monitoring, separate from the renewal mechanism itself.** A cron job that silently stops running is indistinguishable from one that's working, right up until the certificate it was supposed to renew actually expires — which is M7.8's dead-man's-switch problem, wearing a TLS costume.
+
+What good looks like: certificate expiry is monitored by something external to the server it's protecting, with an alert well before the 14-day mark; nobody has ever been surprised by `NET::ERR_CERT_DATE_INVALID` in production.
+
+</Section>
+
+<Section kind="hands-on">
+
+1. **Inspect a real certificate** using the Operator block's `openssl` command, against your own domain if you have one, or a public site otherwise.
+
+2. **Calculate days remaining** and compare it against whatever monitoring (if any) currently watches that number for your own product.
+
+3. **Check your deployment for mixed content risk** — grep for hardcoded `http://` in a codebase that serves over `https://`.
+
+4. **Write down, for your own product, who or what renews your certificate**, and what would happen if that mechanism silently stopped — is there anything that would notice before a user does?
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A company's API works fine in the browser, in Postman, and from every developer's laptop. A specific enterprise customer's server-to-server integration fails every single call with a TLS handshake error — and has never once worked for them.
+
+<Evidence title="the error, from the customer's side">
+
+```text
+SSL_ERROR_SELF_SIGNED_CERT_IN_CHAIN
+  (or, from a Java client:)
+PKIX path building failed: unable to find valid certification path
+```
+
+</Evidence>
+
+<Evidence title="what the company's own checks show">
+
+```text
+$ curl -vI https://api.example.com 2>&1 | grep -iE "SSL connection|issuer"
+* SSL connection using TLSv1.3
+*  issuer: C=US; O=Let's Encrypt; CN=R3
+$ echo | openssl s_client -connect api.example.com:443 2>/dev/null | openssl x509 -noout -issuer
+issuer=C=US, O=Let's Encrypt, CN=R3
+```
+
+</Evidence>
+
+<Evidence title="what the customer runs on their own locked-down server">
+
+```text
+$ curl -vI https://api.example.com
+curl: (60) SSL certificate problem: unable to get local issuer certificate
+```
+
+</Evidence>
+
+Everyone else's browser trusts this certificate instantly. This one customer's server, running the exact same TLS version, cannot. Why, and whose problem is it?
+
+<Reveal label="Reveal the cause">
+
+**The customer's server has an outdated or incomplete list of trusted root/intermediate certificates (a trust store), missing the specific intermediate CA this certificate chains up through — a problem invisible to browsers, which auto-update their trust stores, and very visible to locked-down enterprise servers, which often don't.**
+
+Browsers (Chrome, Firefox, Safari) ship with frequently-updated root certificate trust stores and typically handle fetching missing intermediate certificates automatically. A locked-down enterprise Linux server, especially one that's been running for years without OS updates, often has a **stale** trust store — missing a root or intermediate certificate that was added or rotated more recently than the server's last update. `Let's Encrypt` has changed its intermediate CA chain over the years (this is a routine, documented part of their operation); a server whose trust store predates a given chain simply can't verify certificates issued under it, while every up-to-date client sails through.
+
+**Why this is specifically a server-to-server problem and not a browser problem:** nothing is wrong with the certificate itself — issuer, dates, and domain match are all correct, as every check from the company's side confirms. The failure is entirely on the *verifying* side's knowledge of which CAs to trust, which is a property of that one machine's OS/trust-store maintenance, not of the certificate being presented.
+
+**The fix, layered:**
+1. **Confirm the full certificate chain is being served, not just the leaf certificate** — a common *server-side* misconfiguration that produces an identical-looking symptom: if the server only sends its own certificate without the intermediate(s), even an up-to-date client can fail, because it may not successfully fetch the missing intermediate itself. `openssl s_client -connect api.example.com:443 -showcerts` shows the full chain actually being sent — verify more than one certificate appears.
+2. If the chain is complete and the symptom is genuinely isolated to this one customer, **it's their trust store, not your certificate** — point them at updating their OS/CA bundle (on most Linux systems, a `ca-certificates` package update).
+3. Consider whether your CA's chain-of-trust choices affect your actual customer base's typical environment — enterprise-heavy customers running older, more conservative systems are exactly the segment most likely to hit this, which is a real factor in choosing a certificate authority for a B2B product.
+
+**The transferable lesson:** "it works for me" and "it works for everyone" are different claims about TLS specifically, because trust is evaluated locally by each client against *its own* list of trusted authorities — a list that updates on its own schedule, which you don't control and can't verify remotely without asking.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Check whether this server is sending its full TLS certificate chain, not just the leaf certificate: run openssl s_client with -showcerts against [domain] and tell me how many certificates appear and whether the chain is complete up to a well-known root. If incomplete, show me how to fix it for [nginx/Caddy/whatever is in use]."}>
+A complete chain typically shows at least two certificates (leaf + intermediate); a missing intermediate is the single most common server-side misconfiguration that produces the exact 'works for me, fails for this one client' symptom from the break-fix.
+</AgentTask>
+
+<AgentTask prompt={"Set up certificate expiry monitoring for [domain] that is external to the server itself — not a cron job on the same machine that might silently stop, but a third-party check that alerts well before the 14-day mark. Show me how to verify the monitor itself is actually working, not just configured."}>
+"External to the server itself" is the non-negotiable constraint — the story's eight-month failure happened precisely because the renewal AND any notion of monitoring lived on the same machine whose crontab silently vanished. Verify by actually checking the monitor fires a test alert, the same discipline as M7.8's dead-man's-switch testing.
+</AgentTask>
+
+<AgentTask prompt={"Scan this codebase and configuration for hardcoded http:// URLs — in scripts, config files, third-party embeds, or environment defaults — that could cause mixed-content blocking on a page served over https://. For each, show the fix and whether it needs to be an environment-specific value (http in dev, https in prod) rather than hardcoded either way."}>
+Check it distinguishes genuinely hardcoded mistakes from deliberately environment-scoped values (a local dev URL is correctly http://localhost, not a bug) — the fix for a true mixed-content risk is usually using a protocol-relative or environment-derived URL, not blindly replacing every http:// with https://.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For any domain you operate:
+
+- Is certificate renewal automated (Caddy, certbot with a cron, or a PaaS handling it entirely)?
+- Is the renewal mechanism's HEALTH monitored externally — separately from the renewal mechanism itself?
+- Does the server send its FULL certificate chain, not just the leaf cert? (`openssl s_client -showcerts`)
+- Is there any hardcoded `http://` URL in a codebase served over `https://`?
+
+What good looks like: nobody has ever been surprised by a certificate expiry in production, because something external watches the days-remaining number and alerts well before it matters.
+
+Red flags: a renewal cron job with no monitoring of whether it actually ran; "it works for me" accepted as proof a TLS setup is correct for every client; a certificate chain never verified to be complete.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m05-l03"
+  questions={[
+    {
+      q: "What does a TLS certificate actually prove?",
+      options: [
+        "That the site is safe and trustworthy to use",
+        "That a Certificate Authority verified, at the time of issuance, that the holder of a specific private key controls the named domain — identity, not safety",
+        "That the site has no security vulnerabilities",
+        "That all data on the site is encrypted at rest"
+      ],
+      answer: 1,
+      explain: "A phishing site can have a perfectly valid certificate for ITS OWN domain. A valid cert proves domain identity, which is exactly why checking the domain matches what you expect still matters."
+    },
+    {
+      q: "Why does Let's Encrypt deliberately issue certificates with a short, roughly 90-day lifetime?",
+      options: [
+        "To generate more revenue from frequent renewals",
+        "To force renewal automation to exist and run constantly, rather than letting a yearly manual process quietly fail the one time nobody remembers to run it",
+        "Browsers require certificates to be reissued that often",
+        "Shorter certificates are cheaper to generate computationally"
+      ],
+      answer: 1,
+      explain: "Short lifetimes are a deliberate design choice to surface renewal failures quickly. The story's eight-month silent failure shows even this isn't foolproof if the renewal job's HEALTH isn't separately monitored."
+    },
+    {
+      q: "A certificate's issuer and dates check out correctly from the company's own machines, but one enterprise customer's server fails every TLS handshake. What's the most likely cause?",
+      options: [
+        "The certificate is fraudulent despite appearing valid",
+        "The customer's server has an outdated trust store missing the intermediate CA this certificate chains through, or the server isn't sending the full certificate chain",
+        "The customer's firewall is blocking port 443",
+        "DNS is resolving to the wrong IP for that customer only"
+      ],
+      answer: 1,
+      explain: "Browsers auto-update trust stores and often fetch missing intermediates automatically; locked-down enterprise servers frequently don't. 'Works for me' and 'works for everyone' are different claims because trust is evaluated locally by each client."
+    },
+    {
+      q: "What's the single most important property of monitoring for certificate renewal automation?",
+      options: [
+        "It should check certificate validity every hour",
+        "It must be external to the server being monitored, so a failure of that server (or its cron) doesn't also silently disable the thing watching for the failure",
+        "It should use the same mechanism as the renewal itself for consistency",
+        "It only needs to run once per certificate's lifetime"
+      ],
+      answer: 1,
+      explain: "This is M7.8's dead-man's-switch principle applied to TLS: the renewal mechanism and anything monitoring it living on the same machine means a single failure (a dropped crontab) silently takes out both."
+    },
+    {
+      q: "What is \"mixed content,\" and when does it typically appear?",
+      options: [
+        "A certificate that mixes two different domains",
+        "A page loaded over https:// trying to load a resource (script, image, API call) over plain http://, which browsers block — commonly surfacing after an HTTP-to-HTTPS migration where one hardcoded URL survived",
+        "A TLS handshake using mismatched protocol versions",
+        "A certificate chain with certificates from two different CAs"
+      ],
+      answer: 1,
+      explain: "It's a common TLS-adjacent failure distinct from expiry or trust issues — the fix is grepping for hardcoded http:// URLs in a codebase that now serves over https://."
+    }
+  ]}
+/>
+
+</Section>

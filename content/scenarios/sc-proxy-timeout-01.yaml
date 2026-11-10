@@ -1,0 +1,45 @@
+id: sc-proxy-timeout-01
+module: M5
+lesson: m05-l04
+title: "A healthy instance keeps getting pulled from rotation"
+difficulty: hard
+symptom: "During a traffic spike, 1 in 20 requests return 503. App servers show spare CPU and normal latency. The 503s stop the moment traffic drops."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/expensive-health-check.patch   # health check runs a real DB query sharing the main pool
+    - type: traffic
+      apply: scripts/load/monday-ramp.js
+evidence:
+  logs: true
+  metrics: [lb.healthy_instances, db.connections, http.503]
+  db_console: true
+  notes: "Per-instance CPU, latency and health-check pass/fail history are all available."
+agent:
+  context: "You confirmed app servers have spare capacity and aren't overloaded by any obvious measure."
+  bias: "suspects the load balancer's health check configuration (interval/threshold) rather than what the check itself does"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-503s-under-ramp
+    - health-check-does-not-share-main-pool
+  root_cause_markers:
+    - learner identifies the health check's own database call as competing for the connection pool
+    - liveness check simplified to avoid the shared resource, or given a separate reserved path
+    - a separate deep-health endpoint retained for genuine dependency verification if needed
+  symptom_only_markers:
+    - health check timeout or threshold loosened with the query unchanged
+    - connection pool size increased to compensate
+hints:
+  - "The instance that failed its check had spare CPU. What else could it have been waiting for?"
+  - "Read exactly what the health check endpoint does. Does it touch anything with limited capacity?"
+  - "Under load, what else is competing for that same resource at that exact moment?"
+  - "Reveal: the health check shares the connection pool with real traffic. Make the liveness check cheap and separate it from a real dependency check."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 25
+  agent_verification: 20

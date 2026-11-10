@@ -1,0 +1,43 @@
+id: sc-cors-preflight-01
+module: M5
+lesson: m05-l06
+title: "A payment form that silently fails inside one partner's iframe"
+difficulty: hard
+symptom: "An embedded payment form works on every partner site except one, where submitting it does nothing — no visible error, no server-side record."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/samesite-lax-in-iframe.sh   # session cookie set with SameSite=Lax, embedded via iframe
+evidence:
+  logs: true
+  metrics: [payments.form_submissions, payments.session_present]
+  db_console: false
+  notes: "CORS headers are correctly configured; the cookie's SameSite attribute is the only difference from working embeds."
+agent:
+  context: "You verified the CORS headers (Allow-Origin, Allow-Credentials) are all correctly configured for this partner's origin."
+  bias: "concludes the problem must be elsewhere since CORS headers check out"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - cookie-present-in-iframe-context
+    - form-submission-succeeds
+  root_cause_markers:
+    - learner identifies SameSite as a separate gate from CORS, independently blocking the cookie
+    - learner distinguishes the failing partner's iframe embedding from other partners' different embedding pattern
+    - cookie changed to SameSite=None with Secure (both together)
+  symptom_only_markers:
+    - CORS headers adjusted further with the cookie attribute left unchanged
+    - SameSite removed entirely without setting Secure
+hints:
+  - "CORS headers control whether a script can READ a response. What controls whether a cookie is SENT at all?"
+  - "How is this one partner embedding the form differently from the others?"
+  - "Lax permits the cookie on top-level navigation. Is this an iframe or a top-level navigation?"
+  - "Reveal: SameSite=Lax blocks the cookie in a third-party iframe context. Switch to SameSite=None; Secure — both together."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

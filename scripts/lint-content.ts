@@ -95,6 +95,13 @@ for (const l of lessons) {
       errors.push(`${l.id}: missing lesson section "${section}"`);
     }
   }
+  // PLAN §3: "3 precise prompts for an AI coding agent" per lesson.
+  const agentTaskCount = (l.content.match(/<AgentTask\s+prompt=/g) ?? []).length;
+  if (agentTaskCount < 3) {
+    errors.push(
+      `${l.id}: only ${agentTaskCount} <AgentTask> prompt(s) — the lesson anatomy requires 3`
+    );
+  }
   // Component/section checks must ignore fenced code blocks: MDX treats their
   // contents as literal text, so a TypeScript generic like `<T>` is not a
   // component reference. Blank the fenced regions, preserving line numbers.

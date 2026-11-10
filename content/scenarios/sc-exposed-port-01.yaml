@@ -1,0 +1,43 @@
+id: sc-exposed-port-01
+module: M5
+lesson: m05-l07
+title: "A Redis instance ransomed despite a correctly-scoped firewall rule"
+difficulty: hard
+symptom: "Redis gets compromised and flushed with a ransom note left behind, despite the team confirming their firewall only allows the application server's IP to reach port 6379."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: infra
+      apply: scripts/break/public-ip-plus-restrictive-fw.sh   # instance has both a private IP (correctly firewalled) and a public IP (not)
+evidence:
+  logs: true
+  metrics: [redis.connections_by_source]
+  db_console: false
+  notes: "The security group rule and the instance's actual network interfaces (private and public) are both inspectable."
+agent:
+  context: "You have re-verified the firewall rule multiple times and confirmed it correctly restricts to one private IP."
+  bias: "keeps re-checking the firewall rule rather than checking for other network paths to the instance"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-public-reachability
+    - authentication-required
+  root_cause_markers:
+    - learner discovers the instance also has a public IP with no equivalent restriction
+    - public IP removed or redis bound explicitly to the private interface
+    - requirepass or ACL authentication added as an independent control
+  symptom_only_markers:
+    - firewall rule re-verified or tightened with the public IP left in place
+    - port changed to a non-standard number as the only fix
+hints:
+  - "The firewall rule IS correct for the interface you checked. Is there another interface?"
+  - "Does this instance have a public IP at all? Try connecting from outside the allowed range entirely."
+  - "What does redis.conf's bind directive say, independent of any firewall rule?"
+  - "Reveal: a public IP exists with no equivalent restriction. Remove it, bind explicitly, and require authentication regardless."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

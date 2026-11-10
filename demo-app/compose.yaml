@@ -1,6 +1,7 @@
 # One command runs the whole stack:   docker compose up --build
-# App:    http://localhost:3000
-# Health: http://localhost:3000/api/health
+# App:          http://localhost:3001 (direct, bypassing the proxy)
+# Via proxy:    http://localhost:8080 (for M5's reverse-proxy lessons)
+# Health:       http://localhost:3001/api/health
 services:
   db:
     image: postgres:16-alpine
@@ -53,6 +54,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
+
+  # A real reverse proxy in front of the app, for M5 (networking). Deliberately
+  # plain nginx so config, headers and timeouts are all readable, not hidden
+  # behind a platform's edge. Break it with scripts/break/proxy-*.sh.
+  proxy:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
 
 volumes:
   dbdata:
