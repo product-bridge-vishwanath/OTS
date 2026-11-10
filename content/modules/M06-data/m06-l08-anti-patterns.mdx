@@ -1,0 +1,396 @@
+---
+id: m06-l08
+module: M6
+title: "Data modelling anti-patterns: what AI-generated schemas get wrong"
+order: 8
+difficulty: 2
+depth: both
+platforms: [postgres, supabase, neon]
+concepts: [data-modelling, relational-model, indexes]
+prerequisites: [m06-l01, m07-l06]
+lab: demo-repo
+scenario_ids: [sc-schema-audit-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder asked his AI agent to "add a notes feature to bookings, and a way to track analytics events." Forty minutes later he had a working feature, a demo to show investors, and — though nobody would notice for months — a schema with five separate problems that would each eventually cost him a production incident.
+
+Every individual decision was locally reasonable. A jsonb column for notes was the fastest way to ship a list-of-things feature without a migration. A generic `events` table with a jsonb `payload` meant never having to migrate again when a new event type showed up. Skipping foreign keys avoided a class of migration-ordering headache. None of these were agent mistakes exactly — they're the defaults an agent reaches for when optimizing for "make this work right now," because an agent asked to ship a feature in one request has no way to know this table will hold 400,000 rows in five months, or that two people will edit the same note simultaneously, or that someone will eventually need to query "every event of type X across all time."
+
+The schema wasn't wrong. It was **unfinished** — missing the five questions nobody asked because nobody was looking far enough ahead to ask them.
+
+</Section>
+
+<Section kind="already-did">
+
+If you've worked through this module and M7, you've already met every anti-pattern in this lesson individually — in the demo app, which plants them deliberately, and in your own product, almost certainly, because they're the default output of "make a working feature fast." This lesson's job is different: it's the **checklist for reading a new schema**, agent-generated or your own, and catching all five before they're load-bearing in production rather than after.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The five anti-patterns, and the lesson that fixes each one properly
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Five schema anti-patterns found by inspection: a JSON blob holding a list many writers append to, an everything-in-one-table log, missing indexes, missing foreign keys, and files stored in database columns" className="diagram">
+  <rect x="8" y="16" width="372" height="56" rx="8" />
+  <text x="194" y="38" textAnchor="middle" className="sub">1 · JSON blob for a many-writer list</text>
+  <text x="194" y="58" textAnchor="middle" className="sub">→ lost updates under concurrency (M7.6)</text>
+
+  <rect x="400" y="16" width="372" height="56" rx="8" />
+  <text x="586" y="38" textAnchor="middle" className="sub">2 · Everything-in-one-table log</text>
+  <text x="586" y="58" textAnchor="middle" className="sub">→ unqueryable, ever-growing, no shape (below)</text>
+
+  <rect x="8" y="88" width="372" height="56" rx="8" />
+  <text x="194" y="110" textAnchor="middle" className="sub">3 · No indexes beyond primary key</text>
+  <text x="194" y="130" textAnchor="middle" className="sub">→ fine at 50 rows, ruinous at scale (M6.1)</text>
+
+  <rect x="400" y="88" width="372" height="56" rx="8" />
+  <text x="586" y="110" textAnchor="middle" className="sub">4 · No foreign keys</text>
+  <text x="586" y="130" textAnchor="middle" className="sub">→ orphaned rows possible, nothing enforces it</text>
+
+  <rect x="8" y="160" width="764" height="56" rx="8" />
+  <text x="390" y="182" textAnchor="middle" className="sub">5 · Files stored as bytea/BLOB in a database column</text>
+  <text x="390" y="202" textAnchor="middle" className="sub">→ backup time, query performance and bill size all suffer together (M6.6)</text>
+
+  <text x="12" y="250" className="sub">All five are individually reasonable shortcuts under deadline pressure.</text>
+  <text x="12" y="272" className="sub">All five are invisible until the table has real rows and real concurrent writers.</text>
+</svg>
+
+Three of these five — the JSON blob, missing indexes, and files-in-database — already have their own full lessons (M7.6, M6.1, M6.6). This lesson covers the remaining two in depth, and gives you the **audit habit** that catches all five in one pass on any schema, including one an agent just generated for you five minutes ago.
+
+### Anti-pattern: the everything-in-one-table log
+
+The demo app's `events` table (planted anti-pattern AP5) is the shape:
+
+```sql
+CREATE TABLE events (
+  id         serial PRIMARY KEY,
+  type       text NOT NULL,
+  payload    jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+This *looks* flexible — any event type, any shape of data, no migration ever needed for a new kind of event. The cost shows up in three ways, all of which M6.1's break-fix already demonstrated directly: no column can be meaningfully indexed for most real queries (the data you'd filter on is buried inside `payload`, M6.1's expression-index problem); the table grows forever with every event type mixed together, so "all bookings created last week" requires scanning rows that are 95% unrelated event types; and nothing enforces what `payload` actually contains for a given `type` — a typo in one event's shape is invisible until code that reads `payload.booking_id` gets `undefined` from a row that used `bookingId` instead.
+
+**The fix**, if the table is worth keeping generic (an audit log genuinely benefits from this shape): add indexes on what you actually query (`type`, `created_at`, and a GIN index on `payload` if you query inside it), and seriously consider **dedicated tables for high-volume or frequently-queried event types** — `events` for the long tail of rare things, `booking_events` or similar for the type you query constantly. You don't have to choose one shape for everything.
+
+### Anti-pattern: missing foreign keys
+
+The demo app's `bookings.room_id` (planted anti-pattern AP3) has no foreign key to `rooms.id`. The practical consequence isn't abstract:
+
+```sql
+-- Nothing stops this. The row inserts successfully.
+INSERT INTO bookings (room_id, customer_name, date, start_hour, end_hour)
+VALUES (9999, 'ghost booking', CURRENT_DATE, 10, 12);
+-- room_id 9999 doesn't exist. This booking can never be displayed with a
+-- room name, can never be billed correctly, and nothing in the schema
+-- says this is wrong.
+```
+
+<Callout type="key">
+**A foreign key is a constraint the database enforces regardless of which code path writes the row** — your API, a migration script, a backfill, an agent's generated code, a manual `psql` fix at 2am. Skipping it doesn't remove the requirement that `room_id` point somewhere real; it just moves the enforcement from "guaranteed by the database" to "hoped for by every future piece of code that touches this table," forever.
+</Callout>
+
+```sql
+ALTER TABLE bookings ADD CONSTRAINT bookings_room_fk
+  FOREIGN KEY (room_id) REFERENCES rooms(id);
+```
+
+On an existing table with real data, this can fail the same way M6.3's `NOT NULL` migration failed — if any orphaned rows already exist, the constraint can't apply until you've decided what to do with them (a real product decision, not a technical one: delete them, reassign them, or create a placeholder room to absorb them).
+
+### The audit habit: five questions for any schema
+
+Run these against a new table — yours, or one an agent just generated — before it has real traffic:
+
+| Question | Catches |
+|---|---|
+| Does any jsonb/array column get **appended to** by more than one request? | The single-cell anti-pattern (M7.6) |
+| Will this table's query patterns still work at 100x the current row count? | Missing indexes (M6.1) |
+| Does every foreign-looking column (`*_id`) have an actual `REFERENCES`? | Missing foreign keys |
+| Does any column hold file bytes rather than queryable data? | Files-in-database (M6.6) |
+| Is there a generic `type`/`payload` table that's actually several different things wearing one disguise? | The everything-in-one-table log |
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Run the audit against the demo app's REAL schema ──────────────────
+#   Q1: jsonb columns, and whether application code appends to them
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT table_name, column_name FROM information_schema.columns
+   WHERE data_type='jsonb' AND table_schema='public';"
+#   Verified: three hits — events.payload, bookings.notes, bookings.meta.
+#   Not all jsonb is the anti-pattern; check which ones are APPENDED TO:
+grep -rn "notes.push\|\.push(" --include="*.ts" app/ 2>/dev/null
+#   Verified: only bookings.notes is appended to by application code
+#   (app/api/bookings/[id]/notes/route.ts) — that's AP1, the real risk.
+#   bookings.meta is written whole, once, at insert time — it's a
+#   legitimate whole-value jsonb column (the mental model's exception),
+#   not a hit. The audit surfaces candidates; judgment decides which
+#   ones are actually the anti-pattern.
+
+#   Q2: tables with real traffic and zero indexes beyond the primary key
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT t.relname, count(ix.indexrelid) - 1 AS extra_indexes
+    FROM pg_class t JOIN pg_index ix ON t.oid = ix.indrelid
+   WHERE t.relkind='r' AND t.relname NOT LIKE 'pg_%'
+   GROUP BY t.relname ORDER BY extra_indexes;"
+#   Verified: bookings, events, payments, reports, rooms all show 0 extra
+#   indexes — every one has only its primary key. AP4, confirmed directly.
+
+#   Q3: *_id columns with no matching foreign key constraint
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT c.table_name, c.column_name
+    FROM information_schema.columns c
+   WHERE c.column_name LIKE '%_id' AND c.table_schema='public'
+     AND c.table_name IN ('bookings','payments','reports','events')
+     AND NOT EXISTS (
+       SELECT 1 FROM information_schema.key_column_usage kcu
+        WHERE kcu.table_name = c.table_name AND kcu.column_name = c.column_name
+          AND kcu.constraint_name != c.table_name || '_pkey');"
+#   Verified hits: bookings.room_id, payments.booking_id (genuine FK gaps —
+#   AP3) and payments.provider_event_id (a false positive worth knowing
+#   about: it's an external string id from the payment provider, not a
+#   same-database foreign key candidate at all — the audit finds every
+#   *_id column with no FK; deciding which ones SHOULD have one is still
+#   a judgment call).
+
+#   Q4: file-shaped data in columns
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT table_name, column_name, data_type FROM information_schema.columns
+   WHERE data_type IN ('bytea') AND table_schema='public';"
+#   Verified: none in the demo app — it correctly has no files-in-DB anti-pattern.
+
+#   Q5: a generic type/payload table doing several jobs
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT type, count(*) FROM events GROUP BY type;"
+#   Verified: 'booking.created' and 'page.viewed' in the SAME table — two
+#   genuinely different kinds of thing (a business event vs. an analytics
+#   ping) sharing one schema with no enforced shape per type — AP5.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Find jsonb columns across a schema | `information_schema.columns WHERE data_type='jsonb'` |
+| Find tables with weak index coverage | `pg_index` joined to `pg_class`, as in the Operator block |
+| Find missing foreign keys | `information_schema.key_column_usage` cross-checked against `*_id` columns |
+| Visualize a schema quickly | `pg_dump --schema-only`, or a GUI (TablePlus, Supabase's schema view) |
+| Catch these at generation time | A prompt that explicitly asks the agent to justify each of the five questions, not just "add this feature" |
+
+What good looks like: before any new table goes into production, someone has run the five-question audit against it — not relying on noticing the problem later, in an incident, the way M7.6 and M6.1's stories both did.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Run all five Operator queries** against the demo app's real schema and confirm each finding (AP1, AP3, AP4, AP5 all present; files-in-database correctly absent).
+
+2. **Pick one finding and trace its actual consequence** through the modules that cover it: AP1 → re-run `node scripts/load/concurrent-editors.js 1` (M7.6) and watch notes vanish; AP4 → re-run `missing-index-growth.sql` then `EXPLAIN ANALYZE` (M6.1) and watch the seq scan.
+
+3. **Write the migration that fixes AP3** (the foreign key), including the orphan-check step from the mental model:
+   ```sql
+   SELECT b.id, b.room_id FROM bookings b
+    WHERE NOT EXISTS (SELECT 1 FROM rooms r WHERE r.id = b.room_id);
+   ```
+   On the pristine demo data this should return nothing — confirm it, then add the constraint.
+
+4. **Design the fix for AP5** (the mixed events table): would you split `booking.created` into its own table, add indexes to the existing one, or both? Justify the choice against the actual query patterns you'd expect (the demo app's worker already queries `events` by type — what would that query's `EXPLAIN` look like at 100,000 rows with no index on `type`?).
+
+5. **Run the five-question audit on your own product's schema** (or any schema you have access to). Write down every hit — this list is your personal, prioritized backlog for this module.
+
+6. **Revert the foreign-key addition** if you added it (`ALTER TABLE bookings DROP CONSTRAINT bookings_room_fk;`) so the demo app stays in its planted-anti-pattern state for other learners.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A product's `events` table — the generic, everything-in-one-table shape — has grown to 40 million rows over 18 months. A new feature needs to query "all password-reset events for a given user, ordered by time" for a security audit page. The query is correct SQL and takes 11 seconds.
+
+<Evidence title="the table and the query">
+
+```sql
+CREATE TABLE events (
+  id serial PRIMARY KEY, type text NOT NULL,
+  payload jsonb, created_at timestamptz DEFAULT now()
+);
+
+SELECT * FROM events
+ WHERE type = 'password_reset_requested'
+   AND payload->>'user_id' = '88213'
+ ORDER BY created_at DESC;
+```
+
+```text
+ Seq Scan on events  (actual time=0.031..10982.442 rows=4 loops=1)
+   Filter: ((type = 'password_reset_requested'::text)
+             AND ((payload ->> 'user_id'::text) = '88213'::text))
+   Rows Removed by Filter: 39,999,996
+```
+
+</Evidence>
+
+<Evidence title="attempted fix">
+
+```sql
+CREATE INDEX idx_events_type ON events (type);
+-- EXPLAIN again:
+ Bitmap Heap Scan on events  (actual time=0.891..2104.117 rows=4 loops=1)
+   Recheck Cond: (type = 'password_reset_requested'::text)
+   Rows Removed by Filter: 612,004   -- still filtering 612k rows by jsonb lookup
+   ->  Bitmap Index Scan on idx_events_type  (actual time=0.412..0.412 rows=612008)
+```
+
+</Evidence>
+
+Adding an index on `type` cut the time from 11 seconds to 2 — real, but not enough for a page a security team will use interactively. Why isn't this index sufficient, and what's the actual fix?
+
+<Reveal label="Reveal the cause">
+
+**The index on `type` narrows 40 million rows to 612,000 matching that one event type — still far too many to filter the rest of the way by a jsonb field extraction with no index backing it, which is still a full scan of those 612,000 rows.**
+
+**This is the everything-in-one-table anti-pattern meeting real scale.** `password_reset_requested` is one of presumably dozens of event types sharing this table, and it alone has accumulated 612,000 rows over 18 months — common enough that indexing just the `type` column still leaves a six-figure scan for the second filter condition. The `payload->>'user_id'` extraction has no index at all, so Postgres must decode the jsonb and do a text comparison on every one of those 612,000 rows, every time this query runs.
+
+**Two real fixes, not mutually exclusive:**
+
+**1. A composite or expression index matching the exact query shape** (M6.1's rule, applied to jsonb):
+```sql
+CREATE INDEX CONCURRENTLY idx_events_type_user
+  ON events (type, (payload->>'user_id'));
+```
+This serves the query directly — equality on `type`, equality on the extracted field — and should bring the query down to milliseconds. It's a real, valid fix, and often enough on its own.
+
+**2. The more durable fix, worth doing for any event type queried this way routinely:** give password-reset events (and any other security-relevant, frequently-queried type) their **own table** with real columns instead of a jsonb blob:
+```sql
+CREATE TABLE password_reset_events (
+  id bigserial PRIMARY KEY,
+  user_id integer NOT NULL REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON password_reset_events (user_id, created_at DESC);
+```
+Now `user_id` is a real, indexed, foreign-keyed column — not a string pulled out of a blob — and the query that was 11 seconds becomes a straightforward indexed lookup with none of the jsonb extraction overhead at all, ever, regardless of how large this specific table or the generic `events` table independently grow.
+
+**Why keep `events` around at all, then?** For the genuinely generic, low-volume, rarely-queried-by-content tail — `page.viewed`, one-off diagnostic events, anything where "fits in one flexible table" outweighs "needs to be fast to query." The anti-pattern isn't having a generic events table; it's using **only** a generic events table for everything, including the event types that turn out to matter enough to deserve their own shape.
+
+**The transferable lesson:** "flexible schema, no migrations needed" is a real benefit early, and it has a real expiration date tied to volume and query frequency — not a fixed row count, but the moment any specific event type inside the blob becomes common enough or important enough to need its own index. The fix at that point isn't abandoning the generic table; it's **promoting the event types that earned it** into their own properly-indexed, properly-typed tables, while the long tail stays where it was.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Run the five-question schema audit against this database: jsonb columns that are appended to by more than one code path, tables with no indexes beyond their primary key given their actual row count and query patterns, *_id columns with no foreign key constraint, columns holding file bytes instead of queryable data, and any generic type/payload table that's actually serving several meaningfully different purposes. Give file:line or table:column for every hit, ranked by how much traffic or data volume each one carries."}>
+The ranking by traffic/volume is what turns a list of findings into a prioritized backlog — not every hit is equally urgent, and the ones with real production data behind them (versus a table that's still empty) deserve attention first. Verify a few hits yourself against the actual schema rather than trusting the list blind.
+</AgentTask>
+
+<AgentTask prompt={"We have a generic events table with type and jsonb payload columns. One event type, [name it], has grown large and is queried frequently by a field inside the payload. Should it get its own dedicated table, or just an expression index on the existing table? Show me both options with the DDL, and the trade-off between them — not just 'add an index.'"}>
+A good answer names the real trade-off: an expression index is less work now and perfectly adequate for moderate frequency; a dedicated table is more upfront work but gives real foreign keys, real column types, and no JSON extraction overhead ever. Verify it doesn't just reach for one option by default — the right answer depends on the actual query frequency and how central this event type is.
+</AgentTask>
+
+<AgentTask prompt={"Before you add this new table or column to our schema, answer the five audit questions explicitly: will anything append to a jsonb/array column from more than one request, will this scale with growth given its likely query patterns, does every *_id column have a real foreign key, does anything here store file bytes, and is this trying to be a generic catch-all for several different kinds of data? Don't proceed until you've answered all five."}>
+Use this prompt BEFORE an agent generates a new schema, not after — it's the preventive version of the audit, catching the founder's story's mistakes at generation time instead of discovering them in an incident five months later. Verify the agent actually engages with all five rather than giving a generic "looks fine" without addressing each one specifically.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The five-question audit, for any new or existing table:
+
+1. Does a jsonb/array column get appended to by more than one request? → single-cell risk (M7.6)
+2. Will current query patterns hold at 100x the row count? → index risk (M6.1)
+3. Does every `*_id` column have a real `REFERENCES`? → orphan risk
+4. Does any column hold file bytes instead of queryable data? → storage risk (M6.6)
+5. Is a generic type/payload table actually several different things in disguise? → scaling-by-type risk
+
+Before accepting any agent-generated schema:
+
+- Have you asked it to justify each of the five questions explicitly, rather than just reviewing the result?
+- For any foreign key you're about to add retroactively, have you checked for existing orphaned rows first?
+- For any generic table, is there a plan for promoting high-volume event types to their own table once they earn it?
+
+What good looks like: every new table is checked against the five questions before it has real traffic, not discovered to be missing one of them during an incident months later — which is how three of this module's other lessons' stories all began.
+
+Red flags: "we'll add indexes/foreign keys later if we need them" as the plan; a generic events table whose busiest event type has never been given its own index or table; an agent-generated schema accepted without anyone asking it the five questions.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l08"
+  questions={[
+    {
+      q: "Why are the five anti-patterns in this lesson described as \"unfinished\" rather than \"wrong\"?",
+      options: [
+        "They are always eventually corrected by the ORM automatically",
+        "Each is a locally reasonable shortcut for shipping a feature fast, and only becomes a real problem once the table has real rows and real concurrent writers — the mistake is not revisiting the decision as the product grows",
+        "They are only wrong on certain database engines",
+        "They are intentional trade-offs that never need fixing"
+      ],
+      answer: 1,
+      explain: "The founder's story makes this explicit: every individual decision was locally reasonable for shipping fast. An agent asked to build a feature in one request has no way to know the table will hold 400,000 rows in five months."
+    },
+    {
+      q: "Why doesn't skipping a foreign key just mean \"one less constraint to worry about\"?",
+      options: [
+        "Foreign keys only matter for performance, not correctness",
+        "It doesn't remove the requirement that the column point somewhere real — it moves enforcement from 'guaranteed by the database' to 'hoped for by every future piece of code that touches this table,' including migrations and manual fixes",
+        "Missing foreign keys are automatically detected and fixed by Postgres",
+        "Foreign keys are optional in Postgres but required in other databases"
+      ],
+      answer: 1,
+      explain: "A foreign key protects against every writer — your API, a backfill, an agent's generated code, a 2am manual fix — not just the one code path you were thinking about when you skipped it."
+    },
+    {
+      q: "In the break-fix, why wasn't a plain index on `type` enough to make the security audit query fast?",
+      options: [
+        "The index was built incorrectly",
+        "It narrowed 40 million rows to 612,000 matching that one event type, but the second filter (a jsonb field extraction with no index) still had to scan all 612,000 of those rows",
+        "jsonb columns cannot be indexed at all",
+        "The query needed a full table rewrite to benefit from any index"
+      ],
+      answer: 1,
+      explain: "A real improvement (11s to 2s) that wasn't sufficient — the composite/expression index matching the EXACT query shape, or promoting the event type to its own table, were the fixes that actually solved it."
+    },
+    {
+      q: "What's the durable fix for a frequently-queried event type living inside a generic events table, beyond just adding an index?",
+      options: [
+        "Deleting old events of that type to keep the table small",
+        "Giving that specific event type its own table with real, indexed, foreign-keyed columns instead of a jsonb blob — while leaving the generic table for the genuinely rare, low-volume long tail",
+        "Switching the entire events table to a different database engine",
+        "Storing the event type as an enum instead of text"
+      ],
+      answer: 1,
+      explain: "The anti-pattern isn't having a generic table — it's using ONLY a generic table for everything, including types that have earned their own shape through volume or query frequency."
+    },
+    {
+      q: "What does the five-question schema audit actually check for?",
+      options: [
+        "Whether a schema follows third normal form strictly",
+        "Jsonb columns appended to by multiple writers, missing indexes relative to likely scale, missing foreign keys, files stored in columns, and generic tables secretly serving several distinct purposes — the five anti-patterns this lesson covers",
+        "Whether every table has a created_at and updated_at column",
+        "Whether column names follow a consistent naming convention"
+      ],
+      answer: 1,
+      explain: "It's designed to be run against any schema — yours, or one an agent just generated — in one pass, before the table has real traffic, catching the exact mistakes that took five months to surface in the founder's story."
+    }
+  ]}
+/>
+
+</Section>

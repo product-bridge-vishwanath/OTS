@@ -1,0 +1,300 @@
+---
+id: m06-l06
+module: M6
+title: "Object storage: buckets, signed URLs, and the egress bill nobody expects"
+order: 6
+difficulty: 2
+depth: both
+platforms: [s3, r2, cloudflare, supabase, vercel]
+concepts: [object-storage]
+prerequisites: [m01-l01]
+lab: self
+scenario_ids: [sc-public-bucket-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder's app let users upload profile photos. The upload endpoint received the file, and — because it was the obvious thing to do with the tools he had — wrote the image bytes into a `bytea` column in Postgres, next to the user's other data. It worked. It shipped. For eight months, nobody noticed anything wrong.
+
+Then his database backup, which used to take four minutes, started taking fifty. His database bill, flat for months, tripled in a quarter with no increase in users. His "list all users" query — a page used constantly by the admin dashboard — started timing out, because it was reading and discarding megabytes of image data on every row just to display a name and an email.
+
+He eventually moved the photos to S3. The migration took an afternoon. The fix wasn't clever — it was recognizing that a database and a file store solve different problems, and he'd been asking the wrong one to do both jobs for eight months because nobody had told him there was a second tool.
+
+</Section>
+
+<Section kind="already-did">
+
+You've uploaded a file to an app and had it "just work," without knowing whether it landed in a database, a server's local disk, or something else entirely. If you've deployed to a platform that wiped your uploads on the next deploy — a real, common surprise — you've already met the reason object storage exists: **a server's local filesystem is not durable storage**, especially not on a platform that replaces the server on every deploy (M1.1's shape distinction, applied to files instead of connections).
+
+</Section>
+
+<Section kind="mental-model">
+
+### What object storage actually is
+
+Not a filesystem, not a database — a flat space of **keys and values**, where the value is a blob of bytes (a file) and the key is a string path like `avatars/user-8812.jpg`. You `PUT` a key, you `GET` a key, there's no "directory" in any real sense (the slashes in keys are cosmetic, not a folder structure the storage engine enforces), and there's no querying *inside* a file the way SQL queries inside a row.
+
+<Callout type="key">
+**The test for whether something belongs in object storage rather than a database column:** is it a blob of bytes you serve whole, rather than data you query, filter, or join? A photo, a PDF, a video, a CSV export — object storage. A user's name, a product's price, anything you'll `WHERE` on — the database. Storing a file *in* the database (as the founder's story did) works until the file volume grows, and then it costs you in backup time, query performance, and bill size, all three at once.
+</Callout>
+
+### Public vs. private, and why "private" needs a signed URL
+
+A bucket (or a key within it) is either world-readable or it isn't. Public is right for things anyone should see without permission — a product image on a storefront. Private is right for anything tied to one user's access — an invoice, a document, a video only paying subscribers should reach.
+
+Private storage can't just hand out a permanent URL, because that URL would itself become the access control (anyone who gets the link gets the file, forever). The fix is a **signed URL** — a time-limited, cryptographically-stamped link your server generates on demand:
+
+```ts
+// Generate a URL valid for 5 minutes, scoped to one object, one action (read).
+const url = await getSignedUrl(s3Client, new GetObjectCommand({
+  Bucket: "invoices", Key: `user-${userId}/invoice-2026-11.pdf`,
+}), { expiresIn: 300 });
+```
+
+The file itself stays private in the bucket forever; the URL is the temporary exception, and it expires on its own — no code has to remember to revoke it.
+
+### Egress: the bill that surprises people
+
+<svg viewBox="0 0 780 200" role="img" aria-label="Storage cost is nearly flat regardless of how often a file is downloaded, but egress cost scales with every download, which is where object storage bills actually grow" className="diagram">
+  <text x="12" y="20" className="sub">STORING a file: cost barely moves whether it's downloaded 0 or 100,000 times</text>
+  <rect x="8" y="30" width="700" height="34" rx="6" />
+  <text x="358" y="52" textAnchor="middle" className="sub">1 GB stored — roughly the same cost, every month, regardless of access</text>
+
+  <text x="12" y="104" className="sub">SERVING a file (egress): cost scales with every single download</text>
+  <rect x="8" y="114" width="80" height="30" rx="4" />
+  <rect x="96" y="114" width="80" height="30" rx="4" />
+  <rect x="184" y="114" width="80" height="30" rx="4" />
+  <rect x="272" y="114" width="80" height="30" rx="4" />
+  <text x="380" y="134" className="sub">… × every download, forever</text>
+  <text x="12" y="176" className="sub">A popular 5MB video downloaded 100,000 times is 500GB of egress — the bill most teams never saw coming.</text>
+</svg>
+
+Storing a gigabyte costs roughly the same whether it's downloaded zero times or a million. **Egress — data leaving the bucket to a user's browser — is billed per byte transferred, and it's the line item that turns a quiet $4/month bucket into a four-figure surprise** if something you store becomes popular, gets hotlinked, or is accidentally made public and scraped at scale. This is exactly why D14 (CDN/WAF) and D9 (file storage) treat egress pricing as a first-class comparison criterion between providers — some (notably Cloudflare R2) charge zero egress specifically to compete on this exact bill.
+
+### CDN in front: for speed, and as an egress shield
+
+Putting a CDN (M5.5) in front of a bucket does two jobs at once: it serves files from a location near the user (faster), and it absorbs repeat requests for the same popular file at the edge — so the *origin bucket* sees far less egress traffic, because the CDN is answering most requests from its own cache instead of fetching from the bucket every time.
+
+<Operator>
+
+The demo app has no object storage wired up — this is a reference lesson, grounded in what's documented rather than something to run against the live stack. Use this to reason about your own product's files.
+
+```bash
+# ── Find every place your app currently stores a file wrong ──────────
+grep -rnE "bytea|BLOB|LargeObject" --include="*.sql" --include="*.ts" . 2>/dev/null
+#   Any hit is a candidate for the founder's story — a file living in
+#   a database column instead of object storage.
+
+# ── Estimate your actual egress exposure ──────────────────────────────
+#   (conceptual arithmetic, worth doing on a real product's numbers)
+#   average file size × downloads per month = monthly egress volume
+#   check that number against your provider's per-GB egress price,
+#   not against the storage price — they are usually very different.
+
+# ── A signed URL, conceptually (AWS SDK v3 shape) ─────────────────────
+#   npm i @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+#   const url = await getSignedUrl(client, new GetObjectCommand({
+#     Bucket: "my-bucket", Key: "private/file.pdf",
+#   }), { expiresIn: 300 });
+#   The expiry is the whole security model for that one link — choose
+#   it deliberately: long enough to be usable, short enough that a
+#   leaked link (in a referrer header, a browser history, a screenshot)
+#   stops working soon.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Option | Note |
+|---|---|---|
+| General object storage | **AWS S3** | The ecosystem default; egress is billed |
+| Zero-egress alternative | **Cloudflare R2** | S3-compatible API, no egress fee — the direct answer to this lesson's bill surprise |
+| Platform-native, simple | **Vercel Blob, Supabase Storage** | Less setup, often pricier at real scale |
+| CDN in front | Cloudflare, CloudFront, Fastly | Caches at the edge, shields origin egress |
+| Image-specific transforms | Cloudinary, imgix, or a CDN's built-in resize | Resizing/format conversion on the fly, not stored per-variant |
+
+D9 in the decision library covers the full storage-provider comparison including concrete egress pricing; D14 covers CDN choice. The decision worth making explicitly before writing any upload code: **where do files live, who can read them, and for how long does a link work** — three answers, written down, not improvised per-endpoint.
+
+What good looks like: no file content lives in a database column; every private file is served through a short-lived signed URL, never a permanent public link; and egress cost is a number someone has actually calculated against real or projected traffic, not assumed to be negligible.
+
+</Section>
+
+<Section kind="hands-on">
+
+Without live object storage in the demo stack, this is a design exercise against your own product (or a realistic plan for the demo app, if you don't yet have one).
+
+1. **Audit for the founder's mistake.** Does anything in your product store file bytes in a database column? If so, estimate: how much has that table grown, and what does it cost your backup time and query performance (M6.1, M6.4) right now?
+
+2. **Classify every file type your product handles** — user uploads, generated reports, static assets — as public or private, and write down who should be able to read each one.
+
+3. **Design the signed-URL flow** for one private file type: what generates the URL, how long is it valid, and what happens if someone tries to reuse it after expiry (it should simply fail — verify that's actually true for whichever provider you'd use).
+
+4. **Do the egress arithmetic** for your actual or projected traffic: average file size × expected downloads/month, compared against your chosen provider's per-GB egress price. Is it negligible, or is it a line item that deserves attention before launch rather than after the first bill?
+
+5. **Decide, in writing**, whether a CDN sits in front of your bucket, and why — for speed, for egress reduction, or both.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A company's S3 bill jumped from $12/month to $4,100 in one billing cycle. Nothing about their upload feature changed. Support has received zero new complaints.
+
+<Evidence title="the billing breakdown">
+
+```text
+S3 Storage:  $12.40    (unchanged from last month)
+S3 Data Transfer OUT:  $4,089.60    (last month: $3.10)
+
+Transfer volume this month: 81.2 TB
+Top requested object: product-images/hero-banner-4k.png (18MB)
+  Requests for this object: 4,511,203
+```
+
+</Evidence>
+
+<Evidence title="the bucket's access logs">
+
+```text
+Top 5 referrer domains for this object:
+  (none/direct)           3,890,112
+  totally-unrelated.io      412,088
+  image-aggregator.net      201,004
+  myapp.com                   7,999   ← the ACTUAL site
+```
+
+</Evidence>
+
+<Evidence title="bucket configuration">
+
+```text
+Bucket policy: public-read (set at creation, 8 months ago, never revisited)
+CDN in front: none — the bucket URL is linked directly in the app's HTML
+CORS: * (any origin allowed)
+```
+
+</Evidence>
+
+4.5 million requests for one hero image, almost none from the actual site. What happened, and what's the fix?
+
+<Reveal label="Reveal the cause">
+
+**The bucket is public with no CDN in front and no access restriction, so the single highest-traffic image got hotlinked by other sites, and every one of their visitors' browsers downloaded the full 18MB file directly from this company's bucket, billed as egress.**
+
+**The mechanism.** `image-aggregator.net` and `totally-unrelated.io` are serving pages that `<img src>` directly to this company's S3 URL — "hotlinking," which costs the hotlinker nothing and costs the *origin* every byte of transfer. With no CDN absorbing repeat requests at the edge and no referrer restriction on the bucket, every single one of those 4.5 million requests went straight to S3 and was billed in full, at 18MB each — that arithmetic alone is roughly 81TB, matching the bill exactly.
+
+**Why this specific object:** an 18MB "4k hero banner" is an unusually large asset to serve raw and unoptimized in the first place — this is also, separately, a performance problem (M9.8) independent of who's requesting it. Large + publicly linkable + no CDN is close to the worst combination for egress risk.
+
+**The fix, layered:**
+
+1. **Put a CDN in front of the bucket immediately.** This alone solves most of the bill: repeat requests for the same object get served from edge cache, and the *bucket's* egress drops to roughly the CDN's cache-miss rate instead of every single visitor.
+2. **Add a referrer or signed-URL restriction** so the asset only serves to requests originating from `myapp.com` (if there's no legitimate reason for other sites to embed it) — most CDN and storage providers support this directly.
+3. **Compress and resize the image properly.** An 18MB hero banner should likely be served as a few hundred KB in an efficient format (WebP/AVIF) with responsive sizing — fixing this caps the *damage per request* even if some hotlinking persists.
+4. **Set a billing alert** on data transfer specifically, not just total spend — a transfer spike is the leading indicator (M8.4's saturation signal, applied to a cloud bill instead of a server resource) that would have caught this on day two instead of at the end of the billing cycle.
+
+**The transferable lesson:** a public bucket is public to *everyone's* pages, not just your own — and object storage egress is priced per byte with no natural ceiling, so a single popular asset with no CDN and no access restriction can turn into the single largest line item on your infrastructure bill, driven entirely by traffic you never asked for and didn't benefit from.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit this codebase for file storage: does anything store file bytes (images, PDFs, uploads) directly in a database column (bytea, BLOB, or similar)? For each, estimate the current impact on backup size and query performance, and show me the migration to move it to object storage with signed URLs for anything that should be private."}>
+Verify the backup-size estimate against something concrete if you can (M6.4's pg_dump timing) — "it's probably fine" undersells a problem that compounds silently for months, exactly as in the story. Check the migration plan includes BOTH writing new uploads to the new location AND migrating existing rows — a plan that only handles new files leaves the old problem sitting in the database indefinitely.
+</AgentTask>
+
+<AgentTask prompt={"For this file type [describe it — user avatars, generated PDF reports, etc.], tell me whether it should be public or private, and if private, design the signed URL flow: who requests it, how long should the URL be valid, and what should happen if someone tries to reuse an expired link. Then estimate monthly egress cost at [realistic traffic number] and flag if it's a meaningful bill item."}>
+The egress estimate is the part people skip and the part this lesson is about. Make it show the arithmetic (size × downloads × provider's per-GB price), not just a qualitative "should be fine" — and compare at least two providers' egress pricing (e.g., S3 vs R2) since the difference is often the entire point of the choice.
+</AgentTask>
+
+<AgentTask prompt={"Review our bucket/object storage configuration: is anything public that doesn't need to be, is there a CDN in front of publicly-served assets, and is there any referrer or access restriction on objects that shouldn't be freely hotlinkable from other sites? Flag the single largest or most-requested object as the highest-risk target."}>
+This is the audit that would have caught the break-fix before the bill arrived. Check it actually inspects access logs or request patterns if available, not just the bucket policy — a technically-private bucket can still have individual objects made public by mistake.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For any file your product handles:
+
+- Does it belong in object storage (served whole) or a database (queried, filtered, joined)?
+- Is it public or private, and is that the deliberate choice rather than the default?
+- If private, does access go through a signed, time-limited URL — never a permanent link?
+- Is there a CDN in front of anything served frequently or publicly?
+- Have you calculated egress cost against real or projected traffic, using the provider's actual per-GB price?
+- Is there a billing alert on data transfer specifically?
+
+What good looks like: no file bytes live in a database column; every private asset is reached through a signed URL with a deliberate expiry; a CDN sits in front of anything public and popular; and the egress number has been calculated, not assumed.
+
+Red flags: images or PDFs stored as `bytea`/BLOB in a database; a public bucket with no CDN and no referrer restriction; a storage bill that surprises anyone; a signed URL with no expiry or an expiry nobody chose on purpose.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l06"
+  questions={[
+    {
+      q: "Why did storing profile photos in a Postgres bytea column become a problem only after eight months, not immediately?",
+      options: [
+        "Postgres has a hard size limit on bytea that was eventually hit",
+        "The cost compounds gradually with volume — backup time, query performance on unrelated columns, and database bill size all grow with stored file bytes, invisibly until the accumulated weight becomes noticeable",
+        "The images were corrupting other rows in the table",
+        "Postgres automatically deletes bytea data after a retention period"
+      ],
+      answer: 1,
+      explain: "A database and a file store solve different problems. The database can technically hold file bytes, but every unrelated query on that table now pays a cost proportional to file size — which is invisible until the files get big or numerous enough to notice."
+    },
+    {
+      q: "Why can't a private file in object storage simply be served via a permanent public URL?",
+      options: [
+        "Object storage doesn't support permanent URLs at all",
+        "A permanent URL IS the access control — anyone who obtains that link has unlimited access forever, with no way to revoke it short of changing the key or deleting the object",
+        "Permanent URLs are more expensive to generate than signed ones",
+        "Browsers cache permanent URLs indefinitely, causing staleness"
+      ],
+      answer: 1,
+      explain: "A signed URL's expiry is the entire point: it's a time-limited exception to privacy that revokes itself automatically, rather than depending on code remembering to revoke access later."
+    },
+    {
+      q: "Why is egress pricing, not storage pricing, usually where an object storage bill surprises people?",
+      options: [
+        "Storage is always free on managed platforms",
+        "Storing a file costs roughly the same regardless of download count, but egress bills per byte transferred on EVERY download — a popular or hotlinked file multiplies cost by its request volume with no natural ceiling",
+        "Egress is billed at a flat monthly rate regardless of volume",
+        "Storage costs scale exponentially with file count"
+      ],
+      answer: 1,
+      explain: "The break-fix's $4,089 transfer bill against a flat $12 storage cost makes this concrete: 4.5 million requests for one 18MB file, almost all from other sites hotlinking it, with no CDN absorbing the repeat traffic at the edge."
+    },
+    {
+      q: "In the break-fix, why did a CDN in front of the bucket become the primary fix rather than just making the bucket private?",
+      options: [
+        "A CDN automatically blocks all hotlinking by design",
+        "A CDN absorbs repeat requests for the same popular object at the edge, so the origin bucket's egress drops to roughly the cache-miss rate instead of paying for every single visitor's download",
+        "Private buckets cannot be served to any external traffic at all",
+        "CDNs eliminate the need for signed URLs entirely"
+      ],
+      answer: 1,
+      explain: "If the image needs to stay publicly accessible (which it likely does, being a hero banner), a CDN cache is what caps the ORIGIN's cost regardless of how much total traffic the image attracts — restrictions alone would block legitimate access too."
+    },
+    {
+      q: "What's the practical test for whether data belongs in object storage versus a database column?",
+      options: [
+        "File size alone — anything over 1MB belongs in object storage",
+        "Whether it's a blob of bytes served whole (a photo, a PDF) versus data you query, filter, or join (a name, a price, anything you'd WHERE on)",
+        "Whether the data is user-generated or system-generated",
+        "Whether the data needs to be backed up"
+      ],
+      answer: 1,
+      explain: "The founder's photos were never queried by content — they were fetched whole by key. That's the exact shape object storage is built for, and the exact shape a database column handles poorly at volume."
+    }
+  ]}
+/>
+
+</Section>

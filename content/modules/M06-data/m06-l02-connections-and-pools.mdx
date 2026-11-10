@@ -1,0 +1,334 @@
+---
+id: m06-l02
+module: M6
+title: "Connections and pools: why \"too many connections\" happens to everyone"
+order: 2
+difficulty: 2
+depth: both
+platforms: [postgres, supabase, neon, vercel, rds]
+concepts: [connection-pooling]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-pool-exhaustion-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A team moved their API from a single Render service to Vercel functions, following the shape change from M1.1. Launch day went fine. Three days later, at their highest traffic moment of the week, every request started failing with the same error from their database provider's dashboard:
+
+```text
+FATAL: remaining connection slots are reserved for non-replication superuser connections
+```
+
+Nothing in their code had changed since the migration. Nothing in their traffic was unusual — if anything, it was a *good* day, their best signup numbers yet. The problem was arithmetic they'd never done: each Vercel function invocation opened its own database connection, their database allowed 60 total, and at peak they had roughly 300 functions running simultaneously.
+
+They hadn't broken anything. They'd simply never been told that "serverless" and "a database connection per request" are two ideas that actively fight each other, and that the fight is invisible until the exact moment traffic crosses a threshold nobody had calculated in advance.
+
+</Section>
+
+<Section kind="already-did">
+
+You've set `DATABASE_URL` and had your app just work, without ever thinking about what "connecting" costs. You may have seen `POOL_MAX` or `max: 10` somewhere in a database client's setup code and left it at whatever an agent suggested, without knowing what number would have been right for your situation — or what happens when it's wrong in either direction.
+
+If you worked through M7.4 or M7.9, you've already seen one face of this: a backfill script competing with the web app for connections. This lesson is about the arithmetic underneath that — what a connection actually costs, and why the answer changes completely depending on whether your app is a long-running process or a fleet of serverless functions (M1.1).
+
+</Section>
+
+<Section kind="mental-model">
+
+### A connection is not free
+
+Opening a Postgres connection means: a TCP handshake, authentication, and — this is the expensive part — **Postgres forking an entire OS process** to handle it, with its own memory (several MB, minimum). A database with `max_connections = 100` is not an arbitrary number; it's roughly what the box can afford to have forked and idle at once. Exceed it and Postgres refuses new connections outright, which is exactly the error in the story.
+
+### Long-running process vs serverless: a completely different arithmetic
+
+<svg viewBox="0 0 780 260" role="img" aria-label="A long-running process opens a handful of connections once and reuses them for thousands of requests, while serverless functions each open their own connection per invocation, multiplying by concurrency" className="diagram">
+  <text x="12" y="20" className="sub">LONG-RUNNING PROCESS — one pool, opened once, reused</text>
+  <rect x="8" y="30" width="150" height="50" rx="8" />
+  <text x="83" y="58" textAnchor="middle" className="sub">app (1 process)</text>
+  <rect x="200" y="30" width="120" height="50" rx="8" />
+  <text x="260" y="58" textAnchor="middle" className="sub">pool: 10 conns</text>
+  <path d="M 158 55 L 196 55" className="arrow" />
+  <text x="12" y="104" className="sub">10 connections serve thousands of sequential/interleaved requests. Database load: 10.</text>
+
+  <text x="12" y="150" className="sub">SERVERLESS — each invocation opens its own</text>
+  <rect x="8" y="160" width="90" height="40" rx="6" />
+  <text x="53" y="184" textAnchor="middle" className="sub">fn → 1 conn</text>
+  <rect x="112" y="160" width="90" height="40" rx="6" />
+  <text x="157" y="184" textAnchor="middle" className="sub">fn → 1 conn</text>
+  <rect x="216" y="160" width="90" height="40" rx="6" />
+  <text x="261" y="184" textAnchor="middle" className="sub">fn → 1 conn</text>
+  <rect x="320" y="160" width="130" height="40" rx="6" />
+  <text x="385" y="184" textAnchor="middle" className="sub">… × concurrency</text>
+  <text x="12" y="222" className="sub">300 simultaneous invocations = 300 connection attempts, each wanting its own.</text>
+  <text x="12" y="246" className="sub">Database load: CONCURRENCY, not a number you configured — scales with traffic, uncapped.</text>
+</svg>
+
+This is the exact mechanism from M1.1, now with the number attached: a long-running process's connection count is **the pool size you set**, period. A serverless app's connection count is **however many invocations are running right now**, which has no ceiling you control directly — it's a function of traffic.
+
+<Callout type="key">
+**The fix for serverless is never "raise `max_connections`."** Databases have real ceilings (compute, memory) and most managed providers cap it well below what traffic can demand. The fix is a **pooler** — a proxy that sits between many client connections and a small number of real database connections, handing a real connection to whichever client needs it for just long enough, then returning it to the pool. PgBouncer, Supabase's built-in pooler, RDS Proxy, Neon's pooled connection string.
+</Callout>
+
+### What a pooler actually does, and the trade-off it makes
+
+A pooler in **transaction mode** gives a client a real connection only for the duration of one transaction, then takes it back — so 500 serverless functions can share, say, 20 real database connections, because each only needs one for milliseconds at a time.
+
+The cost: **session-level features stop working across requests.** Advisory locks (M7.8), prepared statements that persist, `SET` statements meant to apply to later queries — all of these assume you keep the *same* connection, and a transaction-mode pooler doesn't promise that. This is why the demo app's `pg_try_advisory_lock` pattern from M7.8 needs a direct (unpooled) connection to work correctly — know which connection string you're using for which purpose.
+
+### Diagnosing connection problems, and the one thing most people get wrong
+
+<Callout type="warn">
+**An existing pool's open connections keep working during exhaustion — only NEW connection attempts fail.** This is the detail that confuses almost everyone the first time, and it's real: an app that already holds its 10 pooled connections keeps serving requests perfectly even while the database refuses every other new connection. The failure hits whoever's *trying to connect* right now — a new deploy, a new serverless invocation, a second service starting up — not whoever's already connected.
+</Callout>
+
+That asymmetry explains a lot of "it's fine for me but broken for my coworker" reports and "why did only the new deploy fail" incidents.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── See the ceiling and what's using it ───────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "SHOW max_connections;"
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT count(*) AS total, usename, state
+    FROM pg_stat_activity GROUP BY usename, state ORDER BY total DESC;"
+
+# ── See the app's own pool size ───────────────────────────────────────
+docker compose exec -T app printenv POOL_MAX
+
+# ── Saturate the database to ~90% and watch which requests still work ─
+#   WARNING: this genuinely approaches the connection ceiling — run the
+#   full block including the wait-for-release step before moving on.
+node scripts/break/connection-hungry-backfill.js 85 1 > /tmp/bf.log 2>&1 &
+BFPID=$!
+sleep 6
+docker compose exec -T db psql -U ots -d demo -c "SELECT count(*) FROM pg_stat_activity;"
+#   Verified: ~85-90 of 100 connections held.
+
+#   The APP keeps answering — it already holds its 10 pooled connections:
+curl -s -o /dev/null -w "app (existing pool): %{http_code} %{time_total}s\n" \
+  --max-time 6 localhost:3001/api/bookings
+
+#   But a BRAND NEW connection attempt is what feels the pressure:
+docker compose exec -T db psql -U ots -d demo -c "SELECT 1;" 2>&1 | tail -2
+#   At 85-90/100 this likely still succeeds — Postgres only refuses
+#   outright once truly exhausted. Watch it get slower as it climbs.
+
+wait $BFPID 2>/dev/null
+rm -f /tmp/bf.log
+docker compose exec -T db psql -U ots -d demo -c "SELECT count(*) FROM pg_stat_activity;"
+#   Should be back near baseline once the script's connections close
+#   naturally. If anything looks stuck, see the note below.
+
+# ── If a test like this ever leaves connections stuck, recover with: ──
+#   docker compose restart db
+#   (A full exhaustion test can leave orphaned connections if the
+#    client process is killed abruptly rather than exiting cleanly —
+#    restarting the database container is the reliable recovery.)
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| See current connections | `pg_stat_activity` |
+| See the ceiling | `SHOW max_connections;` |
+| Pool in Node | `pg.Pool` (already in the demo app), `max` option |
+| Pool in front of serverless | PgBouncer, Supabase pooler, Neon pooled connection string, RDS Proxy |
+| Diagnose "too many connections" | Count by `usename`/`application_name` in `pg_stat_activity` to find who's holding them |
+| Prisma/Drizzle specific | Both document a `connection_limit` / pooled-URL setting for serverless — use it |
+
+The practical default for this program's demo stack: a long-running Node process (like the app and worker here) manages its own small pool directly. The moment you move to serverless functions (D3), a pooler stops being optional — the connection-per-invocation arithmetic above makes it mandatory past a small amount of traffic.
+
+What good looks like: you can state your database's `max_connections`, your application's pool size, and whether that arithmetic holds at 10x current traffic — before 10x traffic arrives and tells you the hard way.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Find the two numbers.** `SHOW max_connections` and the app's `POOL_MAX`. Also check the worker's — it has its own separate pool (`max: 3` in `worker/cron.js`).
+
+2. **Compute the ceiling.** If this were serverless instead of a long-running process, and each invocation opened one connection, how many simultaneous invocations would exhaust `max_connections`? Compare that number to a traffic spike you'd consider realistic.
+
+3. **Run the saturation drill** from the Operator block. Confirm the asymmetry: the app (already connected) keeps answering while new connection attempts slow down or fail.
+
+4. **Recover and verify.** After the script finishes (or if you need to, `docker compose restart db`), confirm `pg_stat_activity` returns to baseline and `bookings` still has 3 rows.
+
+5. **Read the worker's pool size** in `worker/cron.js` and explain why it's smaller than the app's — what is it protecting, and from what (M7.9's backfill brakes apply here too).
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team's error tracker shows a new, intermittent error appearing only in the ten minutes after every deploy: `Error: timeout expired getting a connection from the pool`. It never happens otherwise. Deploys happen 3–4 times a day.
+
+<Evidence title="the deploy process">
+
+```text
+Platform: Render, rolling deploy
+  - New instance starts, passes health check, receives traffic
+  - Old instance is given 30s to finish in-flight requests, then killed
+  - For ~10-20s, OLD and NEW instances are both running and both connected
+
+App pool config: max: 15 per instance
+Database: max_connections = 40 (smallest paid tier)
+Normal running instances: 2 (steady state, 2 × 15 = 30 possible, well under 40)
+```
+
+</Evidence>
+
+<Evidence title="connections during a deploy window">
+
+```text
+$ SELECT application_name, count(*) FROM pg_stat_activity GROUP BY 1;
+ application_name | count
+-------------------+-------
+ web-old-abc123    |    14
+ web-new-def456    |    13
+ web-old-xyz789     |   12     ← a THIRD instance, from the previous deploy
+ (other)           |    3
+```
+
+</Evidence>
+
+A third, apparently old instance is still connected. What's actually happening, and why only during deploys?
+
+<Reveal label="Reveal the cause">
+
+**Old instances are not releasing their connections promptly when killed, so successive deploys accumulate connection pressure that only clears once Postgres notices the dead TCP sockets — which can take longer than the next deploy.**
+
+**The arithmetic that should work, and why it doesn't:** 2 steady-state instances × 15 = 30, comfortably under 40. During a rolling deploy, briefly 2 instances × 15 = 30 **plus** whatever the outgoing instance still holds — the platform's design assumes the old instance's pool connections close within its 30-second grace period. The evidence shows a connection from `web-old-xyz789`, which is from a **previous** deploy, not the current one — its connections outlived the grace period and weren't cleaned up, possibly because in-flight requests were themselves waiting on slow queries when the process was killed, or because the pool library didn't catch the termination signal cleanly (M1.6's graceful-shutdown problem, here applied to a connection pool instead of the whole process).
+
+**Each deploy adds pressure without fully releasing the last deploy's pressure**, so three or four deploys in a day compound: 30 (steady) + 14 (stuck from deploy 1) + 13 (stuck from deploy 2) can exceed 40 well before any individual deploy looks unreasonable on its own.
+
+**The fix, in order:**
+1. **Add explicit pool shutdown on SIGTERM**, so the outgoing instance actively closes its connections rather than hoping the OS notices:
+   ```ts
+   process.on("SIGTERM", async () => {
+     await pool.end();     // close all pooled connections cleanly
+     process.exit(0);
+   });
+   ```
+2. **Lower `idle_in_transaction_session_timeout` and set `tcp_keepalives` more aggressively** on the database side, so Postgres itself reclaims dead connections faster rather than waiting on a default OS-level TCP timeout that can be minutes.
+3. **Put a pooler in front of the database** (PgBouncer in transaction mode) so the real connection count the database sees is small and stable regardless of how many application instances briefly overlap during a deploy — this is the structural fix, and the one that also protects against the serverless version of this same arithmetic problem.
+4. **Alert on connection count trending upward across consecutive deploys**, not just on an absolute threshold — the compounding pattern is the signature, and a single-deploy snapshot wouldn't show it.
+
+**The transferable lesson:** connection pressure from a deploy isn't an instant event — it can be a slow leak across several deploys that only manifests as a threshold crossing days later, which makes "nothing changed today" a true and useless statement during the postmortem. The actual change was three deploys ago.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Given this hosting setup — [describe: platform, instance count, scaling behavior] — and this database's max_connections, calculate the worst-case simultaneous connection demand, including during deploys or autoscaling events. Tell me the safety margin and whether a pooler is structurally necessary or just nice-to-have at current traffic."}>
+Make it show the arithmetic explicitly — instances × pool size, plus any overlap window during deploys or scale-up. If the margin is under 30-40%, a pooler isn't optional; verify its recommendation against your actual provider's documented connection limits, which vary a lot by tier.
+</AgentTask>
+
+<AgentTask prompt={"Add graceful pool shutdown to this app: on SIGTERM, stop accepting new requests, finish in-flight ones with a timeout, then explicitly close the database pool before exiting. Show me how to verify the pool actually closes its connections rather than relying on the OS to notice a dead process."}>
+Verify by watching `pg_stat_activity` from another session while you send SIGTERM — the connections for that process should disappear within the timeout, not linger. This is the fix for the deploy-accumulation break-fix, and it needs to actually be tested, not just written.
+</AgentTask>
+
+<AgentTask prompt={"Is this database connection string pooled (transaction-mode) or direct? If I switch my serverless functions to use it, what session-level features — advisory locks, prepared statements, SET-scoped settings — would silently stop working across requests, and where in this codebase do I rely on any of them?"}>
+The advisory-lock dependency is the one most likely to bite (M7.8's cron lock, if the job ever moves to a serverless function). Check it actually searched the codebase for `pg_advisory_lock` and `SET` usage rather than giving a generic answer.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Know, for your actual product:
+
+- Your database's `max_connections`.
+- Your application's pool size, per instance/function.
+- Whether your compute is long-running (pool size = your number) or serverless (connection count = concurrency, uncapped by you).
+- Whether a pooler sits between your app and the database, and in what mode.
+- What happens to open connections when an instance is killed or redeployed.
+
+When diagnosing a connection error:
+
+- Remember: already-open connections keep working; only NEW attempts fail during exhaustion.
+- Check `pg_stat_activity` grouped by `application_name` or `usename` to find who's holding connections.
+- Check whether the pressure is from one event or compounding across several (deploys, backfills, autoscaling).
+
+What good looks like: the connection arithmetic is written down somewhere, checked against your worst realistic traffic spike, and a pooler is in place before serverless or high concurrency makes it mandatory rather than optional.
+
+Red flags: "just raise max_connections" as the first response; no graceful pool shutdown on deploy; connection count never monitored as its own metric.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l02"
+  questions={[
+    {
+      q: "Why does serverless hosting fundamentally change the connection-count arithmetic compared to a long-running process?",
+      options: [
+        "Serverless functions use a different database protocol",
+        "A long-running process's connection count is the pool size you configured; a serverless app's connection count is however many invocations are running right now — a function of traffic, not a number you set",
+        "Serverless platforms don't support connection pooling at all",
+        "Serverless functions require twice as many connections per request"
+      ],
+      answer: 1,
+      explain: "This is the exact mechanism from M1.1's shape distinction, with the number attached. 300 simultaneous invocations means 300 connection attempts — uncapped by anything you configured."
+    },
+    {
+      q: "During a connection exhaustion event, why do some requests keep succeeding while others fail?",
+      options: [
+        "Postgres load-balances requests randomly during exhaustion",
+        "An app that already holds its pooled connections keeps serving requests fine — only NEW connection attempts (a new deploy, a new invocation) hit the refusal",
+        "Read requests always succeed while writes fail during exhaustion",
+        "Requests from authenticated users are prioritized"
+      ],
+      answer: 1,
+      explain: "This asymmetry explains 'it's fine for me but broken for my coworker' — existing connections aren't affected; the failure hits whoever's trying to connect right now."
+    },
+    {
+      q: "What's the structural fix for serverless connection exhaustion, and why isn't raising max_connections the answer?",
+      options: [
+        "Switch to a different database engine with unlimited connections",
+        "A connection pooler in transaction mode shares a small number of real connections across many clients; databases have real ceilings most providers cap well below what traffic can demand",
+        "Reduce the number of serverless function instances manually",
+        "Increase the function timeout so connections last longer"
+      ],
+      answer: 1,
+      explain: "Each real Postgres connection forks an OS process with several MB of memory — a hard ceiling, not an arbitrary setting. A pooler multiplexes many client connections onto few real ones."
+    },
+    {
+      q: "What's the trade-off of a transaction-mode pooler?",
+      options: [
+        "Queries run slightly slower due to the extra network hop",
+        "Session-level features — advisory locks, persisted prepared statements, SET-scoped settings — stop working across requests, because the pooler doesn't guarantee the same real connection between calls",
+        "It only works with a single database at a time",
+        "It requires all queries to be wrapped in explicit transactions"
+      ],
+      answer: 1,
+      explain: "This is why the demo app's pg_try_advisory_lock pattern (M7.8) needs a direct connection — a transaction-mode pooler can hand the unlock call to a different real connection entirely, breaking the lock's semantics."
+    },
+    {
+      q: "In the break-fix, why did a connection problem only appear during deploys, and why did it eventually appear even on deploys that \"should\" have fit the math?",
+      options: [
+        "The deploy process itself consumes extra connections for health checks",
+        "Old instances weren't closing their pool connections on shutdown, so pressure from one deploy could linger into the next — several deploys compounding is what finally crossed the threshold, not any single one",
+        "The database automatically doubled its connection limit during deploys",
+        "Health checks were opening connections that were never closed"
+      ],
+      answer: 1,
+      explain: "Explicit pool shutdown on SIGTERM is the fix. Without it, the failure mode is a slow accumulation across deploys, which is why 'nothing changed today' can be true and still miss the actual cause."
+    }
+  ]}
+/>
+
+</Section>

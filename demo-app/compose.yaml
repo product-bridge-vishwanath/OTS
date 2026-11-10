@@ -4,6 +4,10 @@
 services:
   db:
     image: postgres:16-alpine
+    # pg_stat_statements is loaded here (not just CREATE EXTENSION'd) so the
+    # M6/M8 lessons' "which query is actually slow" drills work out of the box.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements",
+              "-c", "pg_stat_statements.track=all"]
     environment:
       POSTGRES_USER: ots
       POSTGRES_PASSWORD: ots

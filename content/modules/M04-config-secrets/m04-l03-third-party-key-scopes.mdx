@@ -1,0 +1,266 @@
+---
+id: m04-l03
+module: M4
+title: "Third-party keys: scopes, restrictions, and one key per environment"
+order: 3
+difficulty: 2
+depth: both
+platforms: [anthropic, openai, aws]
+concepts: [secrets, key-rotation, least-privilege]
+prerequisites: [m04-l01]
+lab: demo-repo
+scenario_ids: [sc-key-scope-01]
+estimated_minutes: 25
+---
+
+<Section kind="story">
+
+Two founders leaked an API key the same week, both into public repos, both caught by the same automated scraper within the hour.
+
+The first had generated a single Stripe key on day one — full account access, no restrictions, used identically in development and production because "it was simpler." The scraper used it to query the account's full customer list and attempt a batch of fraudulent payouts before Stripe's own anomaly detection froze the account six hours later.
+
+The second had, almost by accident, followed their platform's default advice: a **restricted** key scoped to read-only access on a single resource type, issued separately for development. The same scraper found it, tried the same tricks, and got permission-denied on every one. The founder rotated it the next morning after a routine audit, mildly annoyed. No incident, no freeze, no customer impact.
+
+Same mistake — pasting a key into a public commit. The blast radius was decided weeks earlier, by a decision neither founder remembers consciously making: how much that key was allowed to do.
+
+</Section>
+
+<Section kind="already-did">
+
+You've generated an API key from a provider's dashboard — Stripe, Anthropic, OpenAI, a maps API, a mail provider — and almost certainly accepted whatever permissions the default option offered, because the form was in your way and the feature was the point. If you've ever used the *same* key in `.env` locally and in the production dashboard, you've already made the "one key, several environments" choice, probably without a second thought.
+
+</Section>
+
+<Section kind="mental-model">
+
+L4.1 and L4.2 treated "the key" as one thing to rotate. A key actually has three independent properties, and most leaks are made worse by getting the first two wrong before the leak ever happens:
+
+1. **Scope** — what the key is *allowed to do*: read-only vs read-write, a single resource type vs the whole account, one action vs every action the API exposes.
+2. **Restriction** — *where* the key is allowed to be used from: an HTTP referrer/domain allowlist, an IP allowlist, a project or app binding.
+3. **Environment** — *which* deployment it belongs to: a distinct key per development/staging/production, so a leak in one can't touch the others.
+
+<svg viewBox="0 0 780 240" role="img" aria-label="A key matrix: environment on one axis, scope on the other. An unrestricted, full-access, shared-across-environments key has one giant blast radius; a scoped, restricted, per-environment key has a narrow one." className="diagram">
+  <text x="12" y="20" className="sub">ONE UNRESTRICTED KEY, SHARED ACROSS EVERYTHING</text>
+  <rect x="8" y="30" width="764" height="60" rx="10" />
+  <text x="28" y="56" className="sub">dev laptop · staging · production  — all using the SAME key, full read+write, no domain/IP limit</text>
+  <text x="28" y="78" className="sub">One leak = everything the account can do, from anywhere, in every environment. Blast radius: the whole account.</text>
+
+  <text x="12" y="118" className="sub">SCOPED, RESTRICTED, PER-ENVIRONMENT</text>
+  <rect x="8" y="128" width="244" height="96" rx="10" />
+  <text x="130" y="150" textAnchor="middle" className="sub">dev key</text>
+  <text x="130" y="170" textAnchor="middle" className="sub">read-only, test mode</text>
+  <text x="130" y="190" textAnchor="middle" className="sub">no production data</text>
+  <rect x="268" y="128" width="244" height="96" rx="10" />
+  <text x="390" y="150" textAnchor="middle" className="sub">staging key</text>
+  <text x="390" y="170" textAnchor="middle" className="sub">write, staging resources only</text>
+  <text x="390" y="190" textAnchor="middle" className="sub">IP-restricted to CI runners</text>
+  <rect x="528" y="128" width="244" height="96" rx="10" />
+  <text x="650" y="150" textAnchor="middle" className="sub">production key</text>
+  <text x="650" y="170" textAnchor="middle" className="sub">scoped to exactly what prod needs</text>
+  <text x="650" y="190" textAnchor="middle" className="sub">domain-restricted</text>
+  <text x="12" y="240" className="sub">One leak now costs exactly what THAT key can do, in THAT environment. Nothing else is reachable.</text>
+</svg>
+
+### Why "separate key per environment" matters even with no leak at all
+
+Beyond blast radius, a shared key across environments means you cannot tell, from the provider's own usage dashboard, whether a spend spike came from a runaway test script or real production traffic — the exact ambiguity that makes L4.4's "why the AI bill exploded" investigations slower than they need to be. Separate keys turn "which environment did this?" into a dashboard filter instead of a log-archaeology project.
+
+<Callout type="key">
+**The practical test for any key you're about to generate:** would you be comfortable if this exact key, with these exact permissions, leaked publicly tomorrow? If the honest answer is "that would be bad, but survivable," the scope is probably right. If the answer is "that would be the whole business," narrow it before you ever use it — not after it leaks.
+</Callout>
+
+</Section>
+
+<Section kind="tools">
+
+| Provider | Scoping mechanism | Restriction mechanism |
+|---|---|---|
+| Stripe | **Restricted keys** — per-resource read/write permissions, generated per use case | Can be limited to specific IP addresses on paid plans |
+| Anthropic / OpenAI | **Project-scoped API keys** — separate projects per environment, each with its own key and usage limits | Per-project spend limits (L4.4); no domain restriction on server-side keys (they're never meant to be client-exposed at all) |
+| Google Cloud / Maps | API key restrictions by **HTTP referrer**, **IP address**, or **Android/iOS app** | This is the mechanism that makes a client-exposed Maps key survivable — restrict it to your domain and a leaked key is useless elsewhere |
+| AWS | IAM policies attached to access keys/roles — scoped to specific services, actions, and resources (least privilege, M10.4) | VPC/network-level restrictions on top of IAM |
+| Generic webhooks | A **signing secret**, not an API key — verifies the webhook came from the provider; it authenticates the *message*, not a request you make | N/A — never put a webhook signing secret where an API key goes, or vice versa |
+
+**The one mechanism most teams skip:** per-environment keys. Scoping and restriction get attention because the provider's UI asks about them when you generate a key. A *second* key for staging means going back and doing the work again, which is why it's the step people skip — and it's usually the cheapest of the three to add.
+
+</Section>
+
+<Section kind="hands-on">
+
+The demo app has one external credential: `ANTHROPIC_API_KEY`, used by the front-desk assistant. It's a useful small-scale case for practicing the scoping questions even without a Stripe or Maps key to hand.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Ask the three questions about the key you actually have.** Open the Anthropic (or your own LLM provider's) console and check: Is this key scoped to a specific project, or your whole account? Does it have a spend limit of its own (L4.4)? Is it the *same* key you'd use in a production deployment, or a separate one?
+
+2. **Set up the per-environment split for real.** Create a second project in the provider's console named something like `demo-app-dev`, generate its key, and put that one — never your "main" key — in `demo-app/.env`:
+   ```bash
+   # demo-app/.env
+   ANTHROPIC_API_KEY=sk-ant-...-from-the-dev-project-only
+   ```
+   Confirm it works:
+   ```bash
+   docker compose up -d app
+   curl -s localhost:3001/api/assistant -X POST -H 'Content-Type: application/json' \
+     -d '{"question":"how many rooms are there?"}' | python3 -m json.tool
+   ```
+
+3. **Audit for scope creep in your own code.** Search for anywhere a key or token is used for more than the one thing it was issued for — a common real-world case is a single Stripe key doing both payment processing *and* being read by an analytics script, when a read-only, analytics-scoped key would do:
+   ```bash
+   grep -rn "process.env\." --include="*.ts" app/ lib/ | grep -iE "key|token|secret"
+   ```
+   For each hit: is this the narrowest key that could do this specific job?
+
+4. **Check what's actually exposed to the client**, the way M1.5 taught for `NEXT_PUBLIC_` variables — but now asking the scoping question specifically: if a client-side key (a Maps key, a publishable Stripe key) is intentionally exposed, does it have a domain/referrer restriction set? An exposed key with no restriction is usable by anyone who reads your page source, from anywhere.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A mapping feature works perfectly in the demo, and within a week the provider disables the project's Maps key for "suspicious usage patterns" — $380 in unexpected charges, almost entirely from requests the team never made.
+
+<Evidence title="the key as shipped">
+
+```text
+app/components/Map.tsx:
+  <script src={`https://maps.googleapis.com/maps/api/js?key=${process.env.NEXT_PUBLIC_MAPS_KEY}`}>
+
+Provider console → API key settings:
+  Application restrictions: None
+  API restrictions: None (key can call every enabled API on the project)
+```
+
+</Evidence>
+
+<Evidence title="usage breakdown">
+
+```text
+Requests by referrer (last 7 days):
+  myapp.com                         1,204 requests   (expected)
+  totally-unrelated-domain.ru       38,421 requests  (NOT expected)
+  (direct/no referrer)              9,900 requests
+
+Requests by API:
+  Maps JavaScript API    1,204
+  Places API             47,117   ← this app has never called Places
+```
+
+</Evidence>
+
+Explain both the volume and the *kind* of requests, and give the fix.
+
+<Reveal label="Reveal the cause">
+
+**The key was both unrestricted (usable from any domain) and unscoped (able to call any API on the project), and it was client-exposed by design — so anyone who viewed the page source could lift it and use it for whatever Google API they wanted, from wherever they wanted.**
+
+`NEXT_PUBLIC_MAPS_KEY` is meant to be visible to the browser — that part is correct; Maps keys are *designed* to run client-side, unlike a server secret such as `ANTHROPIC_API_KEY`. The mistake is treating "this key is supposed to be public" as "this key needs no restrictions." Scraping a page for an unrestricted `key=` parameter is trivial, and once lifted, a key with no application restriction works from any site, and a key with no API restriction can be pointed at any API the project has enabled — in this case, Places API, which the attacker's own site was presumably using for free on this project's billing.
+
+**The fix:**
+1. **Rotate** the key (L4.1's rule applies regardless of which kind of key it is).
+2. **Add an HTTP referrer restriction** limiting the new key to `myapp.com` (and any legitimate additional domains, e.g. a staging subdomain) — this alone makes the key useless from `totally-unrelated-domain.ru`.
+3. **Add an API restriction** limiting the key to only the Maps JavaScript API this feature actually uses. Places API usage on this key becomes impossible even if someone bypasses the referrer check through a server-side proxy.
+4. **Set a budget alert and, if the provider supports it, a hard cap** on this project specifically (L4.4) — a client-exposed key is a standing invitation to try, restrictions or not, and a spend ceiling is the backstop.
+
+**The transferable rule:** a key being *intentionally* client-visible doesn't exempt it from scoping — if anything, it raises the bar, because client-exposed means "will eventually be found" rather than "might leak." Restriction (domain/IP) and scope (which APIs, which actions) are what make an intentionally public key survive being public.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit every third-party API key and token used in this codebase. For each one, tell me: what scope/permissions it currently has versus what the code actually calls, whether it's restricted by domain/IP, and whether it's the same key used across development, staging, and production. Flag any key that's broader than what the code uses, and any key shared across environments."}>
+Cross-check the "broader than what the code uses" claims by grepping the actual API calls yourself for a sample — an agent reading provider dashboards it can't access will have to infer scope from documentation, which can be wrong for your specific account tier. Confirm the per-environment claim by actually comparing the key values (prefixes only) across your env files.
+</AgentTask>
+
+<AgentTask prompt={"This key is going to be exposed in client-side code (a browser map, a publishable payment key, etc.) by design. Tell me exactly which restrictions this provider supports (domain/referrer, IP, specific API/action scope) and configure the narrowest set that still lets the feature work. Then show me a request from an unauthorized domain that should now fail, so I can confirm it actually does."}>
+The proof step matters most here — "configured" isn't the same as "verified." Make it show you the actual failed request (a curl with a spoofed referrer, or the provider's own test tool) before you trust the restriction is live.
+</AgentTask>
+
+<AgentTask prompt={"We currently use one API key for [provider] across dev, staging, and production. Set up separate keys per environment with the narrowest scope each one needs, update the env config in each environment, and give me a rollout order that doesn't break anything mid-migration."}>
+Check the rollout order puts new keys in place and verified before the old shared key is revoked anywhere — revoking it in one environment while another still depends on it is the M4.2 rotation mistake wearing a different hat.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every third-party key before it's used anywhere:
+
+- What is its **scope** — the narrowest permission set the feature actually needs, not the default the console offered?
+- What is its **restriction** — domain/referrer, IP, or app binding, especially if the key will ever be client-visible?
+- Is it **one key per environment** — dev, staging, production each with their own, so a leak in one can't touch the others?
+- If it's a **webhook secret**, is it being used to verify incoming messages, not treated as an API key for outbound calls?
+
+The leak-survivability test: if this exact key leaked publicly tomorrow, is the worst case "a nuisance" or "the whole account"? If it's the latter, narrow it now.
+
+Red flags: a single key used in development and production; "None" under application or API restrictions for any client-exposed key; an API key doing double duty for two unrelated features; a webhook signing secret stored or used like a regular API key.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m04-l03"
+  questions={[
+    {
+      q: "What are the three independent properties of an API key that determine a leak's blast radius?",
+      options: [
+        "Length, encoding format, and expiry date",
+        "Scope (what it can do), restriction (where it can be used from), and environment (which deployment it belongs to)",
+        "The provider, the price tier, and the key's age",
+        "Whether it's stored in an env var or a secret manager"
+      ],
+      answer: 1,
+      explain: "Rotation (L4.2) and leak prevention (L4.1) matter regardless of these properties, but the properties are what decide how much damage a given leak can actually do."
+    },
+    {
+      q: "Why is a client-exposed key like a Maps key (meant to be visible in the browser) still worth restricting?",
+      options: [
+        "It isn't worth restricting since it's already public by design",
+        "Being intentionally visible means it WILL be found and used elsewhere unless a domain/referrer restriction and API scope limit what it can do from where",
+        "Restrictions prevent the key from working in the intended app",
+        "Only server-side keys can be restricted; client keys cannot"
+      ],
+      answer: 1,
+      explain: "The break-fix key was correctly client-exposed by design, but unrestricted — so it worked from any domain and could call any enabled API, which is what let it rack up Places API charges."
+    },
+    {
+      q: "What does using one shared API key across dev, staging, and production cost you, beyond a bigger blast radius if it leaks?",
+      options: [
+        "Nothing meaningful if the key has the right scope",
+        "The ability to tell from usage dashboards which environment generated a given spike — every environment's traffic is indistinguishable in the provider's own attribution",
+        "It always violates the provider's terms of service",
+        "It prevents the key from being rotated at all"
+      ],
+      answer: 1,
+      explain: "Separate keys per environment turn 'which environment caused this spend spike?' into a dashboard filter instead of a log-archaeology exercise — directly relevant to L4.4's usage investigations."
+    },
+    {
+      q: "A webhook signing secret and an API key are both 'secrets' — why shouldn't they be used interchangeably?",
+      options: [
+        "They're actually the same mechanism under different names",
+        "An API key authenticates requests YOU make outbound; a webhook signing secret verifies that an INCOMING message genuinely came from the provider — they authenticate in opposite directions",
+        "Webhook secrets expire automatically while API keys don't",
+        "Only API keys need to be rotated"
+      ],
+      answer: 1,
+      explain: "Putting a webhook signing secret where an API key goes (or vice versa) doesn't just fail to work cleanly — it reflects a misunderstanding of which direction is being authenticated."
+    },
+    {
+      q: "The lesson's 'leak-survivability test' asks what?",
+      options: [
+        "Whether the key is long enough to resist brute force",
+        "Whether, if this exact key leaked publicly tomorrow, the worst case would be a nuisance or the whole account — and to narrow scope now if it's the latter",
+        "Whether the key has been rotated in the last 90 days",
+        "Whether the provider offers a bug bounty"
+      ],
+      answer: 1,
+      explain: "It's a scoping heuristic applied before a key is ever used, not an incident-response step — the two founders in the opening story made this decision (without realizing it) weeks before either leak happened."
+    }
+  ]}
+/>
+
+</Section>

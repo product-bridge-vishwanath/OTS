@@ -1,0 +1,380 @@
+---
+id: m06-l03
+module: M6
+title: "Migrations: forward-only, and why rollback is a lie"
+order: 3
+difficulty: 3
+depth: both
+platforms: [postgres, supabase, neon, rds]
+concepts: [migrations, locks]
+prerequisites: [m07-l04, m06-l01]
+lab: demo-repo
+scenario_ids: [sc-migration-rewrite-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+A team's deploy pipeline had a migration step and a "rollback on failure" button they'd never had to use. One Thursday, they needed it.
+
+A migration added a `NOT NULL` column to their `orders` table — no default specified, because the agent that wrote it assumed the column would be backfilled "later." It wasn't later; it was immediately, because 2 million existing orders all violated the new constraint the instant the migration tried to apply it. The migration failed, loudly, which was actually the good outcome — a `NOT NULL` violation on existing data fails fast rather than corrupting anything.
+
+The bad outcome came next. Their "rollback" button reverted the **code** to the previous deploy. It did not, because it structurally cannot, undo the database. The previous code was now running against a database where the migration had *partially* applied — some DDL inside it had already committed before the failing statement, because nobody had wrapped the whole thing in a single transaction. The app was down, the database was in a state nobody had designed for, and "roll back" — the thing M2.6 and M14.2 both call the first fix — did not fix anything, because the two were no longer the same kind of operation.
+
+</Section>
+
+<Section kind="already-did">
+
+You've run `npx prisma migrate dev` or `npx drizzle-kit push` or an agent's generated SQL file and watched it apply instantly, because your table had a few hundred rows. You've probably also seen a migration tool offer a "down" migration — a script to undo the "up" one — and assumed that's what "rollback" means for a database, the same way `git revert` undoes a commit.
+
+It isn't, and the gap between those two ideas is this lesson. M7.4 already showed you that a migration can lock out your whole application; this lesson is about the half that's silent instead of loud — migrations that don't hang, don't error, and still quietly do the wrong thing or the slow thing.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Code is reversible. Data is not — not symmetrically.
+
+<Term k="rollback">Rolling back</Term> code means deploying the previous version — fast, cheap, and exactly as safe as the previous version was. Rolling back a **migration** means running code that attempts to undo a schema change on data that has, in the interim, had new rows written to it under the *new* schema. There is no symmetric inverse for "we dropped a column and users have been writing without it for twenty minutes" — the data created in that window simply doesn't fit the old shape, and no script resolves that by itself.
+
+<Callout type="key">
+**Migrations are forward-only in practice, even when your tool offers a "down" script.** The honest mental model: every migration is a one-way door. Plan the next migration to fix a mistake; don't plan to walk back through the one you just took.
+</Callout>
+
+### Three ways an `ALTER TABLE` can behave — and you cannot tell which from reading the SQL alone
+
+This is the part most teams, and most agents, get wrong by default. The exact same-*looking* statement can be instant or can lock your table for the time it takes to rewrite every row — the difference is entirely in what Postgres has to **check or compute** for every existing row.
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Three migration behaviors: instant metadata-only change, a full table scan to validate a constraint, and a full table rewrite to compute new values" className="diagram">
+  <rect x="8" y="16" width="246" height="246" rx="10" />
+  <text x="131" y="42" textAnchor="middle">INSTANT</text>
+  <text x="131" y="66" textAnchor="middle" className="sub">ADD COLUMN x</text>
+  <text x="131" y="84" textAnchor="middle" className="sub">DEFAULT &lt;constant&gt;</text>
+  <text x="131" y="112" textAnchor="middle" className="sub">metadata only —</text>
+  <text x="131" y="130" textAnchor="middle" className="sub">no row touched</text>
+  <text x="131" y="158" textAnchor="middle" className="sub">verified: 1.1ms on</text>
+  <text x="131" y="176" textAnchor="middle" className="sub">400,000 rows</text>
+  <text x="131" y="216" textAnchor="middle" className="sub">(since Postgres 11)</text>
+
+  <rect x="267" y="16" width="246" height="246" rx="10" />
+  <text x="390" y="42" textAnchor="middle">VALIDATES</text>
+  <text x="390" y="66" textAnchor="middle" className="sub">ADD COLUMN x NOT NULL</text>
+  <text x="390" y="84" textAnchor="middle" className="sub">with no default</text>
+  <text x="390" y="112" textAnchor="middle" className="sub">scans existing rows</text>
+  <text x="390" y="130" textAnchor="middle" className="sub">to check the constraint</text>
+  <text x="390" y="158" textAnchor="middle" className="sub">verified: FAILS outright</text>
+  <text x="390" y="176" textAnchor="middle" className="sub">if any row violates it</text>
+  <text x="390" y="216" textAnchor="middle" className="sub">(the GOOD failure mode)</text>
+
+  <rect x="526" y="16" width="246" height="246" rx="10" />
+  <text x="649" y="42" textAnchor="middle">REWRITES</text>
+  <text x="649" y="66" textAnchor="middle" className="sub">a TYPE change, or a</text>
+  <text x="649" y="84" textAnchor="middle" className="sub">volatile DEFAULT</text>
+  <text x="649" y="112" textAnchor="middle" className="sub">computes and writes a</text>
+  <text x="649" y="130" textAnchor="middle" className="sub">new value PER ROW</text>
+  <text x="649" y="158" textAnchor="middle" className="sub">verified: ~275ms on</text>
+  <text x="649" y="176" textAnchor="middle" className="sub">400,000 rows —</text>
+  <text x="649" y="194" textAnchor="middle" className="sub">holding ACCESS EXCLUSIVE</text>
+  <text x="649" y="212" textAnchor="middle" className="sub">the WHOLE time (M7.4)</text>
+</svg>
+
+The third column is where the story's danger actually lives at scale: 275ms on 400,000 rows is survivable; the same operation on 400 million rows is not — and it's holding the lock the whole time, which M7.4 already showed turns into a total outage via the lock queue.
+
+### The migration checklist that avoids the three traps
+
+| You want to | Safe pattern |
+|---|---|
+| Add a column | `ADD COLUMN x TYPE DEFAULT <constant>` — instant |
+| Add a required column | Add it nullable, backfill in batches (M7.9), **then** add `NOT NULL` once every row has a value |
+| Change a column's type | Add a new column, backfill, swap reads/writes to it, drop the old one — never `ALTER COLUMN ... TYPE` on a large table in one step |
+| Rename a column | Don't, in one step — add the new name, write to both, migrate reads, drop the old one. A rename that happens atomically in the database can still break a running old instance that doesn't know about it yet |
+| Add an index | `CREATE INDEX CONCURRENTLY` (M7.4, M6.1) — never a plain `CREATE INDEX` on a live table |
+| Drop a column | Deploy code that stops reading it **first**, then drop the column in a later migration — never in the same deploy |
+
+The common thread: **separate the schema change from the behavior change, with a deploy in between.** This is the "expand/contract" pattern — expand the schema to support both old and new, deploy code that uses the new shape, then contract by removing what's no longer needed. It's slower than a single-step migration and it's the only version that's actually safe on a live, growing table.
+
+### `lock_timeout` is not optional (recap from M7.4)
+
+Every migration against a table your application is actively using should set:
+
+```sql
+SET lock_timeout = '3s';
+ALTER TABLE bookings ADD COLUMN source text;
+```
+
+A migration that can't get its lock in 3 seconds fails and you retry later — rather than silently queuing behind whatever's holding the table, and queuing everything else behind *it* (M7.4's exact outage).
+
+<Operator>
+
+```bash
+cd demo-app
+docker compose exec -T db psql -U ots -d demo -f /dev/stdin < scripts/break/missing-index-growth.sql
+
+# ── Instant: a constant default, metadata only ────────────────────────
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c "ALTER TABLE bookings ADD COLUMN flag_a boolean DEFAULT false;"
+#   Verified: ~1ms, regardless of table size.
+
+# ── Fails fast: NOT NULL with no default, on a table with existing rows ─
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE bookings ADD COLUMN required_flag boolean NOT NULL;" 2>&1 | tail -2
+#   Verified: ERROR: column "required_flag" contains null values.
+#   This is the GOOD outcome — it fails loudly instead of corrupting data.
+#   The agent in the story's mistake was assuming "backfill later" without
+#   realizing the constraint is checked THIS INSTANT, against ALL rows.
+
+# ── Rewrite #1: a genuinely volatile default, computed per row ───────
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c "ALTER TABLE bookings ADD COLUMN stamped timestamptz DEFAULT clock_timestamp();"
+#   Verified: ~275ms on 400,000 rows (vs ~1ms for a constant default).
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT count(DISTINCT stamped) FROM bookings;"
+#   Verified: ~110,000 distinct values — proof it computed a REAL value
+#   per row, not one shared default. This is a full table rewrite.
+
+# ── Rewrite #2: a type change, same cost class ────────────────────────
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c "ALTER TABLE bookings ALTER COLUMN start_hour TYPE bigint;"
+#   Verified: ~274ms. Same order of magnitude as the volatile default —
+#   both are "touch every row," and both hold ACCESS EXCLUSIVE throughout.
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE bookings ALTER COLUMN start_hour TYPE integer;"   # revert
+
+# ── The safe pattern for a required column, in practice ───────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE bookings ADD COLUMN source text;"                  # 1. nullable, instant
+docker compose exec -T db psql -U ots -d demo -c \
+  "UPDATE bookings SET source='web' WHERE source IS NULL;"        # 2. backfill (chunk this on a real table — M7.9)
+docker compose exec -T db psql -U ots -d demo -c '\timing on' \
+  -c "SET lock_timeout='3s'; ALTER TABLE bookings ALTER COLUMN source SET NOT NULL;"
+#   Now every row already has a value, so this is fast — it only
+#   needs to CHECK, not compute, and the check passes instantly.
+
+# ── Always bound the lock wait ─────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "SET lock_timeout='3s'; ALTER TABLE bookings DROP COLUMN flag_a, DROP COLUMN stamped, DROP COLUMN source;"
+
+# ── Clean up ───────────────────────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "DELETE FROM bookings WHERE customer_name LIKE 'archived-customer-%';"
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Write migrations | Drizzle Kit, Prisma Migrate, raw SQL files, Rails/Django migrations |
+| Catch unsafe migrations before they run | **Strong Migrations** (Rails), `squawk` (Postgres linter for exactly these patterns) |
+| Zero-downtime schema changes at scale | `pgroll`, `reshape` — automate the expand/contract pattern |
+| See what's actually locked right now | `pg_locks` joined to `pg_stat_activity` (M7.4) |
+| Run migrations safely in CI/CD | A migration step with `lock_timeout` set, and a timeout on the whole step |
+
+What good looks like: every migration that touches a table with real traffic sets `lock_timeout`; anything that would rewrite a large table is split into expand/backfill/contract; and nobody on the team believes "rollback" undoes a schema change the way it undoes a code deploy.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Run all three Operator timing comparisons** on the grown table and record the actual milliseconds for each. Confirm for yourself that the SQL *looks* similarly simple in all three cases — the cost is invisible from the statement alone.
+
+2. **Trigger the fail-fast case deliberately** and read the error. Explain why this is the *good* outcome compared to a migration that appears to succeed and leaves nulls silently violating an intent nobody enforced.
+
+3. **Do the safe three-step pattern** for a required column: add nullable, backfill, then set `NOT NULL`. Time the final step and confirm it's fast — because by then every row already satisfies the constraint.
+
+4. **Reproduce M7.4's lock queue**, now in a migration-specific frame: hold a transaction on `bookings`, attempt a rewriting migration (the type change) without `lock_timeout`, and watch it queue. Then repeat with `lock_timeout='2s'` set first and watch it fail fast instead.
+
+5. **Clean up** and confirm `bookings` is back to 3 rows with its original columns.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A migration to make `users.referral_code` unique and `NOT NULL` was deployed Friday afternoon. It succeeded. Monday morning, signups are failing for roughly 1 in 8 new users with a 500 error, and support is fielding "I can't create an account" tickets.
+
+<Evidence title="the migration">
+
+```sql
+-- 2026_11_07_referral_code_required.sql
+ALTER TABLE users ADD COLUMN referral_code text;
+UPDATE users SET referral_code = substr(md5(random()::text), 1, 8) WHERE referral_code IS NULL;
+ALTER TABLE users ALTER COLUMN referral_code SET NOT NULL;
+ALTER TABLE users ADD CONSTRAINT users_referral_code_unique UNIQUE (referral_code);
+```
+
+</Evidence>
+
+<Evidence title="signup code (unchanged since before the migration)">
+
+```ts
+const code = substr(md5(Math.random().toString()), 0, 8);   // app-side generation, NOT from the migration's backfill
+await db.query(
+  "INSERT INTO users (email, referral_code) VALUES ($1, $2)", [email, code]);
+```
+
+</Evidence>
+
+<Evidence title="production errors, Monday">
+
+```text
+ERROR: duplicate key value violates unique constraint "users_referral_code_unique"
+DETAIL: Key (referral_code)=(a91f3c2e) already exists.
+  (recurring, different key value each time, ~12% of signup attempts)
+```
+
+</Evidence>
+
+The migration's own backfill used `md5(random()::text)` to generate unique-looking codes for existing rows. Why are *new* signups colliding?
+
+<Reveal label="Reveal the cause">
+
+**8-character hex strings from an 8-character substring of an md5 hash have a genuinely high collision probability at scale, and the migration's backfill masked this until the unique constraint made it visible on NEW inserts instead.**
+
+**Do the actual math, which nobody did before deploying this.** `substr(md5(...), 1, 8)` produces 8 hex characters — 16^8 ≈ 4.3 billion possible values. That sounds like plenty, until you apply the birthday-paradox arithmetic: with *tens of thousands* of existing users, the backfill already had a real (if lower) chance of generating two identical codes for two different rows — and when it did, the **migration's own `UPDATE`** would have silently produced a duplicate, except the `UNIQUE` constraint wasn't added until the *next* statement, so nothing caught it at backfill time. The migration got lucky, or unlucky in a way that wasn't visible: the constraint was only validated **after** the data was already in place, so any collision the backfill itself created was already baked in and nobody saw an error.
+
+**Then the unique constraint went live**, and every *new* signup is now generating an 8-char code independently and has roughly a 1-in-several-thousand chance of colliding with an **existing** code already in a table of tens of thousands of rows — not astronomically rare once you're inserting continuously against a large, static set of previously-claimed values. 1-in-8 failing is high for pure birthday-paradox math at modest user counts, which suggests the random seed or hash input has even less entropy than the nominal 8 hex characters imply (a common mistake: `Math.random()` in JavaScript seeded per-process, or a timestamp-influenced random call, narrowing the actual value space far below 4.3 billion).
+
+**This is not a migration-mechanics bug — the `ALTER TABLE` statements themselves ran exactly as designed and are a textbook-correct example of the expand pattern** (add nullable, backfill, make required, add constraint). The actual defect is that **the constraint changed the contract of an unrelated function**: `referral_code` generation was already a *collision-capable* operation before the migration; the migration just added the enforcement that makes a long-standing latent bug finally throw errors, loudly, in production, days later — the same "something changed that wasn't the obvious last deploy" shape as M8.6 and M1.6's break-fixes, applied to a schema change this time.
+
+**The fix:**
+
+```ts
+// Don't trust an 8-char hash alone. Either use enough entropy that
+// collision probability is actually negligible, or — better — make
+// the INSERT itself handle the conflict instead of hoping to avoid it.
+import { randomBytes } from "crypto";
+
+async function createUserWithUniqueCode(email: string) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = randomBytes(6).toString("base64url");   // ~48 bits, not 32
+    try {
+      await db.query(
+        "INSERT INTO users (email, referral_code) VALUES ($1,$2)", [email, code]);
+      return;
+    } catch (e: any) {
+      if (e.code === "23505" && attempt < 4) continue;    // retry with a new code
+      throw e;
+    }
+  }
+}
+```
+
+This is the same lesson as M7.2's constraint-plus-retry pattern applied to a different column: **the constraint was correct to add — it's what caught the bug.** The fix isn't removing the constraint; it's handling the (now rare, not eliminated) collision with a retry, and generating codes with real entropy rather than a short hash slice.
+
+**Order of work:** first, make signup retry on the specific `23505` violation so new users stop failing immediately; then fix the code generation's entropy; the existing collision risk among already-backfilled rows is a smaller, separate cleanup (find and reassign any duplicate `referral_code` values the backfill may have silently created before the constraint existed to catch them).
+
+**The transferable lesson:** a migration that adds a constraint doesn't introduce a bug — it **reveals** one that was already there, often in code nobody thought to re-examine because the migration file and the application code live in different mental categories. Before adding `UNIQUE` or `NOT NULL` to a column, check what *generates* the values that will now be enforced, not just what's already stored.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review this migration: [paste it]. For each statement, tell me whether it's instant (metadata-only), validates existing data (fails fast on violation), or rewrites the table (computes a new value per row). For anything in the last category, estimate the lock duration at our actual table size and tell me whether it needs the expand/backfill/contract pattern instead."}>
+Check it distinguishes correctly between the three categories from the mental model — a constant default and a volatile one LOOK similar in SQL but cost completely differently. Verify its lock-duration estimate against a real `EXPLAIN` or a timed test on a copy of production-sized data if you have one; "it depends on row count" is a true but useless answer without a number attached.
+</AgentTask>
+
+<AgentTask prompt={"I need to add a NOT NULL unique column to this table, which has [N] existing rows and live write traffic. Write me the full expand/backfill/contract migration sequence: the nullable column add, a chunked backfill using keyset pagination (not one UPDATE for all rows), the NOT NULL step, and the UNIQUE constraint — each as a separate deploy, with lock_timeout set on every DDL statement."}>
+The backfill must be chunked (M7.9) if the table is large — a single `UPDATE` across millions of rows is itself a long-held lock. Verify each step has `lock_timeout` set and that the sequence genuinely separates into multiple deploys rather than one migration file with four statements back to back.
+</AgentTask>
+
+<AgentTask prompt={"I'm about to add a UNIQUE or NOT NULL constraint to this column. Before I do, trace through the codebase every place that generates or writes a value for this column, and tell me whether any of those code paths could plausibly produce a value that violates the new constraint — a collision, a null, an empty string treated as valid. Don't just check the current data; check the CODE that produces future data."}>
+This is the check that would have caught the break-fix before deployment. Make it actually compute or estimate a collision probability if the column uses randomness or a short hash — "it's probably fine" is the sentence that preceded the break-fix's 1-in-8 failure rate.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before running any migration against a table with real traffic:
+
+- Is this statement metadata-only, or does it validate/rewrite every row? (If unsure, test the timing on a copy first.)
+- Is `lock_timeout` set?
+- If adding a required column: nullable → backfill → `NOT NULL`, as separate deploys?
+- If changing a type or renaming: expand (new column) → backfill → switch reads/writes → contract (drop old), as separate deploys?
+- If adding an index: `CONCURRENTLY`?
+- If adding a constraint: have I checked what *generates* the values it will enforce, not just what's already stored?
+
+On rollback:
+
+- Does everyone on the team understand that "rollback" reverts code, not data?
+- Is there a plan for "the migration partially applied" that isn't "panic"? (Wrap multi-statement migrations in a transaction where DDL transactionality allows it — Postgres supports transactional DDL, unlike some databases, which is a real advantage worth using.)
+
+What good looks like: migrations are boring, individually small, reversible in the sense of "the next migration fixes it," and nobody has ever had to explain to a stakeholder that "rolled back" didn't mean what they thought it meant.
+
+Red flags: a single migration file with an add-column, a type change, and a constraint all in one step; no `lock_timeout` anywhere in the migration tooling; a "down" migration nobody has ever tested; adding a constraint without checking what code generates the data it enforces.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l03"
+  questions={[
+    {
+      q: "Why is \"roll back the migration\" fundamentally different from \"roll back the deploy\"?",
+      options: [
+        "Migration rollback requires a separate database connection",
+        "Code rollback just redeploys a previous version; a schema rollback must somehow account for data written under the NEW schema in the interim, which has no automatic, safe inverse",
+        "Migrations can only be rolled back by a database administrator",
+        "Rollback scripts are written in a different language than migrations"
+      ],
+      answer: 1,
+      explain: "This is the core distinction: code is reversible because the previous version was already safe. Data written after a schema change doesn't fit the old shape, and no script resolves that symmetrically — which is why migrations are a one-way door in practice."
+    },
+    {
+      q: "Why does `ADD COLUMN x DEFAULT false` take ~1ms on 400,000 rows, while `ADD COLUMN x DEFAULT clock_timestamp()` takes ~275ms?",
+      options: [
+        "Timestamp columns are always slower to index than booleans",
+        "A constant default is stored once as metadata; a volatile expression must be evaluated and WRITTEN per row, which is a full table rewrite holding an exclusive lock the whole time",
+        "clock_timestamp() requires a network round trip per call",
+        "Boolean columns are compressed automatically, timestamps are not"
+      ],
+      answer: 1,
+      explain: "Verified directly: ~110,000 distinct values appeared for the volatile default across 400,003 rows, proving a real per-row computation happened — this is the rewrite category from the mental model, and it's exactly where M7.4's lock-queue outage becomes relevant at scale."
+    },
+    {
+      q: "Why is a migration that FAILS with \"column contains null values\" the good outcome compared to one that silently succeeds?",
+      options: [
+        "Failed migrations are automatically retried by Postgres",
+        "It fails loudly before any data is corrupted, rather than silently leaving nulls that violate an intent nobody is enforcing — the alternative (success) would have required a default that papers over missing data",
+        "Null values are always a sign of a bug elsewhere",
+        "It means the migration didn't actually run"
+      ],
+      answer: 1,
+      explain: "The story's team hit this and treated it as a crisis, but the constraint check doing its job is the system working correctly. The actual failure was the rollback plan assuming schema changes revert like code."
+    },
+    {
+      q: "In the break-fix, why did adding a UNIQUE constraint on referral_code suddenly cause 1-in-8 signups to fail, when the code generating those values hadn't changed?",
+      options: [
+        "The constraint itself introduced a race condition",
+        "The collision-capable code generating 8-character codes had always been a latent bug; the constraint simply made Postgres start enforcing and reporting what was already a real risk",
+        "The migration corrupted existing referral codes",
+        "The unique index was built incorrectly and matched unrelated rows"
+      ],
+      answer: 1,
+      explain: "A constraint doesn't introduce a bug — it reveals one. The fix wasn't removing the constraint (it was correct to add); it was fixing the entropy of the code generator and adding retry-on-conflict, the same pattern as M7.2's constraint-plus-retry."
+    },
+    {
+      q: "What is the expand/contract pattern, and why does it need multiple deploys rather than one migration?",
+      options: [
+        "It's a way to compress database storage after large deletes",
+        "Add the new schema shape alongside the old one, deploy code that uses the new shape, THEN remove the old shape — because a single-step change can't account for old code instances still running against the new schema, or new code against the old one",
+        "It's a backup strategy for schema changes",
+        "It only applies to adding foreign keys"
+      ],
+      answer: 1,
+      explain: "A rename or type change done in one atomic step can still break a running old instance that doesn't know the shape changed mid-request. Separating expand, backfill, and contract into different deploys is what makes each step individually safe."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,43 @@
+id: sc-key-rotation-01
+module: M4
+lesson: m04-l02
+title: "The database password rotation that caused the outage it was scheduled to avoid"
+difficulty: realistic
+symptom: "A planned, announced database password rotation during a low-traffic window causes a five-minute outage anyway. The web app redeployed fine; something else broke."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/partial-credential-rotation.sh   # rotates DATABASE_URL for `app` only, revokes old password
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [worker.db_connection_errors, app.db_pool_healthy]
+  db_console: true
+agent:
+  context: "You followed a three-step runbook: generate new password, redeploy the app, revoke the old password."
+  bias: "checks only the app's health after redeploy and declares the rotation complete"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - all-services-on-new-credential
+    - worker-reconnected
+  root_cause_markers:
+    - learner enumerates every service/consumer of DATABASE_URL before declaring rotation complete
+    - learner identifies the worker as an unredeployed consumer
+  symptom_only_markers:
+    - worker restarted without explaining why it was missed
+    - old password re-issued as a workaround instead of completing propagation to the worker
+hints:
+  - "The app redeployed and is healthy. Is the app the only thing that reads DATABASE_URL?"
+  - "grep every compose service (or platform service) for the variable name — don't rely on memory."
+  - "The old password was already revoked. What does a service with a cached old credential do next?"
+  - "Reveal: the worker was never redeployed. Propagate to every consumer before revoking anything — found mechanically, not recalled."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

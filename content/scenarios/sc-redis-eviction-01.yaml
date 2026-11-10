@@ -1,0 +1,43 @@
+id: sc-redis-eviction-01
+module: M6
+lesson: m06-l05
+title: "Sessions fail with OOM after a cache TTL change"
+difficulty: hard
+symptom: "Users are logged out mid-session with OOM errors on session writes, starting shortly after an unrelated change lengthened a product cache's TTL to 24 hours."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/shared-redis-noeviction-full.sh   # cache + sessions share one capped instance at noeviction
+evidence:
+  logs: true
+  metrics: [redis.used_memory_pct, redis.oom_errors]
+  db_console: false
+  notes: "redis-cli CONFIG and key-pattern counts are available; session and cache keys are distinguishable by prefix."
+agent:
+  context: "You can see the error is on session writes and assume the bug is in the session code."
+  bias: "investigates the session library rather than Redis memory configuration"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - session-writes-succeed
+    - cache-and-sessions-isolated    # separate instances or separate memory budgets
+  root_cause_markers:
+    - learner identifies the shared maxmemory ceiling and noeviction policy as the actual cause
+    - cache given its own eviction-friendly policy or instance separate from sessions
+    - memory usage monitored as a percentage with an alert before full
+  symptom_only_markers:
+    - maxmemory raised with no separation of concerns
+    - session TTL shortened to compensate
+hints:
+  - "The error is on writes, but reads work fine. What does noeviction actually refuse, and under what condition?"
+  - "Which keys are using the most memory, and what TTL do they have?"
+  - "Two reasonable-looking changes, two weeks apart. Could they combine?"
+  - "Reveal: the cache's longer TTL filled the shared instance; noeviction then blocked unrelated session writes. Separate the two jobs."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

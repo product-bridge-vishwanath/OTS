@@ -1,0 +1,262 @@
+---
+id: m04-l04
+module: M4
+title: "Usage, quotas, and why the AI bill tripled overnight"
+order: 4
+difficulty: 2
+depth: both
+platforms: [anthropic, openai]
+concepts: [quotas, rate-limiting, cost]
+prerequisites: [m01-l05]
+lab: demo-repo
+scenario_ids: [sc-quota-exhausted-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder added a feature where the front-desk assistant double-checked its own answers against the booking data before replying — a reasonable-sounding reliability improvement. Their agent implemented it as a retry loop: on any error, including a rate-limit response, call the model again immediately.
+
+A minor provider hiccup that evening produced a burst of 429s. The retry loop treated each 429 as "try again now," with no backoff and no limit on attempts. Over six hours, the loop ran undetected — the app's health check only tested the database, not the assistant — and generated 1.3 million token-equivalent calls against a feature that, on a normal day, used about 40,000.
+
+The founder found out from the bill, not from a dashboard they were watching, because nobody had set a budget alert, let alone a hard cap. "Why is my AI feature suddenly so expensive" is almost always a question with a mechanical answer sitting in a usage graph — the hard part is that most teams only open that graph after the invoice, not before.
+
+</Section>
+
+<Section kind="already-did">
+
+You've hit a 429 from some provider and seen your own app handle it badly — a spinner that never resolves, a retry that happens so fast you don't notice it's retrying, an error page. You've probably also opened a provider's billing page at least once already and been mildly surprised by a number, even without a true runaway. If you've ever shipped an LLM feature, you've made an implicit bet on how often it gets called that you probably never wrote down.
+
+</Section>
+
+<Section kind="mental-model">
+
+Three separate things get conflated under "usage," and they fail in different ways:
+
+- **Rate limits** — requests or tokens per minute. Breaching one gets you a `429`, not a bigger bill by itself — but a bad retry strategy turns a rate limit into exactly that.
+- **Quotas** — a ceiling over a longer window (daily/monthly requests, tokens, or spend) set by your account tier.
+- **Spend** — the dollar cost, which for token-based billing scales with *usage*, not request count: a request with a 50,000-token prompt costs vastly more than one with a 500-token prompt, even if both count as "one call."
+
+### Budget alerts vs hard caps — the distinction that actually matters
+
+| | What it does | What it doesn't do |
+|---|---|---|
+| **Budget alert** | Notifies you (email/webhook) when spend crosses a threshold | Does **not** stop any requests — spend keeps accruing after the email sends |
+| **Hard cap** | Actually stops the account/project from making further calls once a ceiling is hit | Can cause a hard outage for legitimate traffic if set too low or discovered too late |
+
+A budget alert on its own is a smoke detector with no sprinkler system: useful for "notice sooner," useless for "stop it." The story above would have been caught by an alert within the hour — but the spend would have kept running until a human acted, because nothing was in place to stop it automatically.
+
+<svg viewBox="0 0 780 230" role="img" aria-label="A runaway retry loop graphed over six hours: normal usage is a flat low line, the incident spikes it, a budget alert only notifies partway through while spend keeps climbing, and only a hard cap actually flattens the line" className="diagram">
+  <text x="12" y="20" className="sub">SPEND OVER 6 HOURS — retry storm, no backoff, no cap</text>
+  <rect x="8" y="30" width="764" height="150" rx="10" />
+  <path d="M 20 170 L 120 168 L 160 160 L 200 100 L 300 60 L 450 35 L 600 24 L 760 20" className="arrow" fill="none" />
+  <text x="120" y="190" className="sub">normal baseline</text>
+  <circle cx="200" cy="100" r="4" />
+  <text x="208" y="96" className="sub">budget alert fires here — spend keeps climbing anyway, nobody has looked yet</text>
+  <text x="600" y="40" className="sub">≈1.3M token-equivalent calls by hour 6</text>
+
+  <text x="12" y="210" className="sub">A hard cap set below the normal-use ceiling would have flattened this line at the cap, hours earlier, with no human required.</text>
+</svg>
+
+### Why the bill, specifically, tends to explode rather than creep
+
+Token-based pricing means cost scales with the *size* of what's sent and returned, not just call count. A context window that grows every turn (an agent re-sending its whole conversation history), a prompt that embeds a large, ever-growing dataset (the demo app's assistant rebuilds its full booking context on every call — fine at current scale, a cost risk at 50x the bookings), or a retry loop that doesn't just repeat the call but repeats a *large* call, all multiply far faster than request-count graphs suggest. Watching "requests per minute" alone misses this; watching tokens or dollars directly does not.
+
+</Section>
+
+<Section kind="tools">
+
+| Provider | Usage dashboard | Budget alert | Hard cap |
+|---|---|---|---|
+| Anthropic / OpenAI | Per-project usage, token breakdown | Email/webhook thresholds | Per-project spend limit — the account genuinely stops serving requests past it |
+| Stripe | Dashboard + webhooks for unusual activity | Radar alerts (fraud-oriented, not spend-oriented) | N/A — Stripe isn't a quota you consume, it's payments you process |
+| Twilio | Usage triggers (webhook on threshold) | Usage triggers can call a webhook | Account-level spend limits available |
+| Supabase / most PaaS | Project usage dashboard (DB size, bandwidth, function invocations) | Email at threshold on most tiers | Varies — some tiers throttle, some simply bill overage |
+
+**The practical rule:** set a budget alert on everything with a bill, as a baseline smoke detector — it's nearly always free and takes minutes. Set a **hard cap** specifically on anything with (a) a retry path in your own code, (b) usage proportional to user input size, or (c) no human reliably watching it day to day. The demo app's assistant qualifies on both (a) and (b): it retries-by-design on transient errors in some implementations, and its context grows with the booking table.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Read the current cost shape.** The assistant route logs token usage per call — generate a few requests and look:
+   ```bash
+   for i in 1 2 3; do
+     curl -s localhost:3001/api/assistant -X POST -H 'Content-Type: application/json' \
+       -d '{"question":"what rooms do you have available tomorrow?"}' >/dev/null
+   done
+   docker compose logs app 2>&1 | grep "assistant.answered"
+   #   assistant.answered model=... in=<input tokens> out=<output tokens>
+   ```
+   Note `in=` — that's the *context* (every room and upcoming booking, rebuilt fresh each call per M4's story), not just the question. This is the part that grows with your data.
+
+2. **Simulate the rate-limit path** without a real provider outage — the route already has a branch for it:
+   ```bash
+   grep -A3 "RateLimitError" app/api/assistant/route.ts
+   ```
+   Confirm it returns a `429` to the *caller* rather than retrying internally. That's the correct shape — retries, if any, belong at the caller with backoff (M9's rate-limiting concept), never as a tight loop inside the handler that catches its own error and calls itself again.
+
+3. **Add a cost-visibility line** a provider dashboard alone won't give you: total tokens per hour, computed from your own logs, so a spike is visible in *your* monitoring before the bill arrives:
+   ```bash
+   docker compose logs --since 1h app 2>&1 | grep -o '"in":[0-9]*' | cut -d: -f2 \
+     | awk '{s+=$1} END {print "input tokens, last hour:", s}'
+   ```
+
+4. **Write the budget alert AND hard cap you'd actually want**, as a short note: for this feature, at what monthly spend would you want an email? At what spend would you want calls to actually stop rather than keep running? If you can't answer the second one with a number, that's the gap this lesson is about — go set one in the provider's console now, even a generous one, rather than none.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A customer-facing chat feature works fine for weeks, then suddenly every request returns an error page — no deploy happened, nothing in the app changed, and the team can't reproduce it locally with their own test key.
+
+<Evidence title="the error, from the browser">
+
+```text
+POST /api/assistant → 502
+body: {"error":"assistant unavailable"}
+```
+
+</Evidence>
+
+<Evidence title="app logs">
+
+```text
+14:02:03  app  error  assistant.error status=429 rate_limit_exceeded
+14:02:03  app  error  assistant.error status=429 rate_limit_exceeded
+14:02:04  app  error  assistant.error status=429 rate_limit_exceeded
+   (repeats, one line per request, all 429, none 502 at the provider)
+```
+
+</Evidence>
+
+<Evidence title="the provider console">
+
+```text
+Project: shared-llm-key                 (same project used by THIS app and TWO other internal tools)
+Requests/min, this project: 1,840       Limit: 2,000
+Usage by source (last hour): unattributed — single API key, no per-app breakdown
+```
+
+</Evidence>
+
+Why would a `429` (rate-limited) from the provider turn into a `502` for the customer, and why is this app being rate-limited when ITS traffic hasn't changed?
+
+<Reveal label="Reveal the cause">
+
+**The provider's rate limit is shared across every tool using the same API key and project, and a different internal tool's traffic spike consumed nearly all of the shared headroom — this app's own requests didn't change at all.**
+
+The `502` is the demo app's own code doing exactly what L4.4's hands-on confirmed was correct: it catches a non-rate-limit `APIError` and returns a `502` ("assistant unavailable"), while `RateLimitError` should return a `429`. Here, the handler's log lines show it correctly identified `429`s — but look again at the client-facing response: a generic internal tool, under load, is consuming enough of the shared project's 2,000 requests/minute that this app's *own* occasional requests are now arriving when the budget is already spent, and depending on which code path the error falls through, the customer sees a `502` wrapping what was actually a rate-limit condition.
+
+**The real cause, one layer up from the error code:** this app shares a provider project — and therefore a single rate limit and a single usage dashboard — with two unrelated internal tools. There's no way to tell, from the provider's own console, which of the three is responsible for any given spike, because usage isn't attributed per application. The "nothing in THIS app changed" observation is true and irrelevant: the shared resource changed.
+
+**The fix:**
+1. **Separate API keys/projects per application**, exactly as L4.3 recommends per *environment* — the same logic extends to per-*application* when several unrelated tools share a provider account. Each gets its own rate limit headroom and its own attributable usage graph.
+2. **Add client-side throttling and exponential backoff with jitter** on `429` specifically, so a shared-limit squeeze degrades gracefully (slower responses) instead of failing outright.
+3. **Fix the error-response fallthrough** so a `429` reaching the handler always surfaces as `429` to the customer, never genericized into a `502` — the distinction matters for anyone debugging this from the outside.
+4. **Set per-project budget alerts and a hard cap on each separated project**, so one tool's runaway can't silently eat another's headroom ever again.
+
+**The transferable rule:** a quota or rate limit is a property of the credential and project, not of your application's own traffic pattern. "Our traffic didn't change" doesn't rule out hitting a limit if something else sharing that credential's limit did.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit this codebase for every outbound call to a rate-limited third-party API (LLM, payment, email, SMS). For each one, tell me: is there retry logic, and if so does it back off exponentially with jitter and cap the number of attempts, or could it tight-loop on a sustained error? Flag anything that retries without a limit."}>
+Don't accept 'it has a try/catch' as proof of safe retry behavior — a catch block that calls the same function again with no delay and no attempt counter is exactly the runaway from this lesson's story. Ask it to show you the actual retry/backoff code, not just confirm one exists.
+</AgentTask>
+
+<AgentTask prompt={"For [provider]'s dashboard, tell me exactly how to set up: (1) a budget alert at a threshold I choose, and (2) a hard spend cap that actually stops the account from making further calls, not just notifies me. Explain which of the two protects against each failure mode: a human-watched slow cost creep versus an unattended retry loop."}>
+Confirm it clearly distinguishes alert-only from cap — this is the distinction many providers' UIs make easy to miss (a 'threshold' setting that only emails you looks identical in the form to one that actually throttles). Have it point to the specific dashboard setting, not a generic description.
+</AgentTask>
+
+<AgentTask prompt={"This app's bill for [provider] tripled over [period]. Here's the usage graph and recent deploy history: [paste]. Walk me through the mechanical investigation: token/request volume over time, which endpoint or feature it correlates with, whether it lines up with a deploy or an external traffic event, and whether retry behavior could be multiplying a smaller root cause."}>
+Insist on a mechanical answer tied to the actual graph shape, not a generic 'LLM costs can be unpredictable' response. A sudden step change points at a code or config change; a gradual ramp points at real traffic growth; a sawtooth with a rising floor is a different failure class (M9's memory-leak shape) and shouldn't be confused with this one.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before an LLM or billed third-party feature ships:
+
+- Is there a **budget alert** set, at minimum? (Nearly free, takes minutes — there's no excuse to skip this one.)
+- Is there a **hard cap**, specifically if the feature has any retry path, scales with user input size, or runs unattended?
+- Does the retry logic (if any) back off exponentially with jitter and cap its attempt count — never a tight loop on error?
+- Is this application's provider key/project **separate** from any other application's, so usage and rate limits are attributable?
+- Does a health check cover this feature specifically, or only the database — would a silent failure here actually be noticed?
+
+Red flags: a retry that calls itself immediately on *any* caught error; "the bill" as the first place anyone finds out about a cost spike; a shared API key across unrelated internal tools; a context that grows with your data with no ceiling on how large a single request can get.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m04-l04"
+  questions={[
+    {
+      q: "What's the key difference between a budget alert and a hard cap?",
+      options: [
+        "They're two names for the same provider feature",
+        "A budget alert only notifies you after a threshold is crossed; a hard cap actually stops further calls from being made — spend keeps accruing after an alert but not after a cap",
+        "A hard cap is always more expensive to set up than an alert",
+        "Budget alerts work for LLM providers; hard caps only exist for payment providers"
+      ],
+      answer: 1,
+      explain: "An alert is a smoke detector; a cap is the sprinkler. The runaway-loop story would have triggered an alert within the hour while spend kept climbing, because nothing was in place to stop it."
+    },
+    {
+      q: "Why does token-based billing make cost spikes sharper than request-count graphs suggest?",
+      options: [
+        "Token pricing is inherently unstable and changes daily",
+        "Cost scales with the SIZE of what's sent and returned, not call count — a growing context or a large-prompt retry multiplies spend far faster than 'requests per minute' shows",
+        "Tokens are billed at a premium rate during peak hours",
+        "Request-count graphs are always inaccurate"
+      ],
+      answer: 1,
+      explain: "A request with a 50,000-token prompt costs vastly more than one with 500 tokens, even counted identically as 'one call' — which is why watching tokens or dollars directly catches what request-count monitoring misses."
+    },
+    {
+      q: "In the break-fix, why was this app rate-limited when its own traffic hadn't changed?",
+      options: [
+        "The provider changed its pricing model overnight",
+        "It shared an API key and project — and therefore a single rate limit and usage dashboard — with two unrelated internal tools, one of which spiked",
+        "The app's code had a bug that doubled its own request rate",
+        "The database connection pool was exhausted"
+      ],
+      answer: 1,
+      explain: "A rate limit is a property of the credential/project, not of one application's traffic pattern. Separating keys per application (extending L4.3's per-environment logic) would have isolated this."
+    },
+    {
+      q: "Why is a retry loop that calls the provider again immediately on any caught error dangerous specifically on a 429?",
+      options: [
+        "429s always indicate a permanent failure that retries can't fix",
+        "A 429 means you're already over the limit — retrying immediately with no backoff keeps requesting at or above that same limit, turning a transient condition into a sustained one that can run for hours unattended",
+        "429s cost more per request than successful calls",
+        "Retrying a 429 is against most providers' terms of service"
+      ],
+      answer: 1,
+      explain: "The opening story's six-hour runaway was exactly this: no backoff, no attempt cap, and no health check covering the feature to notice."
+    },
+    {
+      q: "Which third-party feature most needs a hard cap, not just a budget alert, according to this lesson?",
+      options: [
+        "Any feature with low expected traffic",
+        "One with a retry path in its own code, usage proportional to user input size, or no human reliably watching it day to day",
+        "Only features that have already caused a billing incident once",
+        "Features billed per-request rather than per-token"
+      ],
+      answer: 1,
+      explain: "Those three conditions are exactly what let a small bug multiply into a large, unattended bill — a hard cap is the automatic backstop a budget alert alone can't provide."
+    }
+  ]}
+/>
+
+</Section>

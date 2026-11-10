@@ -1,0 +1,41 @@
+id: sc-schema-audit-01
+module: M6
+lesson: m06-l08
+title: "A security audit query takes 11 seconds on a 40-million-row events table"
+difficulty: realistic
+symptom: "A password-reset audit page needs to query a generic events table by type and a jsonb field. The correct query takes 11 seconds; a security team will use this page interactively."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data
+      apply: scripts/break/grow-events-table.sql   # 40M synthetic events, mixed types, jsonb payload
+evidence:
+  logs: true
+  metrics: [latency.p95, db.seq_scan]
+  db_console: true
+agent:
+  context: "You added an index on the type column and it helped, but not enough."
+  bias: "proposes raising the query timeout rather than fixing the index shape"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - audit-query-under-100ms
+  root_cause_markers:
+    - learner identifies the jsonb field extraction as unindexed and still scanning 600k+ rows
+    - a composite/expression index added matching the exact query shape, OR the event type promoted to its own table
+    - foreign-keyed, typed user_id column used if promoted to a dedicated table
+  symptom_only_markers:
+    - query timeout increased with no index or schema change
+    - all events of this type deleted to shrink the table
+hints:
+  - "The index on `type` helped. By how much, and is that enough for an interactive page?"
+  - "What is Postgres doing to every one of the 612,000 remaining rows to check the second condition?"
+  - "Does this specific event type get queried often enough to deserve its own table?"
+  - "Reveal: the jsonb extraction has no index. Add a composite/expression index matching the query, or promote this event type to its own indexed table."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

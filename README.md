@@ -11,7 +11,7 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 Phase 1, build-order steps 1–4 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
-- **28 lessons across M0, M1, M7 and M8**, each with all 9 anatomy sections
+- **41 lessons across M0, M1, M4, M6, M7 and M8**, each with all 9 anatomy sections
   (story, what-you-already-did, mental model + theme-aware SVG diagram, tools, hands-on
   against the demo app, break-fix with evidence + reveal, three ask-your-agent prompts
   with verification steps, checklist, 5-question quiz):
@@ -20,6 +20,18 @@ Phase 1, build-order steps 1–4 complete:
   - **M1 The server is just a computer** — PaaS/serverless/VPS and the process-vs-function
     shape, SSH and lockout prevention, commands taught by question, processes/ports/
     permissions, environment variables and precedence, supervision and crash loops.
+  - **M4 Config, secrets and keys** (wave 2) — env files and leaks, secret managers and
+    rotation, third-party key scopes, usage quotas and bills, config vs secrets vs flags.
+  - **M6 Data: databases, cache, storage, queues** (wave 2) — relational fundamentals and
+    `EXPLAIN ANALYZE`, connection pooling, migrations (forward-only, and why rollback is a
+    lie), backups and the restore drill, Redis's five jobs, object storage and egress,
+    queues and workers, data-modelling anti-patterns. Verified against the live demo app:
+    a 400k-row seq scan dropping from ~11.7ms to ~2.1ms after `CREATE INDEX CONCURRENTLY`;
+    `pg_stat_statements` enabled via `shared_preload_libraries` so query-ranking drills
+    actually work; real connection exhaustion ("too many clients already") and recovery;
+    `ADD COLUMN` instant vs. a ~275ms full-table rewrite; a `pg_dump`/`pg_restore`
+    round-trip; Redis `INCR` atomicity and TTL expiry; two workers claiming disjoint rows
+    via `SKIP LOCKED`.
   - **M7 Concurrency, jobs and time** (wave 2) — what "concurrent" means and shared
     state, race conditions fixed with exclusion constraints, transactions and isolation
     (including why `BEGIN` doesn't stop duplicates), locks and the lock *queue*,
@@ -37,7 +49,7 @@ Phase 1, build-order steps 1–4 complete:
 - **Reference layer, fully written** (content as YAML in `/content/reference`, each page
   searchable): command cheat sheet (43 commands by task, copyable), HTTP status codes
   (27 codes with layer-to-suspect + how to confirm), failure catalogue (26 entries:
-  symptom → causes → confirm → fix), glossary (67 terms, also powering lesson hovers),
+  symptom → causes → confirm → fix), glossary (113 terms, also powering lesson hovers),
   cloud concept map (18 concepts across AWS/GCP/Azure/PaaS), decision library index
   (D1–D17 with honest defaults; full pages come with M11).
 - **Demo app** (`/demo-app` — "Riverside Studios"): a real full-stack teaching app
@@ -48,7 +60,7 @@ Phase 1, build-order steps 1–4 complete:
   plus `scripts/break/*` and `scripts/load/*` to trigger each one — see
   `demo-app/README.md` for the full map. These are drill material for the lessons and
   Phase 2 scenarios.
-- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **28 scenario definitions** in
+- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **41 scenario definitions** in
   `/content/scenarios/*.yaml` rendered read-only at `/scenarios` (one per break-fix,
   each with breakage, agent bias, probes, root-cause vs symptom-only markers, hint
   ladder and scoring), Drizzle schema includes `scenario_attempts`.
@@ -102,12 +114,14 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-5. Rest of content wave 2: M6 (data), M4 (config/secrets), M5 (networking), M2 (git/shipping).
+5. Rest of content wave 2: M5 (networking), M2 (git/shipping).
 6. Content wave 3: M11 (decision pages), M9, M10, M13, M14.
 7. Content wave 4: M3, M12.
 8. Personal map editor and decision records; then auth + server-side progress.
 
 The demo app's planted anti-patterns now have lessons that fix them properly: the
 double-booking race (M7.2), single-cell notes (M7.6), the non-idempotent webhook
-(M7.7) and the unlocked cron (M7.8). Each lesson's hands-on restores the
-anti-pattern at the end so the app stays teachable.
+(M7.7), the unlocked cron (M7.8), missing indexes (M6.1), and a full five-question
+schema audit that names all of them at once (M6.8). Each lesson's hands-on
+restores the anti-pattern at the end so the app stays teachable — verified clean
+(only primary-key constraints, original seed data) after every module's work.

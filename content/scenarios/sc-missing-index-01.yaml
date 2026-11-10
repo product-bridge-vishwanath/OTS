@@ -1,0 +1,43 @@
+id: sc-missing-index-01
+module: M6
+lesson: m06-l01
+title: "The dashboard that made the team consider sharding"
+difficulty: realistic
+symptom: "A recent-activity widget has gone from instant to 4+ seconds over two months. No deploy correlates. The team is discussing sharding the database."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data
+      apply: scripts/break/missing-index-growth.sql
+evidence:
+  logs: true
+  metrics: [latency.p95, db.seq_scan, db.idx_scan]
+  db_console: true
+agent:
+  context: "You believe the table has outgrown a single database and are drafting a sharding plan."
+  bias: "proposes sharding or a bigger instance before running EXPLAIN ANALYZE"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - query-under-50ms
+    - index-matches-query-shape      # equality column before sort column
+  root_cause_markers:
+    - learner runs EXPLAIN ANALYZE before proposing any architectural change
+    - index added with CREATE INDEX CONCURRENTLY
+    - before/after measurement taken
+  symptom_only_markers:
+    - sharding plan proposed or started
+    - instance size increased with no index added
+    - cache added in front of the unfixed query
+hints:
+  - "Before any architectural change, what does EXPLAIN ANALYZE actually say this query is doing?"
+  - "How many rows were read versus returned? Where does that number appear in the plan?"
+  - "What would sharding change about an unindexed sequential scan on a table split across N databases?"
+  - "Reveal: no index serves this filter+sort. Add one matching both, CONCURRENTLY, and re-measure."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

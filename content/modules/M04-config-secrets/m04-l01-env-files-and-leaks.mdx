@@ -1,0 +1,306 @@
+---
+id: m04-l01
+module: M4
+title: "`.env` files, `.gitignore`, and what to do when a key hits GitHub"
+order: 1
+difficulty: 2
+depth: both
+platforms: [github-actions, vercel, render, railway]
+concepts: [secrets, env-vars, config]
+prerequisites: [m01-l05]
+lab: demo-repo
+scenario_ids: [sc-leaked-key-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A solo founder asked their agent to "commit everything and push, I want this backed up." The agent ran `git add -A`. The repo had no `.gitignore` yet — this was day one — and `.env` went up with it, live Stripe secret key included, to a public GitHub repository.
+
+GitHub's secret scanning caught it in about ninety seconds and emailed Stripe directly, under a partner program most founders have never heard of. Stripe disabled the key before the founder even saw GitHub's own alert. It was the best possible outcome of the worst possible mistake.
+
+Three weeks later, a different founder asking a different agent to "push my changes" had no such luck. The leaked key belonged to a provider with no scanning partnership, the repo had already been forked twice by bots that watch GitHub's public commit firehose for exactly this pattern, and the first anyone knew was a $4,200 overage alert nine hours later.
+
+Same mistake. Wildly different outcomes — and the difference had nothing to do with how careful either founder was *after* the commit.
+
+</Section>
+
+<Section kind="already-did">
+
+You have run `cp .env.example .env` on day one of nearly every project. You have told an agent to "commit my changes" or "push this" without checking what "everything" included. You have probably seen a `.gitignore` get added to a repo on day *three*, after the `.env` file already existed — which, as this lesson explains, is one commit too late.
+
+You may also have received a secret-scanning alert email from GitHub or GitLab and not fully understood what it meant, or why the advice was "rotate the key" rather than "delete the file."
+
+</Section>
+
+<Section kind="mental-model">
+
+M1.5 covered where environment variables live and why `.env` never reaches production on its own. This lesson is about the other direction: how a value that was only ever meant to sit in a local, gitignored file ends up somewhere you never intended — and why the fix is never "remove it."
+
+### The one fact that explains everything here
+
+**Git doesn't store files. It stores every version of every file, forever, by default.** "Deleting" a line in a new commit doesn't erase it — it adds a commit that says "don't show this anymore," while the original commit, containing the original bytes, stays in the repository's history where `git log`, `git show`, and anyone with a clone can still read it.
+
+`.gitignore` does not interact with history at all. It only tells Git "don't track changes to this path from now on." If `.env` was ever committed even once — even in a commit you later "fixed" — adding it to `.gitignore` afterward does nothing to that old commit.
+
+<svg viewBox="0 0 780 260" role="img" aria-label="Timeline of a committed secret: commit, push, scraped by bots within seconds on a public repo, used within hours, noticed days later" className="diagram">
+  <text x="12" y="20" className="sub">THE TIMELINE OF A LEAK — public repository</text>
+
+  <rect x="8" y="30" width="140" height="56" rx="8" />
+  <text x="78" y="54" textAnchor="middle" className="sub">commit</text>
+  <text x="78" y="72" textAnchor="middle" className="sub">t = 0</text>
+
+  <rect x="164" y="30" width="140" height="56" rx="8" />
+  <text x="234" y="54" textAnchor="middle" className="sub">push</text>
+  <text x="234" y="72" textAnchor="middle" className="sub">t ≈ seconds</text>
+
+  <rect x="320" y="30" width="180" height="56" rx="8" />
+  <text x="410" y="50" textAnchor="middle" className="sub">scraped by bots watching</text>
+  <text x="410" y="66" textAnchor="middle" className="sub">GitHub's public event stream</text>
+
+  <rect x="516" y="30" width="150" height="56" rx="8" />
+  <text x="591" y="50" textAnchor="middle" className="sub">key used /</text>
+  <text x="591" y="66" textAnchor="middle" className="sub">usage spikes</text>
+
+  <rect x="682" y="30" width="90" height="56" rx="8" />
+  <text x="727" y="50" textAnchor="middle" className="sub">you</text>
+  <text x="727" y="66" textAnchor="middle" className="sub">notice</text>
+
+  <text x="12" y="112" className="sub">Measured in minutes to hours for a public repo. Private repos aren't immune — a repo made public</text>
+  <text x="12" y="130" className="sub">later, a contractor's clone, or a provider breach all still hold what you committed.</text>
+
+  <rect x="8" y="152" width="764" height="88" rx="10" />
+  <text x="28" y="176" className="sub">.gitignore ADDED AFTER THE FACT:</text>
+  <text x="28" y="198" className="sub">✓ stops the NEXT commit from re-adding .env       ✗ does nothing to commits already made</text>
+  <text x="28" y="220" className="sub">✗ "git rm --cached" + a new commit does not remove it from history either — only from the latest snapshot</text>
+</svg>
+
+### Public vs private: a difference of degree, not of safety
+
+A public repo is scraped so fast that "notice before it's used" is rarely realistic. A private repo buys you time, not immunity — it can be forked by a collaborator, cloned to a laptop that's later compromised, made public by a future "let's open-source this" decision, or exposed by a breach at GitHub or GitLab itself. Treat "it was private" as a reason you *might* have more time to respond, never as a reason the key is still safe.
+
+<Callout type="key">
+**Rotate first, always.** Issuing a new key and revoking the old one is mandatory and always sufficient. Scrubbing the commit from history is optional, often difficult, and on its own does nothing — anyone who already has the old commit (a fork, a clone, a CI cache, a bot) still has the secret regardless of what your `main` branch looks like now.
+</Callout>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool | What it actually does |
+|---|---|---|
+| Prevent the file from being tracked | `.gitignore` + a committed `.env.example` | Stops future commits only — the baseline, not a fix for history |
+| Catch a secret before it's committed | `gitleaks`/`trufflehog` as a pre-commit hook | Pattern-matches known key formats locally, before `git push` even exists as an option |
+| Catch a secret before it's pushed | GitHub push protection | Blocks the push itself when a recognizable secret pattern is detected — the best point in the timeline to stop it |
+| Find out after the fact | GitHub/GitLab secret scanning (repo or org-wide) | Scans existing history and alerts; for partnered providers (Stripe, many cloud providers), alerts the *provider* directly |
+| Remove a secret from history | `git filter-repo` (or BFG Repo-Cleaner) | Rewrites every commit to strip the file/string — changes every commit hash downstream, breaks other people's clones, and is pointless if a copy already escaped |
+
+**The ordering that matters:** push protection (before it leaves your machine) beats secret scanning (after it's already out) beats history rewriting (after it's already out *and* probably copied). Most teams only ever install the third one, which is the least effective of the three because by the time it fires, rotation is the only tool left anyway — so you may as well treat rotation as the plan from the start.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app
+cp .env.example .env
+```
+
+1. **Confirm `.env` is actually ignored, don't assume it.**
+   ```bash
+   git check-ignore -v demo-app/.env
+   git status demo-app/.env       # should show nothing — ignored, not untracked-and-pending
+   ```
+   `git check-ignore -v` prints *which* rule in *which* file is doing the ignoring — useful the day a `.gitignore` rule is subtly wrong (e.g. `.env` ignored but `.env.production` isn't).
+
+2. **See why a `.gitignore` added today can't save yesterday's mistake**, in a disposable scratch repo (never do this in a real project):
+   ```bash
+   mkdir -p /tmp/leak-demo && cd /tmp/leak-demo && git init -q
+   echo "ANTHROPIC_API_KEY=sk-ant-demo-FAKEKEY00000000000000" > .env
+   git add .env && git commit -q -m "add env config"
+   echo ".env" > .gitignore
+   git rm --cached .env -q && git add .gitignore && git commit -q -m "stop tracking .env"
+   git log -p --all -- .env | grep -A1 ANTHROPIC_API_KEY
+   #   The fake key is still right there, in the first commit, forever.
+   cd - && rm -rf /tmp/leak-demo
+   ```
+
+3. **Run a secret scan** over the demo app (install `gitleaks` or use `docker run` if you don't have it locally):
+   ```bash
+   gitleaks detect --source . --no-git -v 2>/dev/null || echo "install gitleaks to run this: https://github.com/gitleaks/gitleaks"
+   ```
+
+4. **Do the rotation motion** on the demo app's real (optional) secret, so the muscle memory is in your hands before you ever need it under pressure:
+   ```bash
+   # "issue" a new key value (in real life: generate it in the provider's dashboard)
+   #   edit demo-app/.env — change ANTHROPIC_API_KEY to a new value
+   docker compose up -d --build
+   docker compose exec app sh -c 'echo "${ANTHROPIC_API_KEY:0:12}…"'   # confirm the NEW value is what the running process has
+   #   only after confirming the new value is live would you revoke the old one at the provider
+   ```
+   This is the whole rotation shape: issue new → deploy → verify the running process has it → *then* revoke old. L4.2 covers why that order matters even more once a database is involved.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A SaaS founder gets an email: "Unusual activity detected on your OpenAI-compatible API key." The dashboard shows 40x normal spend starting nine hours ago. Nothing in the app changed recently, as far as the founder knows.
+
+<Evidence title="the provider dashboard">
+
+```text
+Usage, last 24h:  14.2M tokens  (daily average: 310K tokens)
+Requests from IP ranges: 3 unrecognized ranges, none matching the app's host
+First unrecognized request: 09:14 UTC
+```
+
+</Evidence>
+
+<Evidence title="git log, searched for the key's known prefix">
+
+```text
+$ git log -p --all -S "sk-proj-7fQ2" | head -20
+commit 4a1c9e2 (origin/main, 3 weeks ago)
+    chore: add local env setup for new contributor
++OPENAI_API_KEY=sk-proj-7fQ2xK9mLwYvN4Rt8pQeZcVbHj3nFgTa
+...
+commit 8b22f10 (4 days ago)
+    fix: remove accidentally committed env file
+-OPENAI_API_KEY=sk-proj-7fQ2xK9mLwYvN4Rt8pQeZcVbHj3nFgTa
+```
+
+</Evidence>
+
+<Evidence title="repository visibility">
+
+```text
+Repository: public (was private until 5 days ago — made public for a hackathon submission)
+Forks: 2 (both created the day it went public)
+```
+
+</Evidence>
+
+The founder's question: "I already removed it four days ago — why is it still being used?"
+
+<Reveal label="Reveal the cause">
+
+**The key was committed three weeks ago, the repo went public five days ago, and "removing" it four days ago only removed it from the latest snapshot — not from the two commits that still contain it in full, both now sitting in two public forks.**
+
+Walk the timeline: the key sat harmlessly in a *private* repo's history for over two weeks — not safe, just not yet exposed to anyone who'd look. The moment the repo was made public for the hackathon, that history became readable by anyone, including the automated scanners that watch GitHub's public firehose for exactly this key-prefix pattern. Within hours, at least one scraper had it. The commit that "removed" the key four days *later* changed nothing for whoever already copied it in those first few hours — and it changed nothing for the two forks, which carry their own full copy of history regardless of what happens on the original repository afterward.
+
+**Why "I removed it" felt like it should have worked:** the founder was reasoning about the *current file*, which genuinely no longer contains the key. The exposure lives in the *commits*, which the removal commit doesn't touch, and in the *forks*, which `git filter-repo` on the original repo can't touch at all.
+
+**The fix, in order:**
+1. **Rotate the key now.** Generate a new one, deploy it, confirm the running app uses it, revoke the old one at the provider. This alone stops the bleeding regardless of how many copies exist.
+2. **Check the damage** via the provider's usage logs: which endpoints, how much spend, any data exposed by what those requests returned.
+3. **Decide whether to scrub history** — worthwhile for keeping the repo clean going forward, but explicitly *not* a security control once a key has escaped. Note it won't reach the forks.
+4. **Add push protection and a pre-commit scan** so the next "add local env setup" commit never gets this far.
+5. If the repo must stay public, audit anything else committed under its *private* period with the same scrutiny — visibility changes don't just affect the future.
+
+**The transferable rule:** a secret's exposure is decided by its full commit history and every clone/fork of it, not by what the latest commit on `main` currently contains. "I deleted it" is a statement about files; a leak is a statement about history.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Scan this repository's entire git history — not just the current files — for anything that looks like a committed secret: API keys, private keys, connection strings with embedded passwords, .env files. Use git log -p --all with patterns for common key prefixes (sk-, AKIA, ghp_, etc.) plus a general high-entropy-string check. Report file, commit, and date for each hit. Do not print full key values, only enough characters to identify which secret it is."}>
+This has to search *history*, not just `grep` the working tree — that's the whole point. Spot-check its claims yourself with `git log -p --all -S "<pattern>"` on at least one hit before trusting the list, and confirm it didn't print full secret values into your terminal scrollback or into any file it writes.
+</AgentTask>
+
+<AgentTask prompt={"Set up gitleaks as a pre-commit hook in this repo, plus a CI step that runs it on every PR. Pre-commit should block the commit locally before it's even made; CI should fail the build if one slips through. Show me the config and how to test both paths actually catch a fake secret."}>
+Make it prove the hook works: commit a fake key locally and confirm the hook blocks it, then push a branch where the fake key bypassed the hook (e.g. via --no-verify) and confirm CI fails. A hook you haven't tested firing is a hook you don't actually have.
+</AgentTask>
+
+<AgentTask prompt={"I think an API key for [provider] may have been committed to this repo at some point and the repo has since been public. Walk me through the full incident response in the correct order: what to rotate first, how to check for misuse, whether scrubbing history is worth doing, and what to tell anyone who had access to any fork or clone."}>
+Insist "rotate" is step one in its answer, before any history investigation — if it suggests scrubbing history before rotating, push back. Confirm it treats "repo was ever public, however briefly" as sufficient grounds to assume exposure, not a reason to downgrade severity.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before trusting a repository with any secret, even briefly:
+
+- Does `.gitignore` cover `.env` and every `.env.*` variant, and is it in place *before* the first `.env` file is ever created?
+- Is there a committed `.env.example` with placeholder values, so nobody needs the real file to know what's required?
+- Is push protection (or at minimum pre-commit scanning) actually installed, not just planned?
+- Has anyone run a full-history scan at least once, including on repos that pre-date these controls?
+
+If a key may have leaked:
+
+- Rotate it — immediately, before investigating anything else.
+- Check the provider's usage logs for misuse during the exposure window.
+- Treat "repo was private" as "had less time to be found," never as "was safe."
+- Treat a fork or old clone as a permanent copy that a history rewrite on the original repo cannot reach.
+- Decide on history scrubbing only after rotation, as cleanup, not as the fix.
+
+Red flags: "I deleted the line, so it's fine now"; a `.gitignore` added in the same PR that first introduces secrets, instead of before; an agent told to "commit everything" with no review of what that includes.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m04-l01"
+  questions={[
+    {
+      q: "A key was committed, then removed in a later commit, and `.gitignore` was added at the same time. Is the key still exposed?",
+      options: [
+        "No — the current files no longer contain it",
+        "Yes — the commit containing the original value is still in the repository's history and readable via git log/git show, regardless of later commits",
+        "Only if the repository is public",
+        "Only if someone force-pushes over the history"
+      ],
+      answer: 1,
+      explain: "Git stores every version of every file. A later commit that removes a line adds history; it doesn't erase the earlier commit that still contains the value."
+    },
+    {
+      q: "What does adding `.env` to `.gitignore` after it has already been committed once actually accomplish?",
+      options: [
+        "It retroactively removes the file from all past commits",
+        "It prevents the file from being re-tracked or re-committed going forward, but does nothing to commits that already exist",
+        "It encrypts the file in the git history",
+        "It triggers GitHub's secret scanning to run"
+      ],
+      answer: 1,
+      explain: "`.gitignore` only governs what Git tracks from this point forward. The existing commit, and anyone who already cloned or forked it, is unaffected."
+    },
+    {
+      q: "Why is rotating a leaked key the mandatory first step, ahead of scrubbing git history?",
+      options: [
+        "History scrubbing takes longer to complete than rotation",
+        "Rotation alone stops any future use of the exposed value regardless of how many copies of it exist (forks, clones, caches); history scrubbing can't reach copies outside the original repo and may not even be possible",
+        "GitHub requires rotation before it will allow a history rewrite",
+        "Scrubbing history always breaks the build"
+      ],
+      answer: 1,
+      explain: "Rotation is sufficient on its own and reaches every copy at once, because the OLD value simply stops working. Scrubbing history is cleanup for the repo, not a control over what others already have."
+    },
+    {
+      q: "In the break-fix, why did the founder's four-day-old removal commit not stop the key from being used?",
+      options: [
+        "The removal commit had a syntax error",
+        "The key had already been exposed when the repo went public five days ago and was likely scraped within hours — well before the removal commit — and the forks retain the full history regardless",
+        "GitHub secret scanning only checks the latest commit",
+        "The provider ignored the rotation request"
+      ],
+      answer: 1,
+      explain: "The exposure window started when the repo became public, not when the key was 'removed.' A removal commit changes the current snapshot, not the history a scraper or fork already captured."
+    },
+    {
+      q: "Of push protection, secret scanning (after the fact), and history rewriting, which stops a leak with the least damage already done?",
+      options: [
+        "History rewriting, because it removes the evidence",
+        "Push protection, because it blocks the secret from ever leaving your machine — the other two only react after it's already in the repository or already copied",
+        "Secret scanning, because it alerts the provider directly",
+        "They're equally effective regardless of order"
+      ],
+      answer: 1,
+      explain: "Push protection acts before the push completes. Scanning fires after the secret is already in the remote repo; rewriting history happens after that, and can't reach anything already forked or cloned."
+    }
+  ]}
+/>
+
+</Section>

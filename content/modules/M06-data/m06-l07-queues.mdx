@@ -1,0 +1,365 @@
+---
+id: m06-l07
+module: M6
+title: "Queues and workers: why async exists, and what \"at-least-once\" costs"
+order: 7
+difficulty: 2
+depth: both
+platforms: [redis, postgres, upstash]
+concepts: [queues]
+prerequisites: [m07-l07, m07-l04]
+lab: demo-repo
+scenario_ids: [sc-queue-backpressure-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder added an "export your bookings as PDF" button. The handler did exactly what the button implied: when clicked, the request generated the PDF synchronously and returned it. For a user with a dozen bookings, this took 400ms — fine.
+
+A customer with three years of history clicked it. PDF generation for thousands of bookings took 47 seconds. The request hit the platform's function timeout at 30 seconds and died. The customer clicked again. And again — four more times across two minutes, each one spinning up a fresh 30-second attempt that also died, each one fully loading the same thousands of rows from the database to do work that got thrown away unfinished.
+
+Nothing crashed. Nothing errored in a way anyone noticed until the customer complained. The fix wasn't making PDF generation faster — it was recognizing that "generate this, however long it takes, and tell me when it's done" is a fundamentally different shape of request than "answer me right now," and that the first shape needs a **queue**, not a bigger timeout.
+
+</Section>
+
+<Section kind="already-did">
+
+You've clicked a button that showed a spinner for a while and then, eventually, the result appeared, or you got an email later saying it was ready. You've also clicked a button, waited, and gotten a timeout error — and possibly clicked it again, compounding the problem, exactly like the story above.
+
+If you worked through M7.8, you've already built the core mechanism this lesson is about: `SELECT ... FOR UPDATE SKIP LOCKED`, which lets several workers pull different jobs from a shared table without colliding. This lesson is about when to reach for that pattern (or a dedicated queue product) in the first place, and the guarantees — and non-guarantees — that come with it.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The shape question: does the caller need to wait?
+
+<svg viewBox="0 0 780 230" role="img" aria-label="Synchronous work makes the caller wait for the full duration, while a queue lets the caller get an immediate acknowledgement and a worker does the work separately, reporting completion later" className="diagram">
+  <text x="12" y="20" className="sub">SYNCHRONOUS — the caller is blocked for the FULL duration of the work</text>
+  <rect x="8" y="30" width="130" height="40" rx="6" />
+  <text x="73" y="54" textAnchor="middle" className="sub">request</text>
+  <rect x="160" y="30" width="400" height="40" rx="6" />
+  <text x="360" y="54" textAnchor="middle" className="sub">…generate PDF, 47 seconds, caller waiting the whole time…</text>
+  <text x="12" y="92" className="sub">If this exceeds a platform timeout (often 10-30s), the request dies — work AND result both lost.</text>
+
+  <text x="12" y="134" className="sub">QUEUED — the caller gets an immediate answer; work happens separately</text>
+  <rect x="8" y="144" width="130" height="40" rx="6" />
+  <text x="73" y="168" textAnchor="middle" className="sub">request</text>
+  <rect x="160" y="144" width="150" height="40" rx="6" />
+  <text x="235" y="168" textAnchor="middle" className="sub">enqueue (ms) → 202</text>
+  <rect x="340" y="144" width="150" height="40" rx="6" />
+  <text x="415" y="168" textAnchor="middle" className="sub">worker: 47s, separately</text>
+  <rect x="520" y="144" width="200" height="40" rx="6" />
+  <text x="620" y="168" textAnchor="middle" className="sub">notify when done (email/poll)</text>
+  <text x="12" y="208" className="sub">The caller's connection is free in milliseconds. The 47-second job runs on ITS OWN clock, unaffected by request timeouts.</text>
+</svg>
+
+<Callout type="key">
+**The test: if this takes longer than a user will comfortably wait, or longer than your platform's timeout allows, it needs a queue — not a faster synchronous implementation.** Making the PDF generator 2x faster delays the same timeout failure; it doesn't remove the shape mismatch.
+</Callout>
+
+### At-least-once is what you get, not what you chose
+
+Every real queue — a managed service or your own table — delivers messages **at-least-once**, for the exact reason M7.7 covers: a worker can crash after doing the work but before marking it done, and the only safe response from the queue's side is to redeliver. This means **every job handler must be idempotent** (M7.7) — not "ideally," but as a hard requirement, because the queue's own correctness depends on redelivery being safe to do.
+
+### Three queue shapes, and when each earns its complexity
+
+| Shape | What it is | Use when |
+|---|---|---|
+| **A database table + `SKIP LOCKED`** | Rows as jobs, claimed atomically (M7.4/M7.9) | You already have Postgres; moderate volume; want jobs queryable with normal SQL |
+| **Redis-backed (BullMQ, etc.)** | A list/sorted-set in Redis, with retry/backoff/delay built in | Higher throughput than a DB table comfortably handles; you already run Redis |
+| **Managed service (SQS, Cloud Tasks, etc.)** | Fully managed durability, scaling, dead-letter handling | Volume or reliability needs outgrow what you want to operate yourself |
+
+The database-table version is underrated specifically for this program's learner: it needs no new infrastructure, it's queryable with SQL you already know (`SELECT count(*) FROM jobs WHERE status='pending'` is a dashboard, for free), and M7.9's "five brakes" apply to it directly. Reach for a dedicated product when volume or required throughput genuinely outgrows it — not by default.
+
+### Backpressure: what happens when producers outrun workers
+
+A queue decouples "accepting work" from "doing work" — which is exactly the problem until workers fall behind producers. The queue then does one of two things: grow (using more memory/storage, with delay climbing) or, if bounded, start rejecting new work. Both are **signals**, not failures to hide:
+
+```sql
+-- The queue-depth question every queue-backed system needs an answer to.
+SELECT status, count(*) FROM jobs GROUP BY status;
+-- A 'pending' count that's growing faster than it's draining is backpressure,
+-- forming right now — this is a metric (M8.4), not just a debugging query.
+```
+
+The response to sustained backpressure is never "make the queue bigger" alone — it's add workers, shed load, or fix whatever's actually slow upstream (often the thing M7.9's backfill brakes exist to prevent: one slow job hogging the exact capacity everything else needs).
+
+### Dead letters: where jobs go to be seen, not forgotten
+
+A job that fails repeatedly — a permanently malformed payload, a bug that throws every time — will otherwise retry forever, consuming worker capacity for something that can never succeed. A <Term k="dead-letter-queue">dead-letter queue</Term> is the deliberate alternative: after N failures, move the job somewhere **visible** instead of either retrying endlessly or silently dropping it.
+
+```sql
+UPDATE jobs SET status = 'dead'
+ WHERE id = $1 AND attempts >= 5;
+-- Now `SELECT * FROM jobs WHERE status='dead'` is a list a human can
+-- actually look at, instead of a retry loop nobody notices.
+```
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── The SKIP LOCKED mechanism, as a queue primitive (recap from M7.4/M7.9) ─
+docker compose exec -T db psql -U ots -d demo -c "
+  CREATE TABLE IF NOT EXISTS jobs_demo (
+    id serial PRIMARY KEY, payload text, status text DEFAULT 'pending',
+    attempts int DEFAULT 0, created_at timestamptz DEFAULT now());
+  TRUNCATE jobs_demo;
+  INSERT INTO jobs_demo (payload) SELECT 'job-' || g FROM generate_series(1,10) g;"
+
+# ── Two workers claim DIFFERENT jobs, atomically, no collision ────────
+(docker compose exec -T db psql -U ots -d demo -c "
+  BEGIN;
+  UPDATE jobs_demo SET status='claimed'
+   WHERE id IN (SELECT id FROM jobs_demo WHERE status='pending'
+                 ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED)
+  RETURNING id;
+  SELECT pg_sleep(3);
+  COMMIT;" 2>&1 | grep -E "^ +[0-9]" | tr '\n' ' ' | xargs echo "worker A claimed:" &)
+sleep 1
+docker compose exec -T db psql -U ots -d demo -c "
+  BEGIN;
+  UPDATE jobs_demo SET status='claimed'
+   WHERE id IN (SELECT id FROM jobs_demo WHERE status='pending'
+                 ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED)
+  RETURNING id;
+  COMMIT;" 2>&1 | grep -E "^ +[0-9]" | tr '\n' ' ' | xargs echo "worker B claimed:"
+sleep 3
+
+# ── Watch the "pending" count — the free dashboard a DB-table queue gives you ─
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT status, count(*) FROM jobs_demo GROUP BY status;"
+
+# ── Simulate a dead-letter transition after repeated failures ─────────
+docker compose exec -T db psql -U ots -d demo -c "
+  UPDATE jobs_demo SET attempts = 6, status='failed' WHERE id = 1;
+  UPDATE jobs_demo SET status='dead' WHERE id = 1 AND attempts >= 5;
+  SELECT id, status, attempts FROM jobs_demo WHERE id = 1;"
+#   Now visible and queryable, instead of retrying forever or vanishing.
+
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE jobs_demo;"
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Option | Note |
+|---|---|---|
+| Already on Postgres, moderate volume | A plain table + `SKIP LOCKED` | Zero new infrastructure; SQL-queryable for free |
+| Already on Redis, need speed/features | **BullMQ** (Node), Sidekiq (Ruby) | Retries, delays, rate limiting, priorities built in |
+| Fully managed, high durability | **AWS SQS**, Google Cloud Tasks | You stop operating the queue yourself |
+| Event streaming at scale (not task queues) | **Kafka** | A different problem — ordered event logs for many consumers, not "do this job once." Reach for it only once you actually have that shape of problem |
+| RabbitMQ | Flexible routing (exchanges/topics) between many services | More operational surface than most teams starting out need |
+
+D7 in the decision library has the full comparison with cost and complexity trade-offs. The honest default for this program's learner: **start with the database-table pattern** (you already run Postgres; M7.4/M7.9 already taught you the primitive), and move to BullMQ or a managed service only once volume or feature needs (scheduled jobs, priorities, built-in dead-lettering) genuinely outgrow it.
+
+What good looks like: anything that takes longer than a user will wait, or risks a platform timeout, returns immediately and does its work on a queue; every handler is idempotent; queue depth is a monitored metric, not a mystery; and jobs that can never succeed land somewhere visible instead of retrying forever or disappearing.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Run the two-worker claim drill** from the Operator block and confirm the two workers' claimed-id sets are disjoint — no job claimed twice.
+
+2. **Watch the free dashboard.** Query `status, count(*)` grouped — this is the exact shape of query that becomes a real monitoring metric (M8.4) the moment you have real jobs flowing through.
+
+3. **Design the export feature from the story properly.** Sketch (in writing, not code) what changes: the button's handler now does an `INSERT` into a jobs table and returns immediately; a worker process picks it up; the user is notified (poll, websocket, or email) when it's done. Identify what makes the *handler* idempotent — what happens if the same export is requested twice before the first finishes?
+
+4. **Simulate the dead-letter transition** and write the query a human would actually run to review dead jobs — what would make that list actionable rather than just a list of failures?
+
+5. **Clean up** the demo table.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A background job processes uploaded CSV files, row by row, inserting each as a database record. For small files it's instant. A customer uploads a 400,000-row file, and twenty minutes later the entire application is unusably slow — not just the upload feature, everything.
+
+<Evidence title="the worker code">
+
+```ts
+async function processUpload(jobId: string) {
+  const { rows } = await db.query("SELECT file_path FROM jobs WHERE id=$1", [jobId]);
+  const records = await parseCSV(rows[0].file_path);     // 400,000 rows, all in memory
+
+  for (const record of records) {
+    await db.query("INSERT INTO imported_rows (data) VALUES ($1)", [record]);
+  }
+  await db.query("UPDATE jobs SET status='done' WHERE id=$1", [jobId]);
+}
+```
+
+</Evidence>
+
+<Evidence title="what's happening during the 20 minutes">
+
+```text
+$ SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+  active: 1    (this worker, running one INSERT after another, nonstop)
+
+$ SELECT now() - xact_start AS running_for FROM pg_stat_activity
+    WHERE query LIKE 'INSERT INTO imported_rows%';
+  (no result — each INSERT is its own tiny transaction, none long-running)
+
+$ Application-wide p95 latency, during the upload: 4.2s (baseline: 90ms)
+$ Other endpoints affected: ALL of them, including ones with no relation
+  to imports
+```
+
+</Evidence>
+
+Each `INSERT` is its own short transaction — M7.3's rule about short transactions is being followed. Why is the *entire application* slow, not just imports?
+
+<Reveal label="Reveal the cause">
+
+**The worker is running 400,000 sequential round-trip database calls with no concurrency control and no yielding, monopolizing the single connection it holds for the entire 20-minute duration, and almost certainly competing for I/O and connection-pool capacity that every other request also needs — this is M7.9's missing brakes, now applied to a queue worker instead of a backfill script.**
+
+**Why "no long-running transaction" didn't save it.** M7.3 is right that each `INSERT` being its own short transaction avoids lock-duration problems — nothing is *locked* for 20 minutes. But the worker is still issuing 400,000 synchronous, sequential round trips as fast as the database can process them, back to back, for the entire window. That's sustained load on the connection (M6.2) and on whatever I/O the inserts touch (indexes being updated 400,000 times, WAL being written 400,000 times) — concentrated, continuous pressure on shared resources, even though no single operation is slow or long-held.
+
+**Why it's invisible in `pg_stat_activity` as "stuck":** nothing is stuck. Every query completes normally in milliseconds. The problem is *volume and rate*, not any individual query's behavior — which is exactly why checking for long-running queries or lock waits (the M7.4 diagnostic) comes back clean here. This needs the M8.4 lens instead: look at throughput and saturation, not individual query duration.
+
+**The fix — apply M7.9's five brakes to this worker, which is structurally a backfill even though nobody labeled it one:**
+
+```ts
+async function processUpload(jobId: string) {
+  const { rows } = await db.query("SELECT file_path FROM jobs WHERE id=$1", [jobId]);
+
+  const batchPool = new Pool({ connectionString: process.env.DATABASE_URL, max: 2 });  // brake 2
+  let batch: any[] = [];
+  let processed = 0;
+
+  for await (const record of streamCSV(rows[0].file_path)) {          // don't load all 400k into memory
+    batch.push(record);
+    if (batch.length >= 500) {                                       // brake 1: chunk
+      await batchPool.query(
+        "INSERT INTO imported_rows (data) SELECT * FROM unnest($1::jsonb[])", [batch]);
+      processed += batch.length;
+      batch = [];
+      await db.query("UPDATE jobs SET progress=$1 WHERE id=$2", [processed, jobId]); // brake 4: resumable
+      await sleep(50);                                                // brake 5: yield
+    }
+  }
+  if (batch.length) await batchPool.query(/* final chunk */ "", [batch]);
+  await db.query("UPDATE jobs SET status='done' WHERE id=$1", [jobId]);
+}
+```
+
+The core change: **batched inserts** (one round trip per 500 rows instead of per row — 800 round trips instead of 400,000), a **dedicated small pool** so this job can't compete with the app for every available connection, a **progress column** so the job is resumable and its state is visible, and a **sleep between batches** so sustained load has gaps the rest of the app can use.
+
+**The transferable lesson:** M7.9's backfill brakes aren't specific to migration scripts — they apply to **any** job that does a large volume of database work, including a queue worker processing one user's upload. "It's in a queue, running in the background" describes *where* the work happens, not whether it's safe; an unthrottled worker is exactly as capable of degrading the whole application as an unthrottled script run directly against production.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Find every endpoint in this codebase that does synchronous work taking more than a couple of seconds, or that could plausibly take that long for a user with unusually large data (a big export, a large file, a long report). For each, tell me whether it risks a platform timeout and design the queued version: what goes in the job payload, how the handler stays idempotent, and how the user finds out when it's done."}>
+The "unusually large data" framing matters — the story's PDF export was fine for most users and only broke for the customer with three years of history. Check it specifically considers the worst realistic case for each endpoint, not just typical traffic. Verify the idempotency design: what happens if the same job is enqueued twice?
+</AgentTask>
+
+<AgentTask prompt={"Review this background job/worker: [paste it]. Does it process items one at a time with individual round trips, or in batches? Does it hold a connection or pool slot for its entire duration regardless of volume? Does it yield between units of work? Treat it as a backfill even if nobody labeled it one, and apply the five brakes from batch-job safety: chunking, bounded concurrency, rate limiting, resumability, and yielding to live traffic."}>
+This audit should catch the exact shape from the break-fix — a worker that looks safe because no single transaction is long, but is still capable of degrading the whole application through sustained volume. Verify it proposes batching the actual database calls, not just adding a sleep — a sleep without batching slows the same 400,000 round trips down without reducing their count.
+</AgentTask>
+
+<AgentTask prompt={"Design a dead-letter policy for this queue: after how many attempts should a job stop retrying automatically, what should happen to it then, and what query or dashboard would let a human review and act on dead jobs? Also check whether our current retry logic has exponential backoff with jitter, or retries immediately in a tight loop."}>
+A tight-loop retry with no backoff is itself a load problem (M7.9's rate-limiting brake, applied to internal retries this time). Verify the dead-letter query it proposes is something a real person would actually check — a dead-letter table nobody looks at is only marginally better than jobs that silently vanish.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Deciding whether something needs a queue:
+
+- Will this take longer than a user will comfortably wait?
+- Could it exceed a platform timeout for some realistic input, even if not typical ones?
+- If the answer to either is yes, does the handler return immediately and enqueue, rather than doing the work inline?
+
+For anything already on a queue:
+
+- Is the handler idempotent? (At-least-once delivery is not optional — M7.7.)
+- Is queue depth ("pending" count) a monitored metric?
+- Is there a dead-letter path after N failures, with a query a human would actually run?
+- If the worker does bulk database work, does it apply M7.9's five brakes — chunking, bounded connections, rate limiting, resumability, yielding?
+
+What good looks like: nothing user-facing risks a timeout for a large-but-realistic input; every job handler survives being run twice; queue depth has a dashboard; and dead jobs are visible, not silently retried forever or dropped.
+
+Red flags: a synchronous endpoint whose runtime scales with a user's data size with no queue as a release valve; a worker processing items one row at a time with no batching; jobs retrying forever with no dead-letter path; "it's in a background job" treated as automatically safe regardless of volume.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l07"
+  questions={[
+    {
+      q: "Why did making PDF generation faster not actually fix the story's export feature?",
+      options: [
+        "Faster generation would have used more memory and caused a different crash",
+        "A synchronous request/timeout shape mismatch doesn't go away with speed improvements — it just delays when the same timeout failure occurs for a large-enough input; the fix is changing the SHAPE to queued work",
+        "PDF generation cannot be made faster in principle",
+        "The timeout was caused by network latency, not generation time"
+      ],
+      answer: 1,
+      explain: "The test from the mental model: if work can take longer than a user will wait or a platform allows, it needs a queue, not a faster synchronous implementation. Speed is a separate, secondary optimization."
+    },
+    {
+      q: "Why must every queue job handler be idempotent, not just 'ideally' but as a hard requirement?",
+      options: [
+        "Idempotency makes jobs run faster",
+        "Every real queue delivers at-least-once — a worker can crash after completing work but before marking it done, so safe redelivery depends on the handler tolerating being run twice",
+        "Idempotent handlers use less memory",
+        "It's only required for queues backed by a database table, not managed services"
+      ],
+      answer: 1,
+      explain: "This is M7.7's idempotency requirement restated as a queue design constraint: the queue's own correctness model assumes redelivery is safe, so the handler must make that true."
+    },
+    {
+      q: "In the CSV-upload break-fix, why did the application-wide slowdown happen even though every individual INSERT completed in milliseconds with no long-running transaction?",
+      options: [
+        "The database had a memory leak unrelated to the inserts",
+        "400,000 sequential round trips, back to back for 20 minutes, created sustained load on shared I/O and connection capacity — a volume and rate problem invisible to lock-duration or long-query diagnostics",
+        "The CSV parser was blocking the Node.js event loop",
+        "Each INSERT was implicitly acquiring a table-level lock"
+      ],
+      answer: 1,
+      explain: "M7.4's lock-wait diagnostic and M7.3's short-transaction check both come back clean here — the problem needs M8.4's saturation lens (throughput, not duration) to see. M7.9's five brakes apply to this worker even though nobody labeled it a backfill."
+    },
+    {
+      q: "What is a dead-letter queue, and why is it better than retrying forever or dropping a failed job silently?",
+      options: [
+        "A faster queue for high-priority jobs",
+        "A place a permanently-failing job is moved after N attempts, so it's visible and queryable by a human instead of consuming worker capacity forever or disappearing unnoticed",
+        "A queue that only holds jobs during off-peak hours",
+        "A backup copy of every job, kept in case the primary queue fails"
+      ],
+      answer: 1,
+      explain: "A malformed payload or a real bug will fail every single retry attempt. Retrying forever wastes capacity on something that can never succeed; dropping it silently means nobody ever learns about the failure at all."
+    },
+    {
+      q: "Why does a plain Postgres table with SKIP LOCKED count as a legitimate queue, not just a workaround?",
+      options: [
+        "It's always faster than Redis-backed or managed queue options",
+        "It needs no new infrastructure if you already run Postgres, and it's directly queryable with ordinary SQL — `SELECT status, count(*) GROUP BY status` is a real monitoring dashboard with zero extra tooling",
+        "It automatically provides exactly-once delivery, unlike other queue types",
+        "It scales to arbitrarily high throughput without any limitation"
+      ],
+      answer: 1,
+      explain: "The verified mechanism from M7.4/M7.9: two workers claiming disjoint rows atomically, with no collision. It's the right default until volume or feature needs (built-in delays, priorities, dead-lettering) genuinely outgrow it — not something to avoid by default in favor of a dedicated product."
+    }
+  ]}
+/>
+
+</Section>

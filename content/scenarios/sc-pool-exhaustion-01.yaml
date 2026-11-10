@@ -1,0 +1,44 @@
+id: sc-pool-exhaustion-01
+module: M6
+lesson: m06-l02
+title: "Connection errors that only appear after deploys"
+difficulty: hard
+symptom: "An intermittent 'timeout expired getting a connection from the pool' error appears only in the ten minutes after every deploy, several times a day."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: deploy
+      apply: scripts/break/no-graceful-pool-shutdown.patch   # old instances don't close their pool on SIGTERM
+    - type: traffic
+      apply: scripts/load/rolling-deploy-simulation.js
+evidence:
+  logs: true
+  metrics: [db.connections, pool.timeouts]
+  db_console: true
+  notes: "pg_stat_activity shows connections from instances older than the current deploy, grouped by application_name."
+agent:
+  context: "You can see the error only correlates with deploy timing."
+  bias: "proposes raising max_connections or the pool size rather than looking at shutdown behavior"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - connections-return-to-baseline-after-deploy
+    - no-stale-instance-connections
+  root_cause_markers:
+    - SIGTERM handler added that explicitly closes the pool
+    - learner identifies compounding across multiple deploys, not a single-deploy spike
+  symptom_only_markers:
+    - max_connections or pool size raised with shutdown behavior unchanged
+    - deploy frequency reduced as the fix
+hints:
+  - "Group pg_stat_activity by application_name or instance id. Is anything there older than the current deploy?"
+  - "What is supposed to happen to an instance's connections when it's killed? Is anything making that happen explicitly?"
+  - "Does the connection count after one deploy fully return to baseline, or does it creep up slightly each time?"
+  - "Reveal: add an explicit SIGTERM handler that closes the pool before exit, and verify connections drop immediately."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 25
+  agent_verification: 20

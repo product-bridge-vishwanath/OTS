@@ -1,0 +1,43 @@
+id: sc-migration-rewrite-01
+module: M6
+lesson: m06-l03
+title: "A unique constraint that reveals a collision bug"
+difficulty: hard
+symptom: "A Friday migration added a NOT NULL unique referral_code column. It succeeded. Monday, 1 in 8 new signups fail with a duplicate key error."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: migration
+      apply: scripts/break/short-hash-referral-code.sql   # expand/backfill/contract applied correctly, but the generator has low entropy
+evidence:
+  logs: true
+  metrics: [signup.success_rate, db.duplicate_key_errors]
+  db_console: true
+  notes: "The migration file and the signup code path are both available for inspection."
+agent:
+  context: "You wrote and reviewed the migration and consider the schema change itself correct."
+  bias: "proposes removing or loosening the unique constraint to stop the errors"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - signup-success-rate-100-pct
+    - constraint-remains-enforced     # removing it is a symptom-only fix
+  root_cause_markers:
+    - learner traces the duplicate key error to the code generator's entropy, not the migration mechanics
+    - retry-on-conflict added to the insert path
+    - code generator's entropy increased
+  symptom_only_markers:
+    - unique constraint dropped or weakened
+    - migration rolled back with no fix to the generator
+hints:
+  - "The ALTER TABLE statements used the correct expand/backfill/contract pattern. Is the migration mechanics the bug?"
+  - "What generates the value this constraint now enforces? Has that code been reviewed?"
+  - "Estimate the collision probability of an 8-character hex substring across tens of thousands of rows."
+  - "Reveal: the constraint is correct and caught a real bug. Fix the generator's entropy and retry on conflict."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

@@ -1,0 +1,44 @@
+id: sc-key-scope-01
+module: M4
+lesson: m04-l03
+title: "The map feature's bill jumped $380 and the key wasn't even leaked from a repo"
+difficulty: guided
+symptom: "A client-exposed map API key was scraped straight from page source (as it's meant to be visible) and used from an unrelated domain for an API this app never calls, racking up charges."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/unrestricted-client-key.sh   # removes referrer/API restrictions on a demo client-side key
+    - type: traffic
+      apply: scripts/load/unauthorized-referrer-calls.js
+evidence:
+  logs: false
+  metrics: [provider.requests_by_referrer, provider.requests_by_api]
+  db_console: false
+agent:
+  context: "The map key is intentionally client-exposed — that part was always correct."
+  bias: "treats 'it's supposed to be public' as 'no restrictions needed', and focuses on rotating rather than scoping"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - referrer-restriction-set
+    - api-restriction-set
+    - budget-cap-set
+  root_cause_markers:
+    - learner distinguishes "client-exposed by design" from "unrestricted"
+    - learner adds both a domain/referrer restriction and an API/action scope restriction
+  symptom_only_markers:
+    - key rotated with identical (no) restrictions, recreating the same exposure
+    - restriction added for one dimension (referrer OR API) but not the other
+hints:
+  - "This key was always meant to be visible in the browser. Is visibility the actual problem here?"
+  - "Look at which API is being called that this app's code never calls."
+  - "A key with no application restriction works from any domain that finds it — and finding a public key in page source is trivial."
+  - "Reveal: the key was correctly client-exposed but had no referrer restriction and no API scope. Restrict to this domain and to only the Maps JS API, then set a budget cap as a backstop."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

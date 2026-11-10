@@ -1,0 +1,369 @@
+---
+id: m06-l01
+module: M6
+title: "Relational fundamentals: tables, keys, and why a query is slow"
+order: 1
+difficulty: 2
+depth: both
+platforms: [postgres, supabase, neon, rds]
+concepts: [relational-model, indexes]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-missing-index-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder's booking list page loaded instantly for the first four months. In month five, it started taking "a couple of seconds." By month seven it was six seconds, and support tickets started arriving: *"your site is so slow."*
+
+She asked her agent. It suggested adding a cache. She added Redis, wired it into the listing endpoint, and the page got fast again — for about three weeks, until someone created a booking and the cached list didn't include it, and a customer double-booked a room the UI had shown as free.
+
+The actual cause was never about caching. Her `bookings` table had grown from 50 rows to 400,000, and every query against it was reading **every single row** to find the handful that mattered — because nothing told Postgres it didn't have to. One command would have fixed the real problem in under a second, with no new moving part, no staleness risk, and no double booking:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_bookings_date ON bookings (date);
+```
+
+She had reached for the second-most-complicated fix in the entire curriculum before trying the simplest one.
+
+</Section>
+
+<Section kind="already-did">
+
+You've typed `SELECT * FROM users WHERE email = '...'` into a database console and gotten an instant answer, because your table had a hundred rows. You've also, at some point, watched a query that used to be instant start taking seconds — and if you're like the founder above, your first instinct was to add something (a cache, a bigger instance) rather than to ask what the database was actually *doing* to answer that query.
+
+This lesson gives you the one tool that answers that question directly: `EXPLAIN ANALYZE`. Everything else in this module — pooling, migrations, caching, queues — assumes you already know whether your actual problem is "this one query is slow" or something else, and this is how you find out.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Tables, rows, keys — fast if you already know this
+
+A relational database stores **tables** (rows of the same shape), each row identified by a **primary key**. A **foreign key** says "this value must exist as a primary key somewhere else" — it's what makes `bookings.room_id = 999` for a room that doesn't exist impossible rather than merely a bug waiting to happen. A **constraint** is any rule the database enforces regardless of which code path writes the row (`NOT NULL`, `UNIQUE`, `CHECK`, the exclusion constraints from M7.2).
+
+If all of that is familiar, skip to the next section — the part worth your full attention is what happens when the table gets big.
+
+### What actually happens when you run a query
+
+Postgres doesn't execute your SQL. It compiles a **plan** — a strategy for finding the rows — and executes *that*. The plan it picks depends entirely on what it can use to avoid reading rows it doesn't need.
+
+<svg viewBox="0 0 780 260" role="img" aria-label="Two strategies for the same query: a sequential scan reads every row and checks each one, while an index scan jumps straight to matching rows via a sorted structure" className="diagram">
+  <text x="12" y="20" className="sub">SEQ SCAN — no index: read every row, check each one</text>
+  <rect x="8" y="30" width="60" height="30" rx="4" />
+  <rect x="76" y="30" width="60" height="30" rx="4" />
+  <rect x="144" y="30" width="60" height="30" rx="4" />
+  <rect x="212" y="30" width="60" height="30" rx="4" />
+  <rect x="280" y="30" width="60" height="30" rx="4" />
+  <text x="340" y="50" className="sub">… 400,000 rows …</text>
+  <text x="12" y="80" className="sub">cost scales with TABLE SIZE — fine at 50 rows, ruinous at 400,000</text>
+
+  <text x="12" y="126" className="sub">INDEX SCAN — a sorted structure points straight at matches</text>
+  <rect x="8" y="136" width="760" height="40" rx="6" />
+  <text x="390" y="160" textAnchor="middle" className="sub">B-tree on (date): lookup is O(log n) — a few comparisons, not 400,000</text>
+  <path d="M 200 176 L 200 196" className="arrow" />
+  <path d="M 500 176 L 500 196" className="arrow" />
+  <rect x="150" y="200" width="100" height="30" rx="4" />
+  <rect x="450" y="200" width="100" height="30" rx="4" />
+  <text x="12" y="248" className="sub">cost scales with RESULT SIZE and index depth — barely changes as the table grows</text>
+</svg>
+
+A sequential scan is not a bug — it's the *correct* choice for a tiny table, or for a query that genuinely needs most of the rows. It becomes wrong only when the table grows and nothing gives the planner an alternative.
+
+### Reading `EXPLAIN ANALYZE`
+
+<Callout type="key">
+**`EXPLAIN` alone shows estimates. `EXPLAIN ANALYZE` actually runs the query and shows what really happened** — real time, real row counts, real I/O. Estimates can be wrong (stale statistics, skewed data); reality isn't. Always use `ANALYZE` when diagnosing, and add `BUFFERS` to see how much was read from disk versus cache.
+</Callout>
+
+The four numbers that matter, reading from the innermost operation outward:
+
+| What to look at | Tells you |
+|---|---|
+| `Seq Scan` vs `Index Scan` / `Bitmap Index Scan` | Whether an index was usable at all |
+| `rows=X` (planned) vs `actual rows=Y` | Whether the planner's estimate is realistic |
+| `Rows Removed by Filter: N` | Rows read and then discarded — pure waste |
+| `actual time=A..B` | Time to first row, time to finish |
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;
+```
+
+### Why `OR`, functions, and wildcards defeat indexes
+
+An index on `(date)` helps `WHERE date = $1`. It does **not** automatically help:
+
+| Query shape | Why the index can't be used |
+|---|---|
+| `WHERE lower(email) = $1` | The index is on `email`, not `lower(email)` — needs an expression index |
+| `WHERE name LIKE '%smith'` | A leading wildcard can't use a sorted index; `'smith%'` can |
+| `WHERE date = $1 OR vip = true` | Postgres may need to scan for the `OR` branch anyway |
+| `WHERE date::text = $1` | Casting defeats the match unless the index matches the cast |
+
+The fix is usually matching the index to the exact expression the query uses, or rewriting the query to match an index you already have. This is also why "I have an index and it's still slow" is a real, common sentence — the index exists and the query simply doesn't use it.
+
+### Composite indexes and column order
+
+An index on `(room_id, date)` serves `WHERE room_id = $1 AND date = $2` *and* `WHERE room_id = $1` alone — but **not** `WHERE date = $2` alone efficiently. Order matters: put the column used for exact equality first, the one used for range/sort last. This is the index M7.2's exclusion constraint is built on top of.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Baseline: tiny table, seq scan is fine, and that's correct ───────
+docker compose exec -T db psql -U ots -d demo -c \
+  "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;"
+#   Seq Scan, sub-millisecond. Nothing wrong — 3 rows doesn't need an index.
+
+# ── Grow the table to the size that changes the story ─────────────────
+docker compose exec -T db psql -U ots -d demo -f /dev/stdin \
+  < scripts/break/missing-index-growth.sql
+#   bookings now: 400,003
+
+# ── The SAME query, now against 400k rows ─────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;"
+#   Verified: Gather / Parallel Seq Scan, ~11.7ms, shared hit=7179 buffers,
+#   "Rows Removed by Filter: 132969" per worker — that's the waste, made visible.
+
+# ── Add the index CONCURRENTLY (no table lock — see M7.4) ────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "CREATE INDEX CONCURRENTLY idx_bookings_date ON bookings (date);"
+
+# ── Same query again ───────────────────────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c \
+  "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;"
+#   Verified: Bitmap Heap Scan + Bitmap Index Scan, ~2.1ms, shared hit=1099.
+#   Buffers read dropped ~6.5x, time dropped ~5.5x, and it gets BETTER
+#   relative to a seq scan as the table keeps growing — a seq scan gets
+#   worse forever; an index lookup barely notices.
+
+# ── Which queries actually cost the most, ranked? (pg_stat_statements) ─
+#   Enabled for this stack via shared_preload_libraries in compose.yaml.
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT calls, round(total_exec_time::numeric,1) AS total_ms,
+         round(mean_exec_time::numeric,3) AS mean_ms, left(query,60) AS query
+    FROM pg_stat_statements
+   WHERE query NOT ILIKE '%pg_stat%'
+   ORDER BY total_exec_time DESC LIMIT 10;"
+#   Rank by TOTAL time, not mean — a 2ms query called 50,000 times can
+#   cost more than a 2s query called once (M8.5's N+1 lesson, restated
+#   from the database side).
+
+# ── Which tables have never used an index? (the early-warning signal) ─
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT relname, seq_scan, idx_scan, n_live_tup
+    FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 5;"
+#   idx_scan = 0 on a table with real traffic is the tell — it's growing
+#   toward the founder's story and nobody has noticed yet.
+
+# ── Clean up: drop the index, remove the grown rows ───────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  DROP INDEX IF EXISTS idx_bookings_date;
+  DELETE FROM bookings WHERE customer_name LIKE 'archived-customer-%';"
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| See the real plan | `EXPLAIN (ANALYZE, BUFFERS)` |
+| Rank queries by actual cost | `pg_stat_statements` (needs `shared_preload_libraries`) |
+| Find tables that never use their indexes | `pg_stat_user_tables` |
+| Visualise a plan | explain.depesz.com, explain.dalibo.com (paste the `EXPLAIN` output) |
+| Watch slow queries live | `log_min_duration_statement` in `postgresql.conf` |
+| GUI exploration | Supabase/Neon's built-in query editor, TablePlus, pgAdmin |
+
+What good looks like: before adding a cache, a bigger instance, or a new service, you've run `EXPLAIN ANALYZE` on the actual slow query and can name which operation dominates the time. The founder's cache would have been unnecessary — and would have introduced a correctness bug — if she'd spent five minutes here first.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Run the baseline.** `EXPLAIN ANALYZE` the bookings-by-date query at the current (tiny) size. Note it's a seq scan and that's *fine* — write down why.
+
+2. **Grow and re-measure.** Run the growth script, then the same query. Read `Rows Removed by Filter` and compare it to the actual row count returned. That gap is pure waste.
+
+3. **Add the index and re-measure again.** Confirm the plan type changes (`Seq Scan`/`Parallel Seq Scan` → `Bitmap Heap Scan` or `Index Scan`) and record the buffer and time reduction.
+
+4. **Rank real query cost.** Generate some traffic (`node scripts/load/steady-browse-and-order.js &` for 20 seconds, then stop it) and run the `pg_stat_statements` ranking query. Identify the single most expensive query by total time, not by how it feels.
+
+5. **Break an index on purpose and watch it fail to help.** Add the index on `date`, then run a query that can't use it:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "EXPLAIN ANALYZE SELECT * FROM bookings WHERE date::text LIKE '2026%';"
+   ```
+   Confirm it's still a sequential scan despite the index existing, and explain why from the mental model.
+
+6. **Clean up** per the last Operator block, confirming `bookings` is back to 3 rows.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A SaaS dashboard's "recent activity" widget, which queries the `events` table, has gone from instant to 4+ seconds over two months. No deploy correlates. The team's first instinct, per their Slack thread, was "we should probably shard the database."
+
+<Evidence title="the query and its plan">
+
+```sql
+SELECT * FROM events
+ WHERE type = 'booking.created'
+ ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+ Limit  (cost=18562.40..18562.45 rows=20) (actual time=3812.221..3812.238 rows=20 loops=1)
+   ->  Sort  (actual time=3812.219..3812.224 rows=20 loops=1)
+         Sort Key: created_at DESC
+         Sort Method: top-N heapsort  Memory: 28kB
+         ->  Seq Scan on events  (actual time=0.015..3781.044 rows=41203 loops=1)
+               Filter: (type = 'booking.created'::text)
+               Rows Removed by Filter: 1158797
+ Planning Time: 0.187 ms
+ Execution Time: 3812.301 ms
+```
+
+</Evidence>
+
+<Evidence title="table stats">
+
+```text
+ relname |  n_live_tup | seq_scan | idx_scan
+---------+-------------+----------+----------
+ events  |     1200000 |    48112 |        0
+```
+
+</Evidence>
+
+Sharding is a multi-week, high-risk project. Is it the right next step?
+
+<Reveal label="Reveal the cause">
+
+**No index serves this query, and the table has grown to 1.2 million rows. Sharding would not fix this — it would recreate the exact same unindexed scan on each shard.**
+
+The plan reads precisely: a `Seq Scan` reads all 1.2 million rows, keeps only the ~41,203 matching `type = 'booking.created'`, discards 1,158,797 of them, then sorts the survivors to find the top 20. `idx_scan = 0` on `pg_stat_user_tables` confirms this table has never used an index in its life — it's the demo app's own `events` table shape (planted anti-pattern AP5: an everything-in-one-table log with no indexes), at a scale where the cost finally became visible.
+
+**The fix is one index, matched to the query's actual shape** — equality filter first, sort column second, exactly the composite-index rule from the mental model:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_type_created
+  ON events (type, created_at DESC);
+```
+
+This serves the filter *and* the sort in one structure — Postgres can walk the index in exactly the order the query wants, no separate sort step needed. Re-running the query afterward should show an `Index Scan` with execution time measured in low single-digit milliseconds, not seconds.
+
+**Why "shard it" was the wrong instinct, and a dangerous one:** sharding splits data across multiple databases by a key, solving *write throughput* and *storage* limits that don't exist here — the table isn't too big for one server, one query against it is reading it inefficiently. Every shard would have the identical missing index and the identical sequential scan, just on a fraction of the rows each — still slow, now with the added complexity of cross-shard queries, rebalancing, and a much harder rollback if it goes wrong. D1 and D11's decision pages exist precisely so "we need to shard" gets checked against cheaper fixes first; this is the textbook case where it wasn't.
+
+**The transferable lesson:** before any architectural response to "this is slow" — sharding, a cache, a bigger instance, a different database engine — run `EXPLAIN ANALYZE` on the actual query and read what it's doing. A missing index produces symptoms that *look* like "we've outgrown our database," and the fix for both looks nothing alike.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Run EXPLAIN (ANALYZE, BUFFERS) on this slow query: [paste query]. Tell me whether it uses an index, how many rows were read versus returned, and what single index — naming the exact columns and their order — would most improve it. Do not suggest caching, read replicas, or any architectural change until you've shown me the index wouldn't be enough."}>
+The ordering constraint in the prompt matters: it forces the cheapest fix to be considered first. Verify the suggested column order yourself against the mental model's composite-index rule (equality columns before range/sort columns), and run the before/after EXPLAIN ANALYZE rather than trusting the explanation.
+</AgentTask>
+
+<AgentTask prompt={"Using pg_stat_statements, find the five queries costing the most TOTAL execution time in this database (not mean time), and for each tell me whether the cost is one slow query called rarely or a fast query called very often. For the latter, check whether it's an N+1 pattern from application code rather than something an index can fix."}>
+The total-vs-mean distinction is the one agents get backwards by default. A query with `mean_ms` of 2 and `calls` of 80,000 is often an N+1 (M8.5) that no index fixes — the fix is batching the application's queries, not tuning the SQL.
+</AgentTask>
+
+<AgentTask prompt={"Audit this schema for tables with high seq_scan counts and idx_scan near zero relative to their row count, using pg_stat_user_tables. For each, show the query patterns hitting that table (from pg_stat_statements if available) and propose the specific index each needs, with the DDL using CREATE INDEX CONCURRENTLY."}>
+This is the early-warning scan that would have caught the founder's problem in month two instead of month five. Verify it used `CONCURRENTLY` in every suggestion — a plain `CREATE INDEX` locks the table for writes for its duration (M7.4), which on a growing table is itself an incident.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before adding a cache, scaling a database, or re-architecting:
+
+- Have I run `EXPLAIN (ANALYZE, BUFFERS)` on the actual slow query?
+- Is it a `Seq Scan` on a table bigger than a few thousand rows?
+- How many rows were read versus returned? (`Rows Removed by Filter`)
+- Does an index exist that matches this query's exact filter and sort columns, in the right order?
+- Have I checked `pg_stat_statements`, ranked by total time, for what's *actually* expensive — not what feels slow?
+- Does `pg_stat_user_tables` show any growing table with `idx_scan` near zero?
+
+What good looks like: you can state, for any slow endpoint, exactly which query dominates its latency and what the plan says about why — before reaching for a bigger instance or a cache.
+
+Red flags: "add a cache" as the first response to slowness; "we need to shard" without an `EXPLAIN ANALYZE` in hand; an index that exists but is never used because the query doesn't match it.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l01"
+  questions={[
+    {
+      q: "Why is EXPLAIN ANALYZE more trustworthy than plain EXPLAIN when diagnosing a slow query?",
+      options: [
+        "ANALYZE runs faster because it skips planning",
+        "Plain EXPLAIN shows the planner's ESTIMATES, which can be wrong on stale statistics; ANALYZE actually runs the query and reports what really happened",
+        "ANALYZE only works on indexed tables",
+        "EXPLAIN alone doesn't show the query plan at all"
+      ],
+      answer: 1,
+      explain: "Estimates can mislead you into fixing the wrong thing. Always add ANALYZE (and BUFFERS) when diagnosing — the founder's table-growth story and the break-fix's events table both required real numbers, not estimates."
+    },
+    {
+      q: "A table has an index on `email`, but `WHERE lower(email) = $1` still does a sequential scan. Why?",
+      options: [
+        "Indexes only work on primary keys",
+        "The index is on the raw column, not the expression `lower(email)` — the planner can't match a function call against a plain-column index",
+        "The table needs ANALYZE to be run manually",
+        "lower() always forces a sequential scan regardless of indexing"
+      ],
+      answer: 1,
+      explain: "This is why 'I have an index and it's still slow' is a real sentence — the index exists but doesn't match the query's actual expression. The fix is an expression index on lower(email), or rewriting the query."
+    },
+    {
+      q: "In the break-fix, why was 'shard the database' the wrong next step?",
+      options: [
+        "Sharding requires a different database engine entirely",
+        "Every shard would have the identical missing index, recreating the same sequential scan on a fraction of the rows — the problem was never about total data volume",
+        "Sharding only helps write-heavy workloads, and this was a read",
+        "The events table was too small to shard"
+      ],
+      answer: 1,
+      explain: "Sharding solves write throughput and storage limits. A missing index produces symptoms that look like 'we've outgrown our database' while the actual fix is one CREATE INDEX CONCURRENTLY — and a much smaller, safer change."
+    },
+    {
+      q: "Why rank queries in pg_stat_statements by total_exec_time rather than mean_exec_time?",
+      options: [
+        "Total time is more precise for short queries",
+        "A fast query called extremely often (often an N+1 pattern) can cost more in aggregate than a slow query called once — mean time hides that entirely",
+        "mean_exec_time is not tracked unless logging is enabled",
+        "Total time excludes planning overhead"
+      ],
+      answer: 1,
+      explain: "A 2ms query called 80,000 times outweighs a 2-second query called once. Ranking by total time is also how you spot N+1 patterns from the database side, which no index can fix — the fix is batching in application code."
+    },
+    {
+      q: "What does a composite index on (room_id, date) efficiently serve, and what does it NOT serve well?",
+      options: [
+        "It serves any query touching either column equally well",
+        "It serves `WHERE room_id = $1 AND date = $2` and `WHERE room_id = $1` alone, but NOT `WHERE date = $2` alone — column order matters",
+        "It only serves queries that filter on both columns simultaneously",
+        "It serves date range queries but not exact room_id lookups"
+      ],
+      answer: 1,
+      explain: "The rule: put the equality column first, the range/sort column last. An index can be used as a prefix (room_id alone) but not by skipping to a later column (date alone) efficiently."
+    }
+  ]}
+/>
+
+</Section>

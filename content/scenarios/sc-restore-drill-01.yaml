@@ -1,0 +1,43 @@
+id: sc-restore-drill-01
+module: M6
+lesson: m06-l04
+title: "Three weeks of green backups, every file empty"
+difficulty: realistic
+symptom: "During a real disaster, every nightly backup for the last three weeks turns out to be a zero-byte file. Monitoring showed green every night."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: credentials
+      apply: scripts/break/rotated-backup-credential.sh   # pg_dump fails auth, script logs success anyway
+evidence:
+  logs: true
+  metrics: [backup.file_size, backup.job_exit_code]
+  db_console: true
+  notes: "The backup script's log and the actual backup files (all zero bytes) are both inspectable."
+agent:
+  context: "You can see the monitoring dashboard has shown green for three weeks."
+  bias: "trusts the log line and looks for the disaster's cause elsewhere"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - backup-script-fails-loudly-on-error
+    - restore-verification-job-exists
+  root_cause_markers:
+    - learner identifies the script logs success unconditionally regardless of pg_dump's actual exit code
+    - error handling added (set -euo pipefail, explicit exit code and file size checks)
+    - a periodic restore-and-verify job proposed or added
+  symptom_only_markers:
+    - credential rotated with no change to the script's error handling
+    - monitoring threshold adjusted without checking the artifact itself
+hints:
+  - "The log says 'backup completed' every night. What does the script actually check before writing that line?"
+  - "Look at the file sizes, not just whether the files exist."
+  - "What would catch this that checking the log line cannot?"
+  - "Reveal: the script logs success unconditionally. Add real error handling and a periodic restore-and-verify job."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

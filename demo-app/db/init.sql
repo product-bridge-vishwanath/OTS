@@ -1,3 +1,7 @@
+-- pg_stat_statements is loaded via shared_preload_libraries in compose.yaml;
+-- this just creates the view onto its collected stats.
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
 -- Riverside Studios — teaching schema.
 -- ⚠ This schema DELIBERATELY contains the anti-patterns from OTS modules
 -- M6.8 and M7.6. They are drill material. Do not "fix" them here; the

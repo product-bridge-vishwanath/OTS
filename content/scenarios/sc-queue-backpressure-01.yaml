@@ -1,0 +1,47 @@
+id: sc-queue-backpressure-01
+module: M6
+lesson: m06-l07
+title: "A CSV upload makes the whole app slow, not just imports"
+difficulty: hard
+symptom: "A background job processes an uploaded 400,000-row CSV one row at a time. Twenty minutes in, the entire application is unusably slow — not just the upload feature."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: job
+      apply: scripts/break/row-by-row-worker.js   # sequential single-row inserts, shared pool, no batching or yielding
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [db.connections, latency.p95, worker.rows_processed]
+  db_console: true
+  notes: "pg_stat_activity shows no long-running transactions and no lock waits, which is the misleading part."
+agent:
+  context: "You checked for long-running transactions and lock waits and found none."
+  bias: "concludes the database is healthy since no query is individually slow or stuck"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - app-latency-unaffected-by-upload
+    - worker-uses-dedicated-pool
+    - worker-batches-inserts
+  root_cause_markers:
+    - learner identifies sustained volume/rate as the cause, not any single slow or stuck query
+    - inserts batched instead of one-row-at-a-time
+    - worker given its own small connection pool separate from the app
+    - a yield/sleep added between batches
+  symptom_only_markers:
+    - connection pool size increased with the row-by-row pattern unchanged
+    - the job moved to run at night with no change to its resource usage
+hints:
+  - "Every individual INSERT completes in milliseconds. Is 'nothing is slow' the same as 'nothing is wrong'?"
+  - "Check pg_stat_activity for long transactions and lock waits. Clean. Now check throughput instead of duration."
+  - "This worker is structurally a backfill. Which of M7.9's five brakes does it have?"
+  - "Reveal: 400,000 sequential round trips saturate shared I/O and connections. Batch the inserts, give it its own small pool, and yield between batches."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

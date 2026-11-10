@@ -1,0 +1,402 @@
+---
+id: m06-l05
+module: M6
+title: "Why Redis exists: cache, sessions, limits, and a queue in one box"
+order: 5
+difficulty: 2
+depth: both
+platforms: [redis, upstash, postgres]
+concepts: [caching]
+prerequisites: [m07-l01]
+lab: demo-repo
+scenario_ids: [sc-redis-eviction-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A team's app worked perfectly for weeks, then started throwing `OOM command not allowed when used memory > 'maxmemory'` on writes that had nothing to do with memory management from the application's point of view — a simple session save, failing with an out-of-memory error from the *cache*, not the database.
+
+What had happened: they'd been using Redis correctly for caching, then added session storage to the same instance without checking its configuration. Redis was set to `maxmemory 256mb` with `maxmemory-policy noeviction` — a default that means "when full, **refuse new writes** rather than quietly deleting anything." For a pure cache, eviction (deleting old entries to make room) is exactly what you want; for session data, evicting a session mid-use would silently log users out, which is arguably worse than refusing the write. Someone had correctly set `noeviction` for the session use case, months earlier, for a completely different reason — and then the cache's growth filled the same shared instance and started blocking the sessions it was never supposed to interact with at all.
+
+One tool, five genuinely different jobs, and a configuration that was right for one job and wrong for another, silently, until the instance filled up.
+
+</Section>
+
+<Section kind="already-did">
+
+You've added Redis to a project because a tutorial or an agent said "you'll want Redis for caching" — and if you looked at what it actually does, you've seen it hold things that have nothing to do with caching: rate limit counters (M7.1's break-fix), session tokens, maybe a job queue. "Redis" in most stacks isn't one feature; it's five, bolted onto one very fast key-value store, and conflating them is how the story's incident happens.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Five jobs, one engine
+
+Redis is fast (in-memory) and simple (key-value, with a few useful data structures) — and that combination happens to be exactly what five unrelated problems need:
+
+| Job | What Redis gives it | Example |
+|---|---|---|
+| **Cache** | Fast reads, with a TTL that auto-expires | The demo app's `rooms:all`, 600s TTL |
+| **Session store** | Fast reads/writes, survives restarts (unlike M1.1's in-process `Map`) | A logged-in user's session, shared across instances |
+| **Rate limiter** | Atomic `INCR` with an expiry — no read-modify-write race (M7.1) | "5 signups per minute per IP" |
+| **Pub/sub** | Instant fan-out to any number of listeners | "Notify all connected clients a booking changed" |
+| **Job queue** | A list (or sorted set) workers can pop from | BullMQ, or your own `LPUSH`/`BRPOP` |
+
+<svg viewBox="0 0 780 240" role="img" aria-label="One Redis instance serving five different jobs, each wanting a different eviction policy and TTL behavior, sharing one memory ceiling" className="diagram">
+  <rect x="300" y="16" width="180" height="60" rx="10" />
+  <text x="390" y="40" textAnchor="middle">ONE Redis instance</text>
+  <text x="390" y="60" textAnchor="middle" className="sub">ONE maxmemory ceiling</text>
+
+  <rect x="8" y="120" width="140" height="50" rx="8" />
+  <text x="78" y="142" textAnchor="middle" className="sub">Cache</text>
+  <text x="78" y="160" textAnchor="middle" className="sub">wants: evict freely</text>
+
+  <rect x="156" y="120" width="140" height="50" rx="8" />
+  <text x="226" y="142" textAnchor="middle" className="sub">Sessions</text>
+  <text x="226" y="160" textAnchor="middle" className="sub">wants: never evict</text>
+
+  <rect x="304" y="120" width="140" height="50" rx="8" />
+  <text x="374" y="142" textAnchor="middle" className="sub">Rate limits</text>
+  <text x="374" y="160" textAnchor="middle" className="sub">wants: atomic INCR</text>
+
+  <rect x="452" y="120" width="140" height="50" rx="8" />
+  <text x="522" y="142" textAnchor="middle" className="sub">Pub/sub</text>
+  <text x="522" y="160" textAnchor="middle" className="sub">wants: no persistence</text>
+
+  <rect x="600" y="120" width="172" height="50" rx="8" />
+  <text x="686" y="142" textAnchor="middle" className="sub">Job queue</text>
+  <text x="686" y="160" textAnchor="middle" className="sub">wants: never lost</text>
+
+  <path d="M 78 116 L 300 70" className="arrow" />
+  <path d="M 226 116 L 350 76" className="arrow" />
+  <path d="M 374 116 L 390 76" className="arrow" />
+  <path d="M 522 116 L 430 76" className="arrow" />
+  <path d="M 686 116 L 480 70" className="arrow" />
+
+  <text x="12" y="210" className="sub">One eviction policy, one memory ceiling, five conflicting preferences —</text>
+  <text x="12" y="230" className="sub">whichever job grows fastest can starve every other job sharing the instance.</text>
+</svg>
+
+<Callout type="key">
+These five jobs want **different configuration**, and Redis will happily let you run all five on one instance with one config, which is exactly how the story's incident happened. Before putting a second job on an existing Redis instance, ask whether its eviction and persistence needs match what's already configured — not whether Redis "can" do it, which it always can.
+</Callout>
+
+### Caching: the one job every app meets first
+
+The pattern the demo app already uses:
+
+```ts
+const cached = await redis.get("rooms:all");
+if (cached) return JSON.parse(cached);          // fast path: served from memory
+
+const rows = await db.query("SELECT * FROM rooms");
+await redis.set("rooms:all", JSON.stringify(rows), "EX", 600);   // TTL: 10 min
+return rows;
+```
+
+Three decisions hide in those four lines, and getting any of them wrong produces a real bug:
+
+- **TTL length** is a bet on how stale is acceptable. Too long, and a price change takes 10 minutes to show up anywhere (M6's planted anti-pattern AP8, in the demo app right now).
+- **Invalidation on write** — the better fix for AP8 — means the code that *changes* a room also deletes its cache key, so the next read is forced to go fresh:
+  ```ts
+  await db.query("UPDATE rooms SET hourly_rate=$1 WHERE id=$2", [rate, id]);
+  await redis.del("rooms:all");       // next read refetches — no stale window at all
+  ```
+- **What happens when Redis is down.** The demo app's `/api/rooms` route already does this correctly — `try/catch` around the Redis call, falling through to the database on failure. A cache that can take your *app* down when it's unavailable has stopped being a cache and become a single point of failure (M9.3 goes deeper on this).
+
+### Eviction policy: the setting that decides what "full" means
+
+| Policy | Behavior when `maxmemory` is reached |
+|---|---|
+| `noeviction` (default) | **Refuse new writes** with an error — safest for data you can't afford to lose, wrong for a pure cache |
+| `allkeys-lru` | Quietly delete the least-recently-used key to make room — correct for a cache, wrong for sessions |
+| `allkeys-lfu` | Delete the least-*frequently*-used key — similar, tuned for different access patterns |
+| `volatile-lru` | Only evict keys that have a TTL set, leaving keys with no TTL untouched |
+
+The demo app's Redis is currently `noeviction` with `maxmemory` unset (0 = unlimited) — fine for a small teaching instance, and a real production gotcha if left that way: with no memory ceiling, a leaking cache can consume the **host's** entire memory (M1.6) rather than Redis handling the pressure gracefully. A real deployment needs `maxmemory` set explicitly, and the *policy* chosen deliberately per what's stored — which is exactly why mixing jobs on one instance is risky: one policy can't be simultaneously right for a disposable cache and for sessions you can't silently drop.
+
+### Rate limiting: why `INCR` instead of `GET`-then-`SET`
+
+This is M7.1's break-fix, restated as the reason Redis is the right tool for it:
+
+```ts
+// WRONG — read-modify-write, racy under concurrency (M7.1):
+const n = await redis.get(key);
+await redis.set(key, Number(n ?? 0) + 1);
+
+// RIGHT — one atomic operation, no window for two requests to race:
+const n = await redis.incr(key);
+if (n === 1) await redis.expire(key, 60);     // set TTL only on first hit
+if (n > limit) throw new TooManyRequests();
+```
+
+`INCR` is atomic at the Redis engine level — there's no gap between read and write for a second request to land in, which is precisely the property M7.1's in-memory `Map` lacked.
+
+### Pub/sub: real-time fan-out, with an honest limitation
+
+```ts
+await redis.publish("booking:updated", JSON.stringify({ bookingId: 5841 }));
+// elsewhere, in any number of connected processes:
+redis.subscribe("booking:updated");
+redis.on("message", (channel, msg) => { /* react */ });
+```
+
+The limitation that catches people: **pub/sub messages are fire-and-forget.** If no subscriber is connected at the moment of `publish`, the message is gone — there's no queue, no replay, no delivery guarantee. That makes it right for "update every connected dashboard right now" and wrong for "make sure this job eventually runs," which is what a queue (L6.7) is for instead.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Caching: watch the cache key and its TTL ──────────────────────────
+curl -s localhost:3001/api/rooms | python3 -m json.tool | head -3
+docker compose exec -T cache redis-cli KEYS "rooms:*"
+docker compose exec -T cache redis-cli TTL "rooms:all"
+#   Verified: key "rooms:all", TTL 600 (seconds) — exactly as coded.
+
+# ── TTL expiry, watched directly ──────────────────────────────────────
+docker compose exec -T cache redis-cli SET demo_key "value" EX 5
+docker compose exec -T cache redis-cli TTL demo_key
+docker compose exec -T cache redis-cli GET demo_key
+sleep 6 2>/dev/null || true
+docker compose exec -T cache redis-cli GET demo_key
+#   Verified: returns the value, then nil after the TTL elapses.
+
+# ── Atomic INCR: the rate-limiter primitive ────────────────────────────
+docker compose exec -T cache redis-cli DEL counter
+docker compose exec -T cache redis-cli INCR counter
+docker compose exec -T cache redis-cli INCR counter
+docker compose exec -T cache redis-cli INCR counter
+#   Verified: 1, 2, 3 — monotonic, atomic, no race window.
+
+# ── Eviction policy: what's actually configured right now ─────────────
+docker compose exec -T cache redis-cli CONFIG GET maxmemory
+docker compose exec -T cache redis-cli CONFIG GET maxmemory-policy
+#   Verified: maxmemory=0 (unlimited), policy=noeviction — the real-world
+#   gotcha from the mental model, live in this demo stack right now.
+
+# ── Pub/sub: fan-out to a listener, and its fire-and-forget nature ────
+docker compose exec -T cache redis-cli SUBSCRIBE demo-channel &
+sleep 1
+docker compose exec -T cache redis-cli PUBLISH demo-channel "a booking changed"
+sleep 1
+kill %1 2>/dev/null
+#   Verified: the subscriber receives the message instantly. Try publishing
+#   again with NO subscriber running — the message is simply gone, nothing
+#   queued for later.
+
+# ── Prove invalidation beats TTL for correctness (fixing AP8) ─────────
+curl -s localhost:3001/api/rooms | python3 -c "import sys,json; print(json.load(sys.stdin)['rooms'][0])"
+curl -s -X PATCH localhost:3001/api/rooms/1 -H 'Content-Type: application/json' -d '{"hourly_rate":999}'
+curl -s localhost:3001/api/rooms | python3 -c "import sys,json; print(json.load(sys.stdin)['rooms'][0])"
+#   The price is now stale for up to 10 minutes — AP8, live. Fix it:
+docker compose exec -T cache redis-cli DEL "rooms:all"
+curl -s localhost:3001/api/rooms | python3 -c "import sys,json; print(json.load(sys.stdin)['rooms'][0])"
+#   Immediately fresh. This is the invalidate-on-write pattern.
+docker compose exec -T db psql -U ots -d demo -c "UPDATE rooms SET hourly_rate=80.00 WHERE id=1;"
+docker compose exec -T cache redis-cli DEL "rooms:all" counter demo_key >/dev/null
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Job | Managed option | Note |
+|---|---|---|
+| Cache / sessions / rate limiting | **Upstash** (serverless-friendly, per-request pricing) | Good fit when paired with serverless functions (M6.2's connection math applies similarly) |
+| General-purpose Redis | **Redis Cloud, AWS ElastiCache** | Full feature set, you manage more config |
+| Pub/sub at larger scale | Redis Streams, or a dedicated message broker (L6.7) | Plain pub/sub has no replay or persistence |
+| In-process alternative to a cache | Node `Map` with a TTL library, **only if single-instance** | Breaks the moment you scale out (M1.1) |
+
+What good looks like: you can say, for each thing your app stores in Redis, which of the five jobs it is, what eviction/persistence policy that job actually needs, and whether mixing it with the other jobs on the same instance is safe — rather than "we put it in Redis because it needed to be fast."
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Inspect the live cache key** the app already uses — name, TTL, and confirm it matches the code in `app/api/rooms/route.ts`.
+
+2. **Watch a TTL actually expire**, not just read about it.
+
+3. **Prove atomicity** with `INCR`, and connect it back to M7.1's rate-limiter break-fix — explain in one sentence why `INCR` doesn't have the race that a `GET`-then-`SET` pair does.
+
+4. **Check the demo stack's real eviction configuration** and identify the production risk in leaving `maxmemory` unset.
+
+5. **Reproduce AP8 and fix it properly.** Change a room's price, confirm the cached list is stale, then add `redis.del("rooms:all")` to the `PATCH /api/rooms/[id]` handler so writes invalidate the cache instead of waiting out the TTL. Verify: price change is visible on the very next read.
+
+6. **Try pub/sub with and without a subscriber connected**, and write down — in your own words — why this makes it wrong for "the email absolutely must get sent" and right for "update the dashboard live."
+
+7. **Clean up** test keys and restore the room's price to 80.00.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team's Redis instance, used for both caching and sessions, starts throwing `OOM command not allowed when used memory > 'maxmemory'` on session writes. Users are being logged out mid-session with no error visible to them beyond "please log in again." The error is only on *writes* — reads still work.
+
+<Evidence title="configuration and usage">
+
+```text
+$ redis-cli CONFIG GET maxmemory
+maxmemory: 268435456        (256mb)
+$ redis-cli CONFIG GET maxmemory-policy
+maxmemory-policy: noeviction
+
+$ redis-cli INFO memory | grep used_memory_human
+used_memory_human: 254.80M
+
+$ redis-cli --scan --pattern "cache:*" | wc -l
+48213
+$ redis-cli --scan --pattern "session:*" | wc -l
+1847
+
+$ redis-cli TTL cache:product:88213
+86400        (24 hours)
+$ redis-cli TTL session:a91f3c2e
+1800         (30 min — correct, sessions should expire)
+```
+
+</Evidence>
+
+<Evidence title="recent change">
+
+```text
+git log --oneline -3 -- lib/cache.ts
+a71f2c1 feat: cache product pages for 24h to reduce DB load   ← 2 weeks ago
+```
+
+</Evidence>
+
+48,000 cache keys, 1,847 session keys, both well under their own TTLs. What's actually full, and why does `noeviction` make this a sessions problem instead of a cache problem?
+
+<Reveal label="Reveal the cause">
+
+**The cache's own growth, with a generous 24-hour TTL added two weeks ago, is filling the shared instance's memory ceiling — and `noeviction` means Redis refuses ALL new writes once full, including session writes that have nothing to do with the cache.**
+
+**The mechanism.** `noeviction` was almost certainly set deliberately for the sessions use case — you genuinely don't want Redis silently deleting a logged-in user's session to make room for something else. That's the *correct* policy for session data. But the same instance also holds the product-page cache, which got a new 24-hour TTL two weeks ago (`feat: cache product pages for 24h`) — a change that, in isolation, looks completely reasonable for reducing database load. With 48,213 cached product pages now living for a full day instead of expiring quickly, the instance's real memory use has climbed to 254.8MB against a 256MB ceiling, and it's now effectively full.
+
+**Why `noeviction` makes this bite sessions specifically, not the cache:** once Redis is full, `noeviction` refuses *every* new write, regardless of which "job" that write belongs to. The cache isn't failing — it's reading fine, because reads aren't blocked. New session writes are what's failing, because they're new writes landing on an instance with zero room. The error message and the actual cause point at completely different parts of the system, which is why the team's first instinct (look at the session code) found nothing wrong there.
+
+**This is exactly the mixing-jobs-on-one-instance risk from the mental model**, now with a concrete trigger: two legitimate, independently-reasonable changes (set `noeviction` for safe sessions; cache product pages for a day to cut DB load) combined into an outage neither change would have caused alone.
+
+**The fix, in order:**
+
+1. **Immediate relief:** manually expire or delete a chunk of the oldest cache keys to free headroom and stop the bleeding (`redis-cli --scan --pattern "cache:*" | head -5000 | xargs redis-cli DEL`, or more surgically by age if you've stored a timestamp).
+2. **Separate the instances.** Cache and sessions have different eviction needs — they should not share a `maxmemory` ceiling. Two Redis instances (or two logical databases via `SELECT` in Redis, with separate `maxmemory` if the provider supports per-database limits — most don't, which argues for genuinely separate instances) removes the coupling entirely.
+3. **Shorten the cache TTL back down**, or — better — switch the *cache's* eviction behavior to `allkeys-lru` on its own dedicated instance, so it gracefully drops old entries under pressure instead of either growing unboundedly or blocking writes.
+4. **Alert on memory usage as a percentage of `maxmemory`**, not just on errors — 90% full is the leading indicator (M8.4's saturation signal) that would have caught this days before the first failed write.
+
+**The transferable lesson:** a single Redis instance serving multiple "jobs" (cache, sessions, rate limits, queues) means every job's memory growth is every other job's outage risk, invisibly, because they share one `maxmemory` ceiling and one policy. The fix usually isn't tuning the policy harder — it's **not sharing the instance** between jobs that have genuinely different eviction needs.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit everything we currently store in Redis: for each key pattern, tell me which of the five jobs it represents (cache, session, rate limit, pub/sub, queue), whether it has an appropriate TTL for that job, and whether any two of these jobs are sharing the same Redis instance in a way that could cause one to starve another under memory pressure."}>
+The "sharing an instance" question is the one that catches the break-fix's exact failure mode. Verify by actually checking the current `maxmemory` and `maxmemory-policy` config, not just the key patterns — the policy is what determines whether growth in one job can block writes in another.
+</AgentTask>
+
+<AgentTask prompt={"Add cache invalidation to every write endpoint that modifies data we also cache, so the cache is deleted on write instead of relying solely on a TTL to eventually catch up. Show me the before and after for each endpoint, and flag any endpoint where invalidation is tricky because multiple cache keys could be affected by one write."}>
+Check it actually finds every write path that affects cached data — the demo app's room price update is the obvious one, but a real app may have several. The "tricky" flag matters: a write that affects multiple cached views (a list and a detail page, say) needs multiple invalidations, which is easy to miss.
+</AgentTask>
+
+<AgentTask prompt={"We're adding [rate limiting / a session store / a job queue] to an app that already uses Redis for caching. Should this share the existing Redis instance or use a separate one? Consider eviction policy conflicts, memory ceiling sharing, and what happens to each job if the other one's data grows unexpectedly."}>
+A good answer names the specific eviction-policy mismatch if one exists (noeviction for sessions vs allkeys-lru for cache can't both be the instance-wide policy) and recommends separate instances when the needs genuinely conflict, rather than defaulting to 'just use the same one, Redis can handle it' — which is technically true and exactly how the break-fix happened.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For everything stored in Redis:
+
+- Which of the five jobs is this — cache, session, rate limit, pub/sub, queue?
+- Does its TTL (or lack of one) match what that job actually needs?
+- Is `maxmemory` set to a real ceiling, not left at unlimited?
+- Does the eviction policy match this specific job's tolerance for data loss?
+- If sharing an instance with another job, could either job's growth starve the other?
+
+For caches specifically:
+
+- Is there invalidation-on-write, or only a TTL? (TTL alone means a real staleness window every time.)
+- Does the app degrade gracefully if Redis is unreachable, or does it become a single point of failure?
+
+What good looks like: every key in Redis has an owner who knows which job it serves and what policy that job needs; memory usage is monitored as a percentage, with an alert before it's full; and a cache going down never takes the whole app down with it.
+
+Red flags: sessions and a cache sharing one `maxmemory` ceiling; `noeviction` set with no monitoring of how full the instance is; a cache with no invalidation path, only a TTL and hope.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l05"
+  questions={[
+    {
+      q: "Why did a cache-related code change (a longer TTL on product pages) cause session writes to fail with an OOM error, when the two features seem unrelated?",
+      options: [
+        "The session library has a dependency on the cache library",
+        "Both shared one Redis instance with one maxmemory ceiling and noeviction policy — the cache's growth filled the shared memory limit, and noeviction then refused ALL new writes, including unrelated session writes",
+        "Redis automatically prioritizes cache writes over session writes",
+        "The 24-hour TTL caused a memory leak in the Redis client library"
+      ],
+      answer: 1,
+      explain: "This is the core risk of mixing Redis 'jobs' on one instance: they share a memory ceiling and a single eviction policy, so one job's growth can starve a completely unrelated job's writes."
+    },
+    {
+      q: "Why is `INCR` the correct primitive for a rate limiter instead of `GET` followed by `SET`?",
+      options: [
+        "INCR is faster because it avoids a network round trip",
+        "INCR is atomic at the Redis engine level — there's no gap between read and write for a second concurrent request to land in, unlike a separate GET-then-SET pair",
+        "GET and SET require different Redis data types",
+        "INCR automatically applies a TTL to the key"
+      ],
+      answer: 1,
+      explain: "This is M7.1's race condition, solved at the tool level: GET-then-SET has exactly the read-modify-write window that let a bot slip through a rate limiter. INCR has no such window."
+    },
+    {
+      q: "What is the key limitation of Redis pub/sub that makes it wrong for \"this job must eventually run\"?",
+      options: [
+        "Pub/sub messages are limited to 1KB in size",
+        "Messages are fire-and-forget — if no subscriber is connected at the moment of publish, the message is simply gone, with no queue, replay, or delivery guarantee",
+        "Pub/sub only works within a single Redis instance",
+        "Subscribers can only listen to one channel at a time"
+      ],
+      answer: 1,
+      explain: "This is exactly why a queue (L6.7) is a different tool for a different guarantee: pub/sub is right for 'notify everyone currently listening,' and wrong for anything that must happen even if nobody's listening right now."
+    },
+    {
+      q: "Why does `noeviction` make sense for sessions but `allkeys-lru` make sense for a cache?",
+      options: [
+        "noeviction is always safer regardless of use case",
+        "Losing a session silently logs a user out unexpectedly, which is worse than refusing the write; losing a cache entry just means the next read falls through to the database — a deliberately cheap, recoverable loss",
+        "allkeys-lru is required for any data with a TTL set",
+        "noeviction uses less memory overhead than allkeys-lru"
+      ],
+      answer: 1,
+      explain: "The two policies encode different tolerances for data loss. A pure cache WANTS old entries evicted under pressure; session data does not, which is exactly why mixing the two jobs under one policy is the mistake in this lesson's break-fix."
+    },
+    {
+      q: "The demo app's room price cache has a 600-second TTL but no invalidation-on-write. What's the practical consequence?",
+      options: [
+        "The cache never actually gets used",
+        "After a price change, reads can serve the stale price for up to 10 minutes — a real staleness window every single time a price updates, regardless of how important the update is",
+        "The application crashes on the next read",
+        "Redis automatically detects the underlying data changed and clears the key"
+      ],
+      answer: 1,
+      explain: "This is planted anti-pattern AP8, verified live in the demo stack. Adding `redis.del(key)` to the write path (invalidation-on-write) removes the staleness window entirely, rather than just shortening it."
+    }
+  ]}
+/>
+
+</Section>

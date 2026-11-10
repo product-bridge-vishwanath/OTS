@@ -1,0 +1,46 @@
+id: sc-quota-exhausted-01
+module: M4
+lesson: m04-l04
+title: "A chat feature fails with no code change and no traffic change"
+difficulty: realistic
+symptom: "A customer-facing chat feature starts returning 502s with no deploy and no reproducible failure using the team's own test key."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/shared-provider-project.sh   # this app shares an API key/project with two unrelated internal tools
+    - type: traffic
+      apply: scripts/load/unrelated-tool-spike.js        # simulates a different tool's traffic consuming the shared limit
+evidence:
+  logs: true
+  metrics: [provider.requests_per_min, provider.rate_limit_errors]
+  db_console: false
+  notes: "The provider console shows aggregate usage for the shared project with no per-application breakdown."
+agent:
+  context: "You can reproduce the error only in production, never with your own test key."
+  bias: "assumes this app's own traffic must have changed, since the error correlates with request volume"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - app-has-dedicated-key
+    - rate-limit-surfaces-as-429-not-502
+    - backoff-with-jitter-added
+  root_cause_markers:
+    - learner identifies the shared project/key as the actual resource under pressure
+    - separate API key or project provisioned for this application
+    - client-side throttling and backoff added for 429s specifically
+  symptom_only_markers:
+    - provider tier upgraded with the shared key left in place
+    - retries added with no backoff, worsening the shared-limit pressure
+hints:
+  - "Why can't you reproduce this with your own test key? What's different about production's key?"
+  - "Check the provider console: is usage attributed per application, or pooled?"
+  - "What else uses this exact API key or project?"
+  - "Reveal: a shared key pools the rate limit across unrelated tools. Separate the key, fix the 429-to-502 fallthrough, add backoff."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

@@ -67,3 +67,9 @@ slot**; `concurrent-editors.js` accepted 20 notes and kept **6**;
 Next.js (App Router) · Postgres 16 (`pg`, raw SQL on purpose — you can read
 every query) · Redis (`ioredis`) · a plain Node worker · Anthropic SDK for the
 assistant. The platform site in the repo root teaches with this exact stack.
+
+Postgres runs with `pg_stat_statements` loaded via `shared_preload_libraries`
+(see `compose.yaml`), not just `CREATE EXTENSION`'d — that extension needs the
+preload flag to actually collect stats, or every query against the view fails
+with "must be loaded via shared_preload_libraries." This makes the M6.1/M8.5
+"which query is actually slow, ranked by total time" drills work out of the box.

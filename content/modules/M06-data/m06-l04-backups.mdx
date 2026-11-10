@@ -1,0 +1,344 @@
+---
+id: m06-l04
+module: M6
+title: "Backups and restore: the drill almost nobody runs"
+order: 4
+difficulty: 2
+depth: both
+platforms: [postgres, supabase, neon, rds]
+concepts: [backups]
+prerequisites: [m06-l01]
+lab: demo-repo
+scenario_ids: [sc-restore-drill-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder deleted his production database. Not maliciously — he ran a migration script against the wrong `DATABASE_URL`, one copy-pasted from an old terminal tab that still pointed at prod instead of staging. The script's second line was `DROP TABLE users CASCADE`.
+
+He wasn't worried. His provider's dashboard had a "Backups" tab with a green checkmark and "Last backup: 6 hours ago." He clicked Restore.
+
+Forty minutes later, the restore finished — into a **new, separate database instance** with a different connection string, not back into the one his app was pointing at. Nobody on his two-person team had ever actually practiced a restore before; they'd only confirmed backups were *being taken*, which is a different fact entirely. He spent the next two hours updating every environment variable across three platforms, re-pointing DNS-adjacent config, and explaining to his five paying customers why signups had been broken all afternoon.
+
+The backups were fine. The outage was caused entirely by the gap between "a backup exists" and "I know exactly what restoring it involves, under pressure, without improvising."
+
+</Section>
+
+<Section kind="already-did">
+
+You've seen a "Backups" toggle in a hosting dashboard, switched it on, and felt done. You may never have clicked "Restore" even once, including in a test environment — which means you don't actually know what it does: whether it overwrites in place, spins up a new instance, how long it takes, or what happens to your application's connection string when it finishes.
+
+That gap — backups exist vs. restoring is a *practiced* procedure — is the entire subject of this lesson, and it's one of the cheapest fixes in this whole program relative to the damage it prevents.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Two different questions, often confused
+
+**"Do I have backups?"** is a yes/no about whether data exists somewhere outside the live database. **"Can I restore, and how much do I lose?"** is a completely different question, with two numbers attached:
+
+| Term | Question it answers |
+|---|---|
+| **RPO** (Recovery Point Objective) | If disaster strikes right now, how much recent data am I willing to lose? |
+| **RTO** (Recovery Time Objective) | How long can the restore take before the outage itself is the bigger problem? |
+
+A nightly backup gives you an RPO of "up to 24 hours of data" — if something goes wrong at 23:59, you lose nearly a full day. That may be completely fine for an internal tool and completely unacceptable for a payments system, and nobody has actually *decided* which one your product is until you write the number down.
+
+### Snapshots vs. point-in-time recovery
+
+<svg viewBox="0 0 780 230" role="img" aria-label="A nightly snapshot restores to the last snapshot time, losing everything since; point-in-time recovery replays the write-ahead log to restore to any specific moment" className="diagram">
+  <text x="12" y="20" className="sub">SNAPSHOT (nightly backup) — restores to ONE fixed point</text>
+  <rect x="8" y="30" width="700" height="34" rx="6" />
+  <text x="90" y="52" className="sub">00:00 snapshot</text>
+  <text x="400" y="52" className="sub">disaster at 14:32</text>
+  <path d="M 90 64 L 90 84" className="arrow" />
+  <text x="12" y="104" className="sub">restore → back to 00:00. Everything from 00:00–14:32 is GONE (RPO: up to 24h).</text>
+
+  <text x="12" y="146" className="sub">PITR — replays the WAL to restore to ANY moment</text>
+  <rect x="8" y="156" width="700" height="34" rx="6" />
+  <text x="90" y="178" className="sub">base backup</text>
+  <text x="400" y="178" className="sub">restore to 14:31:58 — one second before</text>
+  <path d="M 420 190 L 420 210" className="arrow" />
+  <text x="12" y="228" className="sub">restore → the exact moment before the bad statement ran (RPO: seconds).</text>
+</svg>
+
+A snapshot restores to a fixed point in time — whenever it was taken. **<Term k="backup-pitr">PITR</Term>** instead keeps a continuous log of every change (the <Term k="wal">WAL</Term> from M7.3) and can replay it to *any* specific second — including "one second before the accidental `DROP TABLE` ran," which is the difference between losing a day and losing nothing.
+
+<Callout type="key">
+**A backup you have never restored is a hypothesis, not a backup.** The only way to know your RTO, know the restore actually works, and know what config changes it requires is to have done it — in a test environment, before you need it under pressure. This is the single highest-leverage, lowest-cost drill in this entire module.
+</Callout>
+
+### What a restore actually changes, and why that surprises people
+
+The founder's mistake was assuming "restore" meant "put the data back where it was." On most managed platforms it means **"create a new database instance from the backup"** — a different host, often a different connection string. Your application doesn't automatically start using it; you have to:
+
+1. Know the new connection string.
+2. Update it everywhere your app reads `DATABASE_URL` from (platform dashboard, `.env`, CI secrets — M1.5's precedence problem, under worse pressure).
+3. Decide what happens to writes that occurred *after* the backup's point-in-time but *before* you noticed the problem — they're gone, by definition, and someone has to say which customers are affected.
+
+None of that is hard. All of it is unpleasant to improvise during an actual incident, which is the entire argument for rehearsing it beforehand.
+
+### What backups don't protect you from
+
+A backup protects against losing the database (disk failure, provider outage, your migration mistake). It does **not** protect against:
+
+- **A slow, correct-looking corruption** that's already in last night's backup too — if bad data has been accumulating for a week, your most recent backup contains it.
+- **Someone with valid credentials deleting data on purpose** — backups help you *recover*, but least-privilege access (M10.4) is what prevents the need.
+- **A single region/provider outage** taking down both your database and its backups together, if they're not stored separately (check this specifically).
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Take a backup (pg_dump, the portable, tool-agnostic format) ──────
+docker compose exec -T db pg_dump -U ots -d demo --no-owner -F c -f /tmp/demo.dump
+docker compose exec -T db ls -la /tmp/demo.dump
+
+# ── THE DRILL: actually restore it, into a SEPARATE database ─────────
+#   Never restore into the database you're trying to protect while
+#   testing — that's how a bad restore becomes a second incident.
+docker compose exec -T db psql -U ots -d postgres -c "CREATE DATABASE restore_drill;"
+docker compose exec -T db pg_restore -U ots -d restore_drill --no-owner /tmp/demo.dump
+
+# ── Verify the restored data is actually correct — don't assume ──────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT (SELECT count(*) FROM bookings) AS bookings,
+         (SELECT count(*) FROM rooms) AS rooms;"
+docker compose exec -T db psql -U ots -d restore_drill -c "
+  SELECT (SELECT count(*) FROM bookings) AS bookings,
+         (SELECT count(*) FROM rooms) AS rooms;"
+#   Verified: these two outputs match exactly (3 bookings, 4 rooms).
+#   On this small demo it's instant — on a real production database,
+#   time this step. THAT number is your real RTO, not a guess.
+
+# ── Simulate the disaster, then recover from the dump ─────────────────
+docker compose exec -T db psql -U ots -d demo -c "DROP TABLE IF EXISTS bookings CASCADE;"
+docker compose exec -T db psql -U ots -d demo -c "\dt" | grep -c bookings
+#   0 — the table is genuinely gone.
+docker compose exec -T db pg_restore -U ots -d demo --no-owner --clean --if-exists \
+  -t bookings /tmp/demo.dump
+docker compose exec -T db psql -U ots -d demo -c "SELECT count(*) FROM bookings;"
+#   Restored — but note this only works because we have the dump file
+#   from BEFORE the drop. A backup taken AFTER the mistake doesn't help.
+
+# ── Clean up ───────────────────────────────────────────────────────────
+docker compose exec -T db psql -U ots -d postgres -c "DROP DATABASE restore_drill;"
+docker compose exec -T db rm /tmp/demo.dump
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Manual backup | `pg_dump` (portable, works across Postgres versions) |
+| Automated snapshots | Every managed provider (Supabase, Neon, RDS) — check the retention window |
+| Point-in-time recovery | RDS PITR, Neon's branching (effectively PITR via copy-on-write branches), Supabase PITR add-on |
+| Verify a backup is restorable | Actually restore it, on a schedule — quarterly at minimum, into an isolated environment |
+| Cross-region/provider redundancy | A second copy of backups in a different storage location (M6.6) than the primary database |
+
+The decision worth writing down explicitly: **what's your RPO, and does your current backup frequency actually deliver it?** Nightly snapshots are an RPO of "up to 24 hours," stated plainly. If that's not acceptable for your product, you need PITR or more frequent snapshots — not a vague sense that backups are "handled."
+
+What good looks like: a restore has actually been performed, by someone on the team, within the last quarter, into an isolated environment, and the time it took is a number someone has written down and compared against what the business can tolerate.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Take a backup** of the demo database with `pg_dump`.
+
+2. **Run the actual restore drill** — into a separate database, never over the original while testing. Verify row counts match exactly, table by table.
+
+3. **Time it.** On this toy dataset it's near-instant; the point of the exercise is the *habit*, which transfers directly to a real database where the number will matter.
+
+4. **Simulate the disaster.** Drop the `bookings` table entirely (as in the Operator block) and confirm it's genuinely gone — `\dt` should not list it.
+
+5. **Restore from your pre-disaster dump** and confirm the data returns intact. Then explicitly answer: if your *only* backup had been taken *after* the drop instead of before, what would have happened? Say it out loud — this is the RPO conversation made concrete.
+
+6. **Write your product's actual RPO/RTO**, even a one-line guess, for your real product: "we can lose up to ___ of data, and a restore can take up to ___ before it's worse than the outage."
+
+7. **Clean up** and confirm the demo app's `bookings` table and data are back to normal.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A company discovers, during an actual disaster, that their automated nightly backups have been silently failing for three weeks. The backup job's status in their monitoring shows green the whole time.
+
+<Evidence title="the backup script">
+
+```bash
+#!/bin/bash
+# runs via cron, nightly at 02:00
+pg_dump -U app -d production --no-owner -F c -f /backups/nightly-$(date +%F).dump
+aws s3 cp /backups/nightly-$(date +%F).dump s3://company-backups/
+echo "backup completed" >> /var/log/backup.log
+exit 0
+```
+
+```text
+Monitoring: checks /var/log/backup.log for the string "backup completed"
+  each night, in the last 25 hours — alerts if missing.
+Status for the last 3 weeks: all green, every night.
+```
+
+</Evidence>
+
+<Evidence title="what actually happened each night">
+
+```text
+$ cat /var/log/backup.log | tail -5
+backup completed
+backup completed
+backup completed
+backup completed
+backup completed
+
+$ ls -la /backups/ | tail -3
+-rw-r--r-- 1 app app   0 Nov  8 02:00 nightly-2026-11-08.dump
+-rw-r--r-- 1 app app   0 Nov  9 02:00 nightly-2026-11-09.dump
+-rw-r--r-- 1 app app   0 Nov 10 02:00 nightly-2026-11-10.dump
+
+$ pg_dump -U app -d production --no-owner -F c -f /tmp/test.dump
+pg_dump: error: connection to server failed: FATAL: password authentication failed
+```
+
+</Evidence>
+
+Three weeks of green checkmarks, and every file is zero bytes. What happened, and what is the real lesson about the monitoring?
+
+<Reveal label="Reveal the cause">
+
+**The database credential rotated (or expired) three weeks ago, `pg_dump` has been failing on every single run, and the monitoring was checking the wrong thing: that the script finished, not that it produced a backup.**
+
+**The mechanism, precisely.** `echo "backup completed" >> /var/log/backup.log` and `exit 0` run **unconditionally** — the script has no error checking on either the `pg_dump` or the `aws s3 cp` step. `pg_dump` failed instantly on an authentication error, produced a zero-byte file (or no file, with the shell still proceeding), `aws s3 cp` uploaded that empty file without complaint, and the script logged success and exited 0 regardless of what actually happened upstream. The monitoring did exactly what it was built to do — check for a log line — and the log line was never the thing that mattered.
+
+**Why this is the same shape as M7.8's dead man's switch problem, applied to backups specifically:** "the job ran" and "the job's output is correct" are different facts, and almost every monitoring setup only checks the first. A script that always logs success regardless of outcome is actively worse than no monitoring, because it manufactures confidence precisely where none is warranted — this is M8.8's "never ping in a finally block" lesson, and it's the same mistake here wearing a backup-job costume.
+
+**The fix, layered:**
+
+1. **Check every step's exit code, and fail loudly on error:**
+   ```bash
+   set -euo pipefail    # exit on any failure, undefined variable, or pipe error
+   pg_dump -U app -d production --no-owner -F c -f "$DUMP_FILE"
+   [ -s "$DUMP_FILE" ] || { echo "ERROR: dump file is empty" >&2; exit 1; }
+   aws s3 cp "$DUMP_FILE" "s3://company-backups/"
+   echo "backup completed, $(stat -f%z "$DUMP_FILE" 2>/dev/null || stat -c%s "$DUMP_FILE") bytes"
+   ```
+2. **Monitor the thing that actually matters: can a backup be restored?** Not "did the script log success" — periodically (weekly, automated) restore the *most recent* backup into a scratch database and assert a sanity check (`SELECT count(*) FROM users` is non-zero, or matches an expected range). This is the only check that can't be fooled by a silently-empty file.
+3. **Alert on file size, not just presence.** A zero-byte or suspiciously small backup file compared to yesterday's is a near-free check that would have caught this in one night instead of three weeks.
+4. **Separate credentials for the backup job from the app's own**, with their own rotation schedule tracked — a shared credential rotating without every consumer being updated is exactly the single point of failure this incident reveals.
+
+**The transferable lesson:** a backup job's monitoring must verify the **artifact**, not the **process**. "The script exited 0" and "a usable backup exists" are different claims, and the gap between them is exactly where this company lived for three weeks with a green dashboard and zero actual protection.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Review this backup script: [paste it]. Does it check the exit code and output of every step (the dump, the upload), or does it log success and exit 0 regardless of what happened? Add proper error handling with set -euo pipefail, a check that the dump file is non-empty and roughly the expected size compared to the previous backup, and make it fail loudly — not silently — on any step's failure."}>
+Check it specifically catches the zero-byte-file failure mode from the break-fix — a script that only checks exit codes might still miss a dump that 'succeeds' but is truncated or empty for another reason. The non-empty-and-reasonable-size check is the belt-and-suspenders addition that catches what exit codes alone might not.
+</AgentTask>
+
+<AgentTask prompt={"Design a weekly automated restore-verification job for our backups: restore the most recent backup into a scratch database, run a handful of sanity checks (row counts within expected ranges, no obviously truncated tables), then tear the scratch database down. Tell me what this would have caught in a scenario where the backup job logs success every night but the files are silently empty."}>
+This is the fix for the break-fix's actual root cause — monitoring the artifact, not the process. Verify the sanity checks are specific enough to catch an empty or truncated dump (a bare 'did it restore without erroring' check might not, since restoring an empty dump can itself succeed without error).
+</AgentTask>
+
+<AgentTask prompt={"For our product [describe it, including how much data loss would be acceptable and how long an outage during restore would be tolerable], recommend a backup strategy: snapshot frequency or PITR, where backups are stored relative to the primary database, and a restore-testing cadence. State explicitly what RPO and RTO this strategy delivers, in concrete numbers, not 'regularly' or 'quickly'."}>
+Push back if it gives vague answers — "backups are taken regularly" is not an RPO. The deliverable is two numbers (a time for RPO, a time for RTO) that you could defend to a stakeholder, derived from your actual backup frequency and a realistic restore time, not an assumption.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Questions to answer about your actual product, in writing:
+
+- What's the RPO — how much recent data can we afford to lose?
+- What's the RTO — how long can a restore take before the outage is worse than the data loss?
+- Does our current backup frequency (snapshot interval, or PITR) actually deliver that RPO?
+- When did someone last actually perform a restore, into an isolated environment, and time it?
+- Does our backup monitoring check that a usable artifact exists, or only that a script exited 0?
+- Are backups stored somewhere that survives the primary database's own outage (different region/provider)?
+
+What good looks like: the answers above are written down, not assumed; a restore has been tested within the last quarter; and backup monitoring would catch a silently-empty file, not just a non-zero exit code.
+
+Red flags: "backups are on" with nobody having ever clicked Restore; a backup job whose monitoring checks a log line rather than the file it produced; no written RPO/RTO anywhere.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m06-l04"
+  questions={[
+    {
+      q: "Why is \"a backup has never been restored\" a meaningful risk, not just an inconvenience?",
+      options: [
+        "Backup files degrade over time if unused",
+        "You don't actually know your restore time (RTO), whether the restore procedure works as assumed, or what config changes it requires — all of which you'd be discovering for the first time during a real incident",
+        "Untested backups are automatically deleted by most providers",
+        "Restoring requires practice to operate the command-line tools correctly"
+      ],
+      answer: 1,
+      explain: "The founder in the story assumed restore meant 'put the data back in place' — it meant 'create a new instance,' and every consequence of that gap surfaced during the actual emergency instead of a calm test."
+    },
+    {
+      q: "What's the practical difference between a nightly snapshot and point-in-time recovery?",
+      options: [
+        "PITR is just a faster version of a snapshot restore",
+        "A snapshot restores to one fixed moment, losing everything since; PITR replays a continuous log (the WAL) to restore to ANY specific second, including one second before a mistake",
+        "Snapshots only work for small databases",
+        "PITR requires a separate database engine"
+      ],
+      answer: 1,
+      explain: "This is the RPO difference made concrete: nightly snapshots mean up to 24 hours of potential loss; PITR means seconds — the difference between losing a day and losing nothing after an accidental DROP TABLE."
+    },
+    {
+      q: "In the break-fix, why did the backup monitoring show green for three weeks despite every backup being a zero-byte file?",
+      options: [
+        "The monitoring tool had a bug in its date comparison",
+        "The script logged 'backup completed' and exited 0 unconditionally, regardless of whether pg_dump or the upload actually succeeded — the monitoring checked that the SCRIPT ran, not that a usable backup existed",
+        "S3 was silently rejecting the uploads",
+        "The monitoring only checked backups on weekdays"
+      ],
+      answer: 1,
+      explain: "Same shape as M7.8's dead man's switch and M8.8's 'never ping in finally' — a check that can't fail manufactures false confidence. The fix is checking the artifact (file size, a real restore test), not just the process's exit status."
+    },
+    {
+      q: "What's the only check that can't be fooled by a backup script that silently produces an empty or corrupt file?",
+      options: [
+        "Checking the file's timestamp is recent",
+        "Periodically actually restoring the backup into a scratch database and verifying real data is present",
+        "Checking the file size is non-zero",
+        "Checking the upload to S3 returned success"
+      ],
+      answer: 1,
+      explain: "File-size and timestamp checks help and are cheap, but an actual restore-and-verify is the only test that proves the artifact is genuinely usable — everything else can be fooled by a plausible-looking but broken file."
+    },
+    {
+      q: "What does RPO (Recovery Point Objective) actually measure?",
+      options: [
+        "How long a restore takes to complete",
+        "How much recent data you're willing to lose if disaster strikes right now — determined by your backup frequency or PITR granularity",
+        "How often backups should be tested",
+        "The maximum size a backup file can be"
+      ],
+      answer: 1,
+      explain: "RPO and RTO answer different questions — RPO is about data loss tolerance, RTO is about outage duration tolerance. A nightly backup has an RPO of 'up to 24 hours,' stated as a concrete number rather than a vague sense of being 'handled.'"
+    }
+  ]}
+/>
+
+</Section>

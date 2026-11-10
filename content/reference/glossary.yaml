@@ -174,6 +174,29 @@ terms:
     name: Jitter
     def: Deliberate randomness added to retry delays so many clients that failed together don't all retry at the same instant and re-create the overload.
 
+  # --- data (M6) ---
+  foreign-key:
+    name: Foreign key
+    def: A column that must match a row in another table, or be null. It's what makes "a booking for a room that doesn't exist" impossible at the database level instead of merely unlikely in application code.
+  normalization:
+    name: Normalization
+    def: Splitting data so each fact is stored once, in the table it belongs to, linked by keys. The opposite is a wide table or a blob column repeating or burying facts that should be queryable rows.
+  pooler:
+    name: Connection pooler
+    def: A proxy (PgBouncer, Supabase's pooler, RDS Proxy) that sits between many client connections and a small number of real database connections, reusing them. Essential for serverless, where each invocation would otherwise open — and exhaust — its own.
+  pooler-transaction-mode:
+    name: Transaction mode (pooling)
+    def: A pooler setting that hands back a database connection the instant a transaction ends, rather than holding it for the whole client session. Enables far more clients per real connection, at the cost of breaking session-level features like advisory locks and prepared statements across requests.
+  wal:
+    name: WAL (write-ahead log)
+    def: The record Postgres writes before changing data, so a crash mid-write can be replayed to a consistent state. It's also what read replicas stream and what point-in-time recovery replays.
+  toast:
+    name: TOAST
+    def: How Postgres stores a value too large for a normal row — out of line, in a side table, fetched only when that column is actually read. It's why a huge jsonb cell makes even queries that ignore it slower.
+  dead-letter-queue:
+    name: Dead-letter queue
+    def: Where a queue puts a job that failed too many times, instead of retrying it forever or silently dropping it. It turns "this job is stuck in a retry loop" into a visible, inspectable list.
+
   # --- shipping ---
   ci-cd:
     name: CI/CD
@@ -333,3 +356,20 @@ terms:
   incident-severity:
     name: Severity (SEV)
     def: "A shared scale for how bad it is (SEV1: everyone's down → SEV4: cosmetic), deciding who gets woken and how often updates go out."
+
+  # --- config and secrets (M4) ---
+  secret-scanning:
+    name: Secret scanning
+    def: Automated detection of known credential patterns (API key prefixes, private keys) in a repository's history. Push protection is the stronger version — it blocks the push itself before the secret ever lands; scanning after the fact only detects what's already exposed.
+  scoped-key:
+    name: Scoped key
+    def: An API key restricted to specific permissions (read vs write, one resource type) and often a specific origin (domain, IP, app). A scoped key that leaks can only do the narrow thing it was issued for.
+  key-rotation:
+    name: Key rotation
+    def: "Replacing a secret's value without a gap: issue the new value, propagate it to every consumer, verify each one is using it, then revoke the old value. Revoking before every consumer is verified turns a planned rotation into an outage."
+  budget-alert:
+    name: Budget alert
+    def: A notification sent when spend crosses a threshold. It does not stop any requests — spend keeps accruing after the alert fires. Contrast with a hard cap.
+  hard-cap:
+    name: Hard cap
+    def: A ceiling that actually stops an account or project from making further calls once spend or usage hits it, rather than merely notifying someone. The only automatic backstop against a runaway retry loop.

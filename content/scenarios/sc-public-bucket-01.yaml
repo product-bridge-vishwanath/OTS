@@ -1,0 +1,44 @@
+id: sc-public-bucket-01
+module: M6
+lesson: m06-l06
+title: "A hero image turns a $12 bill into $4,100"
+difficulty: realistic
+symptom: "An S3 bill jumps from $12/month to over $4,000 in one cycle with no feature change and no new complaints from users."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/public-bucket-no-cdn.sh   # public bucket, no CDN, no referrer restriction, one large hotlinked object
+evidence:
+  logs: true
+  metrics: [storage.egress_bytes, storage.requests_by_referrer]
+  db_console: false
+  notes: "Bucket access logs show requests broken down by referrer domain and object key."
+agent:
+  context: "You can see the storage cost is unchanged; only transfer cost spiked."
+  bias: "assumes the bucket was compromised rather than checking referrer patterns"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - cdn-in-front-of-bucket
+    - referrer-restriction-or-equivalent
+    - billing-alert-on-transfer
+  root_cause_markers:
+    - learner identifies hotlinking from external domains as the traffic source
+    - CDN added in front of the public bucket
+    - the oversized source image compressed/resized
+  symptom_only_markers:
+    - bucket made fully private, breaking the legitimate public use case
+    - storage tier changed with no CDN or restriction added
+hints:
+  - "Storage cost didn't move. Which specific line item did, and what does that bill for?"
+  - "Check requests by referrer domain for the highest-traffic object."
+  - "What sits between this bucket and the internet right now?"
+  - "Reveal: the object is hotlinked from other sites with no CDN absorbing repeat requests. Add a CDN, restrict by referrer, and compress the source image."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

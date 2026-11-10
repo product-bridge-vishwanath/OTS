@@ -1,0 +1,44 @@
+id: sc-leaked-key-01
+module: M4
+lesson: m04-l01
+title: "A key was committed three weeks ago — and the repo just went public"
+difficulty: realistic
+symptom: "A provider emails about unusual activity. Git history shows the key was committed once, three weeks ago, and 'removed' four days ago. The repo went public five days ago for a hackathon."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/leaked-key-history.sh   # commits a fake key, removes it, then flips repo visibility
+    - type: data
+      apply: scripts/break/usage-spike.sql          # synthetic provider usage spike in the audit log
+evidence:
+  logs: true
+  metrics: [provider.usage_tokens, provider.unrecognized_ip_requests]
+  db_console: false
+agent:
+  context: "You added a local env setup commit for a new contributor a few weeks ago and removed it later when you noticed."
+  bias: "treats the later removal commit as sufficient and reasons about the current file tree instead of full git history"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - key-rotated                 # old key confirmed revoked, new key confirmed live
+    - history-exposure-identified # learner locates the original commit via git log --all
+  root_cause_markers:
+    - learner searches full git history, not just current files
+    - learner rotates the key before investigating further
+    - learner correctly treats "repo was ever public" as sufficient grounds for assuming exposure
+  symptom_only_markers:
+    - removal commit treated as resolving the exposure
+    - history scrubbing attempted before rotation
+hints:
+  - "The current files don't contain the key anymore. Does that mean it's safe?"
+  - "Run `git log -p --all` for the key's prefix, not just `grep` on the working tree."
+  - "What changed five days ago that's unrelated to the key itself?"
+  - "Reveal: the key was exposed the moment the repo went public, regardless of the later removal commit. Rotate first, then investigate, and remember forks keep their own copy of history."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20
