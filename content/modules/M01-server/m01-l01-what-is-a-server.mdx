@@ -1,0 +1,355 @@
+---
+id: m01-l01
+module: M1
+title: "What Vercel, Render and a VPS actually are"
+order: 1
+difficulty: 1
+depth: both
+platforms: [vercel, render, railway, fly, aws, docker]
+concepts: [servers, request-journey]
+prerequisites: [m00-l01]
+lab: self
+scenario_ids: [sc-serverless-shape-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A team moved from Render to Vercel over a weekend because the frontend team preferred the preview deploys. The app worked. On Wednesday, their database provider emailed about connection limits. On Thursday, the nightly email digest stopped. On Friday, uploads over 4MB started failing, and a websocket feature they'd shipped in March simply never connected.
+
+Nobody had broken anything. They had moved from a **long-running process** to **per-request functions**, and four assumptions silently stopped being true: that one process could pool database connections, that code could keep running after responding, that a request body could be large, and that a connection could stay open.
+
+Their agent had migrated the code faithfully. It couldn't migrate the assumptions, because nobody had written them down — they weren't in the code, they were in the *shape of the thing the code ran on*.
+
+</Section>
+
+<Section kind="already-did">
+
+You have deployed to at least one of these and it felt like magic: connect a repo, push, get a URL with HTTPS. That's genuinely a good product experience, and it's also why the shape underneath stays invisible until it bites.
+
+You have also, probably, met one of these moments: being told to use `process.env.PORT` instead of a hardcoded 3000. Finding a "Background Worker" option in a dropdown and not knowing whether you needed it. Reading "functions have a 10-second timeout" in docs and not knowing if that applied to you. Seeing "Region: Washington D.C. (iad1)" on a settings page and clicking past it.
+
+Each of those is the platform's shape showing through. This lesson gives you the three questions that reveal it for any host, so you can predict what will break before you migrate rather than after.
+
+</Section>
+
+<Section kind="mental-model">
+
+Underneath every host is the same physical reality: **a computer, running a process, listening on a port.** What differs is how much of that computer you're renting, for how long, and who manages it.
+
+Three questions place any host on the map.
+
+### Question 1: does my code run as a long-lived process, or per request?
+
+This is the biggest fork in the road, and nearly every surprise in the story above comes from it.
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Comparison of a long-running process which starts once and handles many requests while keeping state, versus per-request functions which start and stop for each request with no shared state" className="diagram">
+  <defs>
+    <marker id="arrs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <text x="12" y="22" className="sub">LONG-RUNNING PROCESS — starts once, handles everything, remembers</text>
+  <rect x="8" y="34" width="420" height="78" rx="10" />
+  <text x="218" y="60" textAnchor="middle">one node process, alive for weeks</text>
+  <text x="218" y="80" textAnchor="middle" className="sub">connection pool · in-memory cache · websockets · background timers</text>
+  <text x="218" y="99" textAnchor="middle" className="sub">VPS · Render service · Railway · Fly · ECS · a container</text>
+  <path d="M 452 56 L 438 56" className="arrow" markerEnd="url(#arrs)" />
+  <path d="M 452 73 L 438 73" className="arrow" markerEnd="url(#arrs)" />
+  <path d="M 452 90 L 438 90" className="arrow" markerEnd="url(#arrs)" />
+  <text x="462" y="60" className="sub">request 1</text>
+  <text x="462" y="77" className="sub">request 2</text>
+  <text x="462" y="94" className="sub">request 3 …</text>
+
+  <text x="12" y="158" className="sub">PER-REQUEST FUNCTIONS — start, answer, vanish; nothing is remembered</text>
+  <rect x="8" y="170" width="150" height="60" rx="10" />
+  <text x="83" y="194" textAnchor="middle">fn instance</text>
+  <text x="83" y="212" textAnchor="middle" className="sub">request 1</text>
+  <rect x="178" y="170" width="150" height="60" rx="10" />
+  <text x="253" y="194" textAnchor="middle">fn instance</text>
+  <text x="253" y="212" textAnchor="middle" className="sub">request 2</text>
+  <rect x="348" y="170" width="150" height="60" rx="10" />
+  <text x="423" y="194" textAnchor="middle">fn instance</text>
+  <text x="423" y="212" textAnchor="middle" className="sub">request 3</text>
+  <rect x="518" y="170" width="246" height="60" rx="10" />
+  <text x="641" y="194" textAnchor="middle">…each its own connections</text>
+  <text x="641" y="212" textAnchor="middle" className="sub">Lambda · Vercel · Cloudflare Workers</text>
+  <text x="12" y="254" className="sub">No shared memory. No work after the response. Cold starts when idle.</text>
+  <text x="12" y="272" className="sub">Scales to zero and to thousands — and each instance opens its own DB connection.</text>
+</svg>
+
+| | Long-running process | Per-request functions |
+|---|---|---|
+| Lives for | Weeks, until you deploy | Milliseconds to minutes |
+| Database connections | One shared <Term k="connection-pool">pool</Term> (efficient) | Each instance opens its own → exhaustion at scale |
+| In-memory state | Works (cache, counters, rate limits) | Useless — each request may be a different instance |
+| Work after responding | Fine (timers, queues, background tasks) | **Dies with the response** |
+| Websockets / long polling | Native | Needs a separate service |
+| Idle cost | You pay for the box | Scales to zero |
+| Idle latency | Always warm | <Term k="cold-start">Cold starts</Term> |
+| Big uploads | Your limit | Platform body-size caps (often 4–6MB) |
+| Mental model | "A computer I rent" | "A function someone calls" |
+
+Neither is better. They have different shapes, and your code makes assumptions about shape whether you intend it to or not.
+
+### Question 2: who manages the layers?
+
+Every host is the same stack; the line of responsibility moves.
+
+| Layer | VPS | Container platform | PaaS | Serverless |
+|---|---|---|---|---|
+| Hardware | them | them | them | them |
+| OS, kernel patches | **you** | them | them | them |
+| Runtime (node, python) | **you** | **you** (image) | them (buildpack) | them |
+| <Term k="tls">TLS</Term> certificates | **you** | them | them | them |
+| Process supervision / restarts | **you** | them | them | them (n/a) |
+| Scaling | **you** | config | config | automatic |
+| Your code | you | you | you | you |
+
+What you buy with a PaaS is the removal of six jobs. What you give up is the ability to do anything the platform didn't anticipate — which is exactly the trade in D4 of the decision library.
+
+### Question 3: where is it, physically?
+
+A <Term k="region">region</Term> is a real building. Light takes about 1ms per 200km, and a round trip doubles it. App in Oregon, database in Virginia is ~70ms **per query** — ten queries on a page is 700ms of pure geography, unfixable in code.
+
+<Callout type="key">
+The rule that prevents the most pain: **put your app in the same region as your database.** Users can be served from anywhere via a CDN; a chatty app-to-database arrow cannot. When you choose a region, you are choosing it relative to your *data*, not your users.
+</Callout>
+
+### What "serverless" actually means
+
+There are still servers; you're just not allowed to know about them, and that's the point. The honest definition: **you deploy a function, the platform runs it on demand, you pay per invocation, and you cannot keep anything between calls.** Everything in the per-request column above follows from that last clause.
+
+<Operator>
+
+Determine any deployment's shape empirically — the docs can lie, your process can't.
+
+```bash
+# Is this a long-running process or per-request? Ask the process its own age.
+#   Add a temporary endpoint, or read it where you can:
+node -e 'console.log("uptime seconds:", process.uptime(), "pid:", process.pid)'
+#   Hit it repeatedly. Rising uptime + stable PID = one long-running process.
+#   Near-zero uptime and a changing PID = a new instance per request.
+
+# How many instances am I actually running right now?
+#   The PID/hostname in your logs answers this for free:
+docker compose logs app | grep -oE 'pid=[0-9]+' | sort -u
+#   Platform: the instances/replicas count in the dashboard.
+
+# What are the platform's limits that your code is assuming away?
+#   Body size, request duration, memory — find them BEFORE you need them:
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://yourapp.com/api/upload \
+  -H "Content-Type: application/octet-stream" --data-binary @10mb-file.bin
+#   413 = a proxy/platform body limit, not your code.
+
+# Where is this running, and where is the database?
+curl -sI https://yourapp.com | grep -iE "x-vercel-id|cf-ray|x-render"   # edge/region hints
+#   Then measure the arrow that matters:
+docker compose exec app sh -c 'time nc -z db 5432'
+#   In production, time a trivial query — that floor is your geography:
+#   psql "$DATABASE_URL" -c '\timing' -c 'SELECT 1;'
+
+# Does my code keep state between requests? (The assumption that breaks silently.)
+grep -rnE "^(const|let|var) .*(= new Map|= \[\]|= \{\})" --include="*.ts" lib/ app/ 2>/dev/null
+#   Module-level mutable state works on a long-running process and silently
+#   fails on functions — a rate limiter here is per-instance, not global.
+```
+
+That last grep is the highest-value one in this lesson. Module-scope `Map`s and counters are the single most common thing that works on Render and quietly misbehaves on Vercel.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Host | Shape | Best at | The wall you'll hit |
+|---|---|---|---|
+| **Vercel** | Functions (+ static/edge) | Next.js frontends, preview deploys | No background work after response; body limits; DB connections need a pooler |
+| **Render** | Long-running services, workers, crons | "I want a normal server without managing one" | Cold starts on free tier; fewer edge features |
+| **Railway** | Long-running services | Fast setup, good DX, easy Postgres/Redis | Cost at scale; fewer compliance controls |
+| **Fly.io** | Containers close to users | Multi-region, websockets, full control-ish | You think about machines and volumes again |
+| **Cloudflare Workers** | Edge functions | Global low latency, cheap at volume | Not full Node; different runtime constraints |
+| **AWS Lambda** | Functions | Event-driven, deep AWS integration | Cold starts, IAM complexity, connection limits |
+| **A VPS (Hetzner/DO)** | A whole computer | Cost at scale, no limits, learning | **You** own OS, TLS, restarts, backups, security |
+| **ECS / Cloud Run** | Containers | Predictable container deploys at scale | More infrastructure concepts to hold |
+
+What good looks like: you can state, for your product, whether your code runs as a process or a function, how many instances exist right now, what region it's in relative to your database, and which platform limit you're closest to.
+
+The opinionated default for this program's learner: **a PaaS for the web app, plus one long-running service for workers and crons.** It keeps per-request and background work in the shapes that suit them, and it's the demo app's architecture for exactly that reason.
+
+</Section>
+
+<Section kind="hands-on">
+
+The demo app runs as long-running processes in containers. Prove the shape, then observe what the other shape would forbid.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Prove it's long-running.** `docker compose exec app sh -c 'ps aux | grep -c "[n]ode"'`, then hit the site a few times and run it again. The process count doesn't change — one process is serving everything.
+2. **Find the instance count.** `docker compose ps` — one `app`, one `worker`. The worker listens on no port: it's a long-running process with *no* inbound arrow, a shape serverless cannot express at all.
+3. **See shared state working.** The Redis cache (`curl -s localhost:3001/api/rooms` twice) is shared deliberately *because* in-process memory wouldn't be shared across instances. Ask yourself: if the room list were cached in a module-level `Map` instead, what would break when you scale to three instances?
+4. **Watch the pool advantage.** `docker compose exec -T db psql -U ots -d demo -c "SELECT count(*), application_name FROM pg_stat_activity GROUP BY 2;"`. A handful of connections serve all traffic — that's one pool in one process. Under per-request functions, that number tracks concurrency instead.
+5. **Find the shape assumption.** Open `demo-app/worker/cron.js`. It uses `setInterval`. Write down what happens to that file if you deploy it to Vercel as a function. (Answer: the interval never fires a second time — the function returns and freezes. That's the sc-vocabulary-01 trap from M0.)
+
+Then on **your own** product: determine the shape, the instance count, and the region of both app and database. Add all three to your L0.3 map.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team migrated their API from Render to Vercel on Saturday. By Monday afternoon support has three unrelated-looking complaints, and their database provider has sent a connection-limit warning.
+
+<Evidence title="the three complaints">
+
+```text
+1. "Image uploads over about 5MB fail instantly with an error page."
+2. "The 'export my data' button spins, says Done, but no email ever arrives."
+3. "Login works, but I get logged out randomly, maybe one time in four."
+```
+
+</Evidence>
+
+<Evidence title="platform + provider evidence">
+
+```text
+Vercel function logs:
+  POST /api/upload        413  (12 occurrences, all >4.5MB payloads)
+  POST /api/export        200  41ms  — then nothing further
+  POST /api/login         200  — no errors at all
+
+Supabase:
+  connections: 94/100 used, mostly short-lived
+  warning email: "Your project is approaching its connection limit"
+
+Code (unchanged in the migration):
+  lib/session.ts      const sessions = new Map()      // module scope
+  app/api/export/...  void buildAndEmailExport(userId) // not awaited
+  next.config.ts      (no body size configuration)
+
+Previously on Render: 1 service, 1 instance, 2 workers, zero complaints.
+```
+
+</Evidence>
+
+Three symptoms, one root cause category. Name the shape change and map each complaint to the assumption it broke.
+
+<Reveal label="Reveal the cause">
+
+**One cause: the code was written for a long-running process and now runs as per-request functions.** Nothing in the diff was wrong; every assumption about *shape* became false at once.
+
+**Complaint 1 — uploads over 5MB (413).** Vercel's function request bodies are capped (4.5MB on the serverless runtime). On Render, the only limit was whatever their own code set. The 413 comes from the platform, before their handler runs — which is why there's no application error to find. *Fix:* upload directly to object storage with a <Term k="signed-url">signed URL</Term> and never route file bytes through the function (M6.6 covers this pattern; it's also better architecture on any host).
+
+**Complaint 2 — export says Done, no email.** `void buildAndEmailExport(userId)` — fire-and-forget. On a long-running process the work continued after the response. A function is frozen the instant it responds: the work is abandoned mid-flight, and the `200` is honest about the *response*, not the work. *Fix:* a queue plus a worker, or a scheduled job — a box that outlives the request. (Exactly M0's sc-vocabulary-01, met in the wild.)
+
+**Complaint 3 — random logouts.** `const sessions = new Map()` at module scope. One process meant one map and consistent logins. Now every concurrent function instance has its own empty map, and a request landing on a different instance finds no session — hence *roughly* one in four, not always. *Fix:* sessions in Redis or a signed cookie; never in process memory on a multi-instance host.
+
+**And the connection warning** is the fourth face of the same change: one pooled process used a few connections; dozens of function instances each open their own. *Fix:* a pooler (Supabase's pooler, PgBouncer, Prisma Accelerate) — see M6.2 and D3.
+
+**The transferable lesson:** before changing hosts, enumerate your code's shape assumptions — module-level mutable state, work after the response, open connections, body sizes, long-lived sockets. They aren't in your diff, so neither your tests nor your agent will flag them. "The code deployed fine" says nothing about whether its assumptions survived.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit this repository for code that assumes a long-running process: module-level mutable state (Maps, arrays, counters, caches), work started but not awaited, setInterval or setTimeout outside a request, open sockets or long-lived connections, and in-process rate limiting. For each hit give file:line and say what would happen if this ran as per-request serverless functions across multiple instances."}>
+This is the migration checklist nobody writes. Verify a couple of hits by reading them yourself — `grep -rn "new Map()"` is a good cross-check. Anything in the list is a decision to make *before* a host change, not a bug to discover after.
+</AgentTask>
+
+<AgentTask prompt={"For my current host [name it], list the platform limits that constrain application code: max request body size, max request duration, memory per instance, concurrent instance limits, whether background work survives the response, and whether websockets are supported. Cite the documentation page for each, and flag any limit my code currently relies on exceeding."}>
+Check the citations — limits change and agents remember old numbers. Then test the one that matters most to you (body size is easy: post a 10MB file and look for a 413). Knowing these before you need them is what turns a 2am mystery into a known constraint.
+</AgentTask>
+
+<AgentTask prompt={"What region is my app deployed in, and what region is my database in? Show me where you found each. Then measure the round-trip latency of a trivial query from the app to the database and tell me how much of my typical page's latency is pure geography."}>
+Make it prove the regions from a dashboard or config file, not from assumption. If they differ, the latency floor it measures is unfixable in code — the only remedies are co-location or fewer queries per page, and that's a real decision (D15).
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Questions to ask before choosing or changing a host:
+
+- Does my code run as a long-running process or per-request functions? Which does my *workload* want?
+- Where do background jobs, crons and queue consumers run? (If the answer is "in the web app", check it survives the response.)
+- Does anything hold state in process memory? What happens at two instances?
+- How many database connections will I open at peak? Do I need a pooler?
+- What are the body size, duration and memory limits, and which am I closest to?
+- Which region is my app in? Which region is my database in? Why?
+- Which of OS, runtime, TLS, restarts, scaling and backups am I taking responsibility for?
+
+What good looks like: shape, instance count and both regions are on your map, and you can name the platform limit you'll hit first.
+
+Red flag: a host migration described as "it's just a different deploy target". The code is portable; the assumptions are not.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l01"
+  questions={[
+    {
+      q: "Which single property of a host explains cold starts, lost background work, connection exhaustion AND useless in-memory caches all at once?",
+      options: [
+        "Whether it's managed or self-hosted",
+        "Whether your code runs as a long-lived process or per-request instances that keep nothing between calls",
+        "Which region the datacenter is in",
+        "Whether it uses containers or virtual machines"
+      ],
+      answer: 1,
+      explain: "All four follow from the same clause: a function starts, answers, and vanishes. No warm process (cold starts), no life after the response (lost work), no shared pool (connections), no shared memory (caches)."
+    },
+    {
+      q: "Your code has `const rateLimits = new Map()` at module scope and you scale from one instance to four. What happens?",
+      options: [
+        "The map is shared automatically by the platform",
+        "Each instance gets its own map, so the effective limit is roughly four times what you intended",
+        "Requests fail with a state synchronisation error",
+        "Nothing changes — module scope is per-deployment"
+      ],
+      answer: 1,
+      explain: "Module-level state is per-process. Four processes, four independent maps. This is why shared counters, rate limits and sessions belong in Redis or the database — and why the grep for module-scope mutables is the best pre-migration check."
+    },
+    {
+      q: "Why does putting your app and database in different regions hurt more than putting your app far from users?",
+      options: [
+        "Databases are more sensitive to packet loss than browsers",
+        "A page typically makes many app-to-database round trips, and a CDN can serve users from nearby while nothing can shortcut a chatty private arrow",
+        "Cross-region database traffic is billed at a higher rate",
+        "Browsers cache content but databases cannot"
+      ],
+      answer: 1,
+      explain: "One user request can mean ten queries. At ~70ms each that's 700ms of geography, unfixable in code. Users get a CDN; your database arrow doesn't. Choose the region relative to your data."
+    },
+    {
+      q: "In the break-fix, the export endpoint returned 200 but no email was ever sent. Why?",
+      options: [
+        "The email provider silently rate-limited the requests",
+        "The work was started without being awaited, and a function is frozen once it responds — so it was abandoned mid-flight",
+        "The 200 was cached by the CDN",
+        "The export query timed out at the database"
+      ],
+      answer: 1,
+      explain: "Fire-and-forget works on a long-running process and silently fails on functions. The 200 truthfully describes the response, not the work. Real asynchrony needs a box that outlives the request."
+    },
+    {
+      q: "What do you actually buy by choosing a PaaS over a VPS?",
+      options: [
+        "Lower cost at every scale",
+        "Someone else owns OS patching, TLS renewal, process supervision and scaling — at the price of only being able to do what the platform anticipated",
+        "Better performance, because platforms optimise the runtime",
+        "Freedom from thinking about regions and limits"
+      ],
+      answer: 1,
+      explain: "The layer table is the answer: a PaaS removes about six jobs you'd otherwise own. The cost is flexibility, and the crossover where a VPS gets cheaper comes later than people claim (D4)."
+    }
+  ]}
+/>
+
+</Section>

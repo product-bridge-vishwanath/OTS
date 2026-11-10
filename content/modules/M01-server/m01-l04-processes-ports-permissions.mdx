@@ -1,0 +1,457 @@
+---
+id: m01-l04
+module: M1
+title: "Processes, ports and permissions: the three things that say \"denied\""
+order: 4
+difficulty: 2
+depth: both
+platforms: [docker, nginx, postgres]
+concepts: [processes, ports, permissions]
+prerequisites: [m01-l03]
+lab: demo-repo
+scenario_ids: [sc-port-permission-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A developer spent an afternoon fighting `EADDRINUSE: address already in use :::3000`. He killed every `node` process he could find. He restarted his terminal. He rebooted. Each time the error came back within a minute.
+
+He eventually asked his agent, which suggested changing the port to 3001. That worked — so he shipped it. Two days later staging broke, because the reverse proxy in front of it was still forwarding to 3000, and nobody remembered why the port had moved.
+
+What was actually holding port 3000: `pm2`, which he'd installed three weeks earlier following a tutorial, and which was dutifully restarting his app every time he killed it. `lsof -i :3000` would have printed the answer — the process name and its PID — in about 200 milliseconds.
+
+The deeper problem is that "port already in use", "permission denied" and "connection refused" all feel like the same kind of wall. They're not. Each names a different system — processes, permissions, networking — and each has a command that tells you exactly who's responsible.
+
+</Section>
+
+<Section kind="already-did">
+
+You've met all three walls. `EADDRINUSE` when a dev server didn't shut down cleanly. `EACCES: permission denied` writing to an uploads folder, probably "fixed" with `sudo` or `chmod 777`. `ECONNREFUSED` when the database wasn't running — or was running but not listening where you thought.
+
+You've probably also run `chmod -R 777` on something, because an agent suggested it and it made the error go away. (It did make the error go away. It also made the directory world-writable, which is how the SSH lockout in L1.2 happened.)
+
+This lesson replaces those three walls with three questions, each answerable in one command.
+
+</Section>
+
+<Section kind="mental-model">
+
+Three systems, three failure messages, three commands.
+
+<svg viewBox="0 0 780 260" role="img" aria-label="Three systems: processes identified by PID, ports as numbered doors bound by one process each, and permissions as owner group other triples on every file" className="diagram">
+  <rect x="8" y="14" width="246" height="112" rx="10" />
+  <text x="131" y="40" textAnchor="middle">PROCESSES</text>
+  <text x="131" y="62" textAnchor="middle" className="sub">a running program + its memory</text>
+  <text x="131" y="80" textAnchor="middle" className="sub">identified by PID · owned by a user</text>
+  <text x="131" y="104" textAnchor="middle" className="sub">&quot;port in use&quot; → ps / lsof</text>
+
+  <rect x="267" y="14" width="246" height="112" rx="10" />
+  <text x="390" y="40" textAnchor="middle">PORTS</text>
+  <text x="390" y="62" textAnchor="middle" className="sub">numbered doors on an interface</text>
+  <text x="390" y="80" textAnchor="middle" className="sub">one listener each · 0.0.0.0 vs 127.0.0.1</text>
+  <text x="390" y="104" textAnchor="middle" className="sub">&quot;connection refused&quot; → ss / nc</text>
+
+  <rect x="526" y="14" width="246" height="112" rx="10" />
+  <text x="649" y="40" textAnchor="middle">PERMISSIONS</text>
+  <text x="649" y="62" textAnchor="middle" className="sub">owner · group · everyone else</text>
+  <text x="649" y="80" textAnchor="middle" className="sub">read · write · execute</text>
+  <text x="649" y="104" textAnchor="middle" className="sub">&quot;permission denied&quot; → ls -la / id</text>
+
+  <text x="12" y="160" className="sub">rwx r-x r-- · owner group other — read the triples left to right</text>
+  <rect x="8" y="172" width="364" height="76" rx="10" />
+  <text x="190" y="196" textAnchor="middle" className="sub">-rw-r--r--  1 deploy  www-data  uploads/</text>
+  <text x="190" y="216" textAnchor="middle" className="sub">owner: deploy can read+write</text>
+  <text x="190" y="236" textAnchor="middle" className="sub">group www-data and others: read only</text>
+
+  <rect x="400" y="172" width="372" height="76" rx="10" />
+  <text x="586" y="196" textAnchor="middle" className="sub">chmod 640 = rw- r-- ---</text>
+  <text x="586" y="216" textAnchor="middle" className="sub">4=read 2=write 1=execute, added per triple</text>
+  <text x="586" y="236" textAnchor="middle" className="sub">755 dirs · 644 files · 600 secrets · never 777</text>
+</svg>
+
+### Processes
+
+A **process** is a running program with its own memory, its own environment, and an owning user. It has a <Term k="pid">PID</Term>, which changes on every restart. Your app "being up" means: a process exists, it's listening on a port, and it hasn't crashed.
+
+Signals are how you talk to one:
+
+| Signal | Command | What the process gets |
+|---|---|---|
+| `SIGTERM` (15) | `kill <pid>` | "Please shut down" — can finish requests and close connections |
+| `SIGKILL` (9) | `kill -9 <pid>` | Nothing. Instant death, no cleanup |
+| `SIGHUP` (1) | `kill -HUP <pid>` | Many servers reload config without restarting |
+
+<Callout type="warn">
+`kill -9` as a reflex is a bad habit with real costs: no <Term k="graceful-shutdown">graceful shutdown</Term> means in-flight requests die, database transactions are abandoned, and buffered writes are lost. Try `kill` first and give it a few seconds. Reach for `-9` only when a process is genuinely wedged — and then ask *why* it ignored SIGTERM, because that's usually a bug worth fixing.
+</Callout>
+
+### Ports
+
+A port is a numbered door, and **only one process can listen on a given port + interface**. Which interface matters enormously:
+
+- `0.0.0.0:3000` — listening on *all* interfaces. Reachable from outside the machine (and from outside a container).
+- `127.0.0.1:3000` — listening on localhost *only*. A proxy on the same machine can reach it; nothing else can, including Docker's port mapping.
+
+That distinction is a genuine production failure: an app that binds to `127.0.0.1` inside a container looks perfectly healthy in its own logs, while the platform's health checks and port mapping get connection refused. Hence <Term k="five-oh-two">502</Term>, with a running, happy app.
+
+The three different "can't connect" answers:
+
+| What you see | What it means |
+|---|---|
+| **Connection refused** | Something reached the machine; **nothing is listening** on that port |
+| **Timeout / hang** | A firewall or security group is silently dropping packets |
+| **Connection reset** | Something listened, then slammed the door (often TLS mismatch, or the app crashed mid-handshake) |
+
+"Refused" vs "timeout" is a free, high-value distinction: refused means fix the app, timeout means fix the firewall.
+
+### Permissions
+
+Every file has an owner, a group, and three permission triples. `ls -la` shows them:
+
+```text
+-rw-r--r--  1 deploy  www-data  2048  Nov  7 03:40  app.log
+│└┬┘└┬┘└┬┘     │       │
+│ │  │  └── other: r--   (everyone else: read)
+│ │  └───── group: r--   (www-data members: read)
+│ └──────── owner: rw-   (deploy: read+write)
+└────────── type: - file, d directory, l symlink
+```
+
+Numeric mode: read=4, write=2, execute=1, added within each triple.
+
+| Mode | Means | Use for |
+|---|---|---|
+| `755` | owner rwx, others r-x | Directories, executables |
+| `644` | owner rw, others r | Normal files |
+| `600` | owner rw, nobody else | **Secrets, SSH keys, `.env`** |
+| `777` | everyone everything | **Never.** It's not a fix; it's a vulnerability that silences an error |
+
+On directories the bits mean something slightly different and surprising: `x` means "may traverse into", and `w` means "may create or delete entries *inside*". So a read-only file in a writable directory can still be deleted — the permission that matters for deletion is the directory's.
+
+**The two questions behind every `permission denied`:** which user is the process running as (`ps aux`, or `whoami` inside it), and who owns the thing it's touching (`ls -la`)? Nine times in ten the answer is a mismatch — commonly because someone ran a step with `sudo` once and left root-owned files behind.
+
+<Operator>
+
+```bash
+# ── "Port already in use" — find the owner in one command ──────────────
+lsof -i :3000                       # PID, process name, user — the answer
+ss -tlnp | grep 3000                # Linux: includes the process
+#   Then decide: is it an orphan, or a supervisor that will restart it?
+systemctl status myapp --no-pager | head -5
+pm2 list 2>/dev/null
+#   Only then:
+kill <pid>      # polite; wait 3 seconds
+kill -9 <pid>   # last resort
+
+# ── Which interface is it bound to? (the silent 502 cause) ─────────────
+ss -tln | grep 3000
+#   0.0.0.0:3000 or *:3000  → reachable from outside
+#   127.0.0.1:3000          → localhost only; container port mapping WILL fail
+docker compose exec app sh -c 'netstat -tln 2>/dev/null || ss -tln'
+
+# ── "Connection refused" vs "timeout" — distinguish them deliberately ──
+nc -zv db 5432                  # refused = nothing listening; hang = firewall
+curl -sv --max-time 5 http://localhost:3000/ 2>&1 | head -5
+#   On a VPS also check the firewall, which produces timeouts not refusals:
+sudo ufw status
+sudo iptables -L -n | head -20
+
+# ── "Permission denied" — the two-question diagnosis ──────────────────
+ps aux | grep "[n]ode"                 # which USER is the process?
+docker compose exec app sh -c 'whoami; id'
+ls -la /srv/app/uploads                # who OWNS the target?
+namei -l /srv/app/uploads/file.png     # checks EVERY directory in the path
+#   The fix is almost always ownership, not 777:
+sudo chown -R riverside:riverside /srv/app/uploads
+sudo chmod 755 /srv/app/uploads
+#   Secrets stay tight:
+chmod 600 /srv/app/.env && ls -l /srv/app/.env
+
+# ── Find damage from a past `sudo` ────────────────────────────────────
+find /srv/app -user root -not -path "*/node_modules/*" 2>/dev/null | head
+#   Root-owned files inside an app directory are a permission bug waiting to fire.
+
+# ── Processes: what is this thing actually doing? ─────────────────────
+ps -o pid,ppid,user,etime,rss,cmd -p <pid>     # age, memory, full command
+ls -l /proc/<pid>/cwd                          # its working directory
+tr '\0' '\n' < /proc/<pid>/environ | grep -v -i "key\|secret\|password"
+ls /proc/<pid>/fd | wc -l                      # open file descriptors (leak check)
+```
+
+`namei -l` is the underrated one: `permission denied` on `/srv/app/uploads/x.png` is often caused by a missing `x` bit on `/srv` or `/srv/app`, not on the file. `namei -l` prints the permissions of every component of the path at once.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool | Note |
+|---|---|---|
+| Who holds a port | `lsof -i :PORT`, `ss -tlnp` | `lsof` on macOS, `ss` on modern Linux |
+| What's running | `ps aux`, `htop`, `systemctl status` | `ps` is everywhere |
+| Signals / stopping | `kill`, `kill -9`, `pkill -f pattern` | `pkill -f` matches the full command line — powerful and easy to over-match |
+| Permissions on a path | `ls -la`, `namei -l`, `stat` | `namei -l` for "which directory in the path is wrong" |
+| Ownership repair | `chown -R`, `chmod` | Prefer group membership over loosening modes |
+| Firewall | `ufw status`, `iptables -L -n`, cloud security groups | Produces timeouts, not refusals |
+| Container internals | `docker compose exec`, `docker inspect` | `whoami` inside the container is often not root |
+
+What good looks like: `EADDRINUSE` sends you to `lsof -i`, not to changing the port. `EACCES` sends you to `ps aux` + `ls -la`, not to `chmod 777`. And you can state which interface your app binds to.
+
+A note on containers worth internalising: the user inside a container is usually *not* your user, and often not root. Files written into a mounted volume are owned by the container's UID, which is why a file your app created can appear un-editable on your host — same mismatch, different boundary.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Who holds the port?** The app maps container 3000 → host 3001. Look from both sides:
+   ```bash
+   lsof -i :3001                 # on your host: Docker holds it
+   docker compose exec app sh -c 'netstat -tln 2>/dev/null || ss -tln'
+   ```
+   Note the container binds `0.0.0.0:3000` — predict what would break if it bound `127.0.0.1:3000` instead.
+
+2. **Reproduce `EADDRINUSE` deliberately**, then diagnose it properly:
+   ```bash
+   nc -l 5599 &                  # occupy a port
+   nc -l 5599                    # second listener fails
+   lsof -i :5599                 # the correct diagnostic
+   kill %1
+   ```
+
+3. **Which user does the app run as?**
+   ```bash
+   docker compose exec app sh -c 'whoami; id; ps aux | head -3'
+   ```
+
+4. **Create a real permission denial and fix it by ownership, not by 777:**
+   ```bash
+   docker compose exec app sh -c '
+     mkdir -p /tmp/uploads && chown 65534:65534 /tmp/uploads && chmod 755 /tmp/uploads
+     su -s /bin/sh nobody -c "touch /tmp/uploads/ok.txt" && echo "nobody CAN write"
+     chown root:root /tmp/uploads && chmod 755 /tmp/uploads
+     su -s /bin/sh nobody -c "touch /tmp/uploads/fail.txt" || echo "nobody DENIED (as expected)"
+     ls -la /tmp/uploads'
+   ```
+   The denial came from ownership. `chmod 777` would have silenced it; `chown` fixed it.
+
+5. **Signals: graceful vs violent.** Watch the difference in the logs:
+   ```bash
+   docker compose logs --tail 5 app
+   docker compose stop app          # sends SIGTERM, waits
+   docker compose logs --tail 5 app # look for a clean shutdown
+   docker compose start app
+   docker compose kill app          # SIGKILL — no cleanup
+   docker compose logs --tail 5 app # nothing graceful logged
+   docker compose start app
+   ```
+   The second one leaves no trace of shutting down, because the process was never told.
+
+6. **Refused vs timeout**, the distinction that saves firewall confusion:
+   ```bash
+   docker compose exec app sh -c 'nc -zv db 5432'        # open
+   docker compose exec app sh -c 'nc -zv db 5999'        # refused — fast
+   docker compose exec app sh -c 'nc -zv -w 3 10.255.255.1 80'   # dropped — hangs
+   ```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A new deploy to a VPS "succeeded" — the deploy script exited 0, the service reports running — but every request to the site returns 502 from Nginx. The previous release was fine. Uploads were also reported broken earlier in the week.
+
+<Evidence title="service and port state">
+
+```text
+$ systemctl status riverside --no-pager | head -8
+● riverside.service - Riverside Studios
+     Active: active (running) since Fri 2026-11-07 10:14:51 UTC; 4min ago
+   Main PID: 20514 (node)
+
+$ curl -s -o /dev/null -w "%{http_code}\n" https://riverside.example
+502
+
+$ sudo ss -tlnp | grep -E "3000|nginx"
+LISTEN 0  511  127.0.0.1:3000   0.0.0.0:*   users:(("node",pid=20514,fd=21))
+LISTEN 0  511    0.0.0.0:80     0.0.0.0:*   users:(("nginx",pid=911,fd=6))
+LISTEN 0  511    0.0.0.0:443    0.0.0.0:*   users:(("nginx",pid=911,fd=7))
+
+$ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3000/api/health
+200
+```
+
+</Evidence>
+
+<Evidence title="nginx and app config">
+
+```text
+$ sudo tail -2 /var/log/nginx/error.log
+2026/11/07 10:15:02 [error] 911#0: *4812 connect() failed (111: Connection refused)
+  while connecting to upstream, client: 203.0.113.9,
+  upstream: "http://10.0.0.5:3000/api/bookings", host: "riverside.example"
+
+$ grep -A2 "location /" /etc/nginx/sites-enabled/riverside
+location / {
+    proxy_pass http://10.0.0.5:3000;
+}
+
+$ hostname -I
+10.0.0.5
+
+$ git log --oneline -2
+7c1e9aa perf: bind server explicitly to avoid IPv6 warnings   ← deployed 10:14
+f2d0b31 feat: booking notes
+
+$ git show 7c1e9aa -- server.js | grep -E "^[-+].*listen"
+-server.listen(PORT)
++server.listen(PORT, "127.0.0.1")
+```
+
+</Evidence>
+
+<Evidence title="and the earlier uploads complaint">
+
+```text
+$ ls -la /srv/app/uploads | head -4
+drwxr-xr-x 2 root       root       4096 Nov  4 09:22 .
+-rw-r--r-- 1 root       root      18244 Nov  4 09:22 logo.png
+
+$ ps -o user,cmd -p 20514
+USER       CMD
+riverside  /usr/bin/node /srv/app/server.js
+
+$ sudo journalctl -u riverside --since "4 days ago" | grep -i eacces | head -2
+Nov 04 09:40:12 riverside[18233]: Error: EACCES: permission denied, open '/srv/app/uploads/u_8812.png'
+```
+
+</Evidence>
+
+Two separate causes here. Name both, and note what each has in common.
+
+<Reveal label="Reveal the cause">
+
+**Cause 1 — the 502: the app binds to the wrong interface.**
+
+Commit `7c1e9aa` changed `server.listen(PORT)` to `server.listen(PORT, "127.0.0.1")` to silence an IPv6 warning. `ss` shows the result precisely: `127.0.0.1:3000`, localhost only. Nginx's config forwards to `http://10.0.0.5:3000` — the machine's own LAN address, a *different interface*. Nothing is listening there, so Nginx gets **connection refused** (error 111 in its log, which names the exact mechanism) and returns 502 upward.
+
+Everything else is misleadingly healthy: the service is `active (running)`, the app logs no errors, and `curl http://127.0.0.1:3000/api/health` returns 200 — because that request uses the one interface that works. This is the silent 502 from the mental model, in the wild: a perfectly healthy app that the proxy cannot reach.
+
+*Fix:* either bind to all interfaces (`server.listen(PORT, "0.0.0.0")`) or point Nginx at `127.0.0.1:3000`. Prefer the latter here — the app shouldn't be reachable from the LAN directly; the proxy should be the only way in. Then verify from the proxy's perspective, not the app's: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/api/health` is not the test that was failing.
+
+**Cause 2 — uploads: ownership mismatch.** The process runs as `riverside` (per `ps -o user`), but `/srv/app/uploads` is owned by `root:root` with mode 755 — so the owner can write, and `riverside` is "other", which has read and traverse but not write. Hence `EACCES`. The directory was almost certainly created with `sudo mkdir` at some point, which is how root-owned files appear inside an app directory.
+
+*Fix:* `sudo chown -R riverside:riverside /srv/app/uploads` and leave it `755`. **Not** `chmod 777`, which would also make it world-writable — silencing the error while creating a vulnerability, and leaving the actual mismatch in place to resurface on the next file root creates.
+
+**What the two have in common, and the real lesson:** both are *identity and location* mismatches, not code bugs. Something is listening — on the wrong interface. Something can write — as the wrong user. In both cases the app's own logs and status look fine, because from the app's point of view nothing is wrong. You find them by asking **who** and **where**: `ss -tlnp` for which process on which interface, `ps -o user` plus `ls -la` for which user against which owner. Three commands, two outages.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"I get EADDRINUSE on port 3000. Identify which process holds it, which user owns that process, and whether it is supervised by systemd, pm2, Docker, or nothing — so I know if killing it will just restart. Do not suggest changing the port."}>
+The "do not suggest changing the port" clause is doing real work: changing the port is the move that caused the two-day staging mystery in the story. Make it show you the `lsof`/`ss` output. If a supervisor owns the process, the correct action is `systemctl stop`/`pm2 stop`, not `kill`.
+</AgentTask>
+
+<AgentTask prompt={"My app gets EACCES writing to [path]. Diagnose it properly: which user does the process run as, who owns every directory in that path (use namei -l), and what is the minimum ownership or group change that fixes it? Explicitly do not propose chmod 777, and explain what 777 would expose if we used it."}>
+Making it argue against 777 is the point — agents suggest it readily because it works. Verify the user it names with `ps -o user -p <pid>`, and check whether root-owned files elsewhere in the app directory suggest a `sudo` step in your deploy script that will recreate the problem.
+</AgentTask>
+
+<AgentTask prompt={"Add graceful shutdown to this app: on SIGTERM, stop accepting new connections, finish in-flight requests with a timeout of 10 seconds, close the database pool, then exit 0. Log one line when shutdown begins and one when it completes."}>
+Test it for real: start the app, send a request, and `kill <pid>` (not `-9`) mid-request. You want both log lines and an exit code of 0 — and the request completing. Without this, every deploy drops whatever was in flight, which is invisible in metrics and visible to users.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The three questions, with their commands:
+
+- **"Port already in use"** → `lsof -i :PORT` / `ss -tlnp`. Who holds it, and is a supervisor going to restart it?
+- **"Permission denied"** → `ps -o user -p <pid>` and `ls -la` (or `namei -l` for a path). Which user, which owner?
+- **"Connection refused" vs "timeout"** → refused means nothing is listening (fix the app); timeout means packets are being dropped (fix the firewall).
+
+Standing checks worth doing once per service:
+
+- Which interface does my app bind to — `0.0.0.0` or `127.0.0.1`? Is that deliberate?
+- Which user does it run as? Is it root? (It shouldn't be.)
+- Does it handle SIGTERM gracefully, or does every deploy drop in-flight requests?
+- Are there any root-owned files inside my app directory? Where did they come from?
+- Is my `.env` mode 600?
+
+What good looks like: no `chmod 777` anywhere in your infrastructure or your shell history; apps run as a dedicated non-root user; `kill -9` is rare and investigated when needed.
+
+Red flags: changing a port to work around `EADDRINUSE`; `sudo` sprinkled through a deploy script; `chmod -R 777` as a fix for anything at all.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l04"
+  questions={[
+    {
+      q: "You get EADDRINUSE on port 3000. Why is changing the port the wrong first move?",
+      options: [
+        "Port 3000 is reserved and must be used for HTTP services",
+        "It leaves an unknown process running and hides the real cause — often a supervisor that will keep restarting the old app, and now your proxy points at the wrong port",
+        "Other ports are slower",
+        "It requires a firewall rule change"
+      ],
+      answer: 1,
+      explain: "`lsof -i :3000` names the holder in milliseconds. In the story it was pm2, which restarted the app after every kill — and the port change broke the proxy two days later."
+    },
+    {
+      q: "An app logs no errors, its health check passes on localhost, systemd says running — and the proxy returns 502. What's the most likely cause?",
+      options: [
+        "The proxy's TLS certificate has expired",
+        "The app is bound to 127.0.0.1 while the proxy connects to another interface, so nothing is listening where the proxy looks",
+        "The app's health endpoint is cached",
+        "The database is refusing connections"
+      ],
+      answer: 1,
+      explain: "That's the break-fix exactly. `ss -tlnp` shows the interface; a localhost-only bind is invisible to the app's own logs and to a localhost curl, because both use the interface that works."
+    },
+    {
+      q: "What's the practical difference between \"connection refused\" and a connection that hangs until timeout?",
+      options: [
+        "Refused is TCP, timeout is UDP",
+        "Refused means the machine was reached but nothing is listening on that port; a hang means packets are being silently dropped, usually by a firewall",
+        "Refused means the service is overloaded; timeout means it is down",
+        "They are the same error reported differently by different clients"
+      ],
+      answer: 1,
+      explain: "A free, high-value distinction: refused sends you to the app (is it running? which interface?), timeout sends you to firewall rules or security groups."
+    },
+    {
+      q: "Why is `chmod 777` not an acceptable fix for a permission error?",
+      options: [
+        "It only works on files, not directories",
+        "It makes the path writable by every user and process on the machine, silencing the symptom while leaving the actual owner/user mismatch in place",
+        "It is reverted automatically on reboot",
+        "It breaks the application's ability to read the file"
+      ],
+      answer: 1,
+      explain: "The real diagnosis is two questions — which user is the process, who owns the target — and the fix is `chown` or group membership. 777 trades a visible error for an invisible vulnerability, as the SSH lockout in L1.2 showed."
+    },
+    {
+      q: "Why prefer `kill <pid>` over `kill -9 <pid>`?",
+      options: [
+        "`kill -9` requires root privileges",
+        "SIGTERM lets the process finish in-flight requests, close database connections and flush writes; SIGKILL gives it no chance to do any of that",
+        "`kill -9` only works on processes you own",
+        "SIGTERM is faster"
+      ],
+      answer: 1,
+      explain: "SIGKILL abandons transactions and drops in-flight work. Use SIGTERM first, and if a process ignores it, treat that as a bug to fix — missing graceful shutdown handling is the usual reason."
+    }
+  ]}
+/>
+
+</Section>

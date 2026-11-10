@@ -1,0 +1,378 @@
+---
+id: m00-l04
+module: M0
+title: "Where things break: one failure per box"
+order: 4
+difficulty: 2
+depth: both
+platforms: [vercel, cloudflare, postgres, redis, supabase, sentry]
+concepts: [architecture-mapping, failure-triage, layer-isolation]
+prerequisites: [m00-l01, m00-l03]
+lab: demo-repo
+scenario_ids: [sc-failure-tour-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+An engineer with fifteen years of experience and a founder with eight months both get the same page: *"app slow, customers complaining."*
+
+The founder starts clicking. Platform dashboard: looks fine. Logs: a wall of text, nothing obviously red. Database tab: some graphs she can't interpret. She asks her agent, which suggests adding indexes — plural, speculatively. Twenty-five minutes gone, no diagnosis.
+
+The engineer asks one question: *"slow for everyone, or slow on one page?"* The answer — one page, the bookings list — eliminates DNS, the CDN, TLS, routing, and the whole edge. He opens that endpoint's latency graph, sees it climbing over three weeks with no deploy correlation, and says: *"something's grown and a query is now scanning it. Show me the slow query log."* Ninety seconds to a hypothesis.
+
+He didn't know the answer. He knew the **failure vocabulary of each box**, so the symptom told him where to stop looking.
+
+That vocabulary is learnable in one sitting, and it's this lesson.
+
+</Section>
+
+<Section kind="already-did">
+
+You have hit most of these failures already, you just met them as strangers. "Application error" on a Vercel deploy. `ECONNREFUSED` when the local database wasn't running. A certificate warning on a staging domain. A page that worked yesterday and takes eight seconds today. CORS, the first time you split frontend and backend.
+
+Each one felt like a unique disaster. They're not. There are roughly two dozen production failures in common circulation, each box hosts a handful of them, and **they're all recognisable by symptom alone.** You've been experiencing the catalogue in random order, without the index.
+
+</Section>
+
+<Section kind="mental-model">
+
+Every box fails in a small number of characteristic ways, and the *shape* of the symptom usually names the box before you look at anything.
+
+### Three questions that locate almost any failure
+
+Ask them in this order, because each cuts the search space hardest for its cost.
+
+<svg viewBox="0 0 780 250" role="img" aria-label="Three triage questions: is it everyone or some users, is it everything or one feature, and did it start suddenly or gradually — each answer pointing at different boxes" className="diagram">
+  <defs>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="8" y="14" width="236" height="56" rx="10" />
+  <text x="126" y="38" textAnchor="middle">1 · Everyone, or some?</text>
+  <text x="126" y="57" textAnchor="middle" className="sub">who is affected</text>
+
+  <rect x="272" y="14" width="236" height="56" rx="10" />
+  <text x="390" y="38" textAnchor="middle">2 · Everything, or one feature?</text>
+  <text x="390" y="57" textAnchor="middle" className="sub">how wide the blast radius</text>
+
+  <rect x="536" y="14" width="236" height="56" rx="10" />
+  <text x="654" y="38" textAnchor="middle">3 · Sudden, or gradual?</text>
+  <text x="654" y="57" textAnchor="middle" className="sub">what kind of cause</text>
+
+  <rect x="8" y="124" width="236" height="104" rx="10" />
+  <text x="126" y="148" textAnchor="middle" className="sub">everyone → shared box:</text>
+  <text x="126" y="166" textAnchor="middle" className="sub">DNS · edge · app · database</text>
+  <text x="126" y="190" textAnchor="middle" className="sub">some → per-user factor:</text>
+  <text x="126" y="208" textAnchor="middle" className="sub">region · cache · their data · auth</text>
+
+  <rect x="272" y="124" width="236" height="104" rx="10" />
+  <text x="390" y="148" textAnchor="middle" className="sub">everything → infrastructure:</text>
+  <text x="390" y="166" textAnchor="middle" className="sub">DNS · TLS · proxy · process down</text>
+  <text x="390" y="190" textAnchor="middle" className="sub">one feature → that path:</text>
+  <text x="390" y="208" textAnchor="middle" className="sub">one query · one provider · one job</text>
+
+  <rect x="536" y="124" width="236" height="104" rx="10" />
+  <text x="654" y="148" textAnchor="middle" className="sub">sudden → an event:</text>
+  <text x="654" y="166" textAnchor="middle" className="sub">deploy · config · expiry · outage</text>
+  <text x="654" y="190" textAnchor="middle" className="sub">gradual → accumulation:</text>
+  <text x="654" y="208" textAnchor="middle" className="sub">data growth · leak · disk · quota</text>
+
+  <path d="M 126 70 L 126 120" className="arrow" markerEnd="url(#arrb)" />
+  <path d="M 390 70 L 390 120" className="arrow" markerEnd="url(#arrb)" />
+  <path d="M 654 70 L 654 120" className="arrow" markerEnd="url(#arrb)" />
+</svg>
+
+Question 3 is the one people skip, and it's the most diagnostic of the three. **Sudden means something changed; gradual means something accumulated.** Those have disjoint cause lists and disjoint fixes. A gradual failure will never be explained by a deploy, and no amount of reading the last diff will help.
+
+### The tour: each box and its characteristic failures
+
+| Box | How it fails | Telltale symptom |
+|---|---|---|
+| **Browser / client** | JS error; stale cached bundle; blocked by extension | No request in the network tab; works in incognito |
+| **<Term k="dns">DNS</Term>** | Wrong/expired record; domain suspended; <Term k="ttl">TTL</Term> still serving old answer | "Can't be reached"; works for you, not for them |
+| **<Term k="tls">TLS</Term> / certificate** | Expiry; renewal silently failing for weeks; wrong domain on cert | Browser cert warning, starting at an exact minute |
+| **<Term k="cdn">CDN</Term> / edge** | Serving stale content; caching something personalised; cache miss storm | Old prices after deploy; one user seeing another's page |
+| **<Term k="reverse-proxy">Proxy</Term> / <Term k="load-balancer">LB</Term>** | No healthy instance; body size limit; timeout shorter than the work | <Term k="five-oh-two">502</Term>, 503, 504, 413 — *from the platform, not your app* |
+| **App process** | Unhandled exception; <Term k="oom">OOM</Term>; <Term k="crash-loop">crash loop</Term>; wrong port; missing <Term k="env-var">env var</Term> | 500 with a <Term k="stack-trace">stack trace</Term>; restart counter climbing |
+| **App logic** | Race condition; <Term k="idempotent">non-idempotent</Term> retry; bad validation | Wrong data, not errors — the worst kind |
+| **<Term k="cache">Cache</Term>** | Stale after writes; down; stampede on expiry | Plausible-but-wrong data; sudden DB load spike |
+| **Database** | <Term k="connection-pool">Connections</Term> exhausted; missing <Term k="index">index</Term> at scale; <Term k="deadlock">locks</Term>; disk full | Intermittent 500s; everything slow at once; timeouts |
+| **<Term k="queue">Queue</Term> / <Term k="worker">worker</Term>** | Worker dead, queue growing; job poisoned and retrying forever | Work "accepted" but never done; backlog graph climbing |
+| **Clock-driven job** | Didn't run; ran twice; ran at the wrong hour (DST) | Silence, duplicates, or off-by-one-hour data |
+| **Third party** | Outage; <Term k="idempotent">429</Term> rate limit; quota exhausted; API change | Failures only on calls to one domain |
+| **Your own config** | Secret expired/rotated; quota cap hit; wrong environment's key | Started at an exact minute, no deploy |
+
+<Callout type="key">
+Notice which row has no error message: **app logic**. Races, lost updates and double-charges produce *wrong data*, not exceptions — nothing turns red, no alert fires, and you learn about it from a customer weeks later. That's why M7 exists, and why the demo app's planted bugs are mostly in this row.
+</Callout>
+
+### Two shapes worth memorising
+
+**Sudden + everyone + everything** → almost always an *event* on a *shared* box: a deploy, a config/secret change, a certificate expiry, a DNS change, or your provider's outage. Check the change log and status pages first; you'll be right the large majority of the time, and both checks cost seconds.
+
+**Gradual + one feature** → almost always *accumulation* behind one code path: a table that grew past its missing index, a leak, a disk filling, a quota being approached. Nobody changed anything; the world got bigger. Compare a graph over weeks, not hours.
+
+<Operator>
+
+Each triage question maps to a command. This is the three-minute sweep.
+
+```bash
+# Q1 — everyone or some? Compare paths and geographies.
+curl -s -o /dev/null -w "edge: %{http_code} %{time_total}s\n" https://yourapp.com/api/health
+#   Then from elsewhere: a phone on cellular, or an online checker from another region.
+#   Platform logs grouped by status tells you the ratio:
+#   Vercel/Render log filter: status >= 500  → is it 100% or 30%?
+
+# Q2 — everything or one feature? Per-route error rates.
+docker compose logs --since 30m app 2>&1 | grep -oE '(GET|POST|PATCH) /[^ ]*' | sort | uniq -c | sort -rn | head
+docker compose logs --since 30m app 2>&1 | grep -ciE "error|fatal"
+
+# Q3 — sudden or gradual? Find the FIRST occurrence, then widen the window.
+docker compose logs app 2>&1 | grep -iE "error" | head -3      # earliest, not latest
+git log --oneline --since="24 hours ago"                        # was there an event?
+#   Gradual check — has the data grown?
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT relname, n_live_tup AS rows, pg_size_pretty(pg_total_relation_size(relid)) AS size
+    FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 5;"
+
+# Fast third-party elimination (cheapest check in the whole sweep)
+for host in api.stripe.com api.anthropic.com; do
+  curl -s -o /dev/null -w "$host %{http_code} %{time_total}s\n" "https://$host" --max-time 5
+done
+```
+
+The order matters: Q1 and Q2 are nearly free and eliminate whole regions of the map. Reading code is the *last* thing in this list, not the first.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+The tools that answer each triage question, with a bias toward what you already have.
+
+| Question | Best tool | Zero-cost version |
+|---|---|---|
+| Everyone or some? | Error tracker's "users affected" count (Sentry) | Ask two people on different networks |
+| Everything or one feature? | Per-route metrics / APM | Group log lines by path (`uniq -c`) |
+| Sudden or gradual? | Metric graph over 30 days; Sentry "first seen" | `git log` + first log occurrence |
+| Which box? | A map with providers (L0.3) | Your own `.env` and bills |
+| Is it them, not me? | Status pages, bookmarked | `curl` their API directly |
+
+What good looks like: within three minutes of a page, you can state the answers to all three questions and name two candidate boxes. That's not expertise — it's a sweep you can run from a checklist, and it beats twenty-five minutes of speculative fixes every time.
+
+The highest-leverage setup investment: **bookmark the status pages of every third-party box on your map, in one folder.** The cheapest checks should be the easiest to reach.
+
+</Section>
+
+<Section kind="hands-on">
+
+Run the triage sweep against deliberately broken versions of the demo app. For each, time yourself from symptom to named box — and do *not* read the break script first.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+**Drill 1 — a dependency dies.**
+```bash
+docker compose stop db
+```
+Load the site. Answer Q1/Q2/Q3, name the box, then confirm with `curl -s localhost:3001/api/health`. Restart: `docker compose start db`.
+
+**Drill 2 — the app process is gone.**
+```bash
+docker compose stop app
+```
+Load the site. What *shape* of error is it this time, and which box reported it? Note the difference from drill 1: in one case something answered you with a diagnosis, in the other nothing answered at all. Restart: `docker compose start app`.
+
+**Drill 3 — gradual accumulation.**
+```bash
+docker compose exec -T db psql -U ots -d demo -f /dev/stdin < scripts/break/missing-index-growth.sql
+curl -s -o /dev/null -w "%{time_total}s\n" localhost:3001/api/bookings
+docker compose exec -T db psql -U ots -d demo -c "EXPLAIN ANALYZE SELECT * FROM bookings WHERE date = CURRENT_DATE;"
+```
+Which triage answers did you get? Note that Q3 says *gradual* — and that no deploy, no config change and no status page would ever have explained it.
+
+**Drill 4 — wrong data, no errors.**
+```bash
+node scripts/load/concurrent-editors.js 1
+```
+Now run the sweep. Q1: some users. Q2: one feature. Q3: ambiguous. Crucially: check the logs and the error tracker — **nothing is red.** This is the app-logic row, and it's why "no errors in the logs" never means "nothing is broken".
+
+Write a four-line table: drill → triage answers → box → how you confirmed. That table is the beginning of your own failure catalogue, and the [reference catalogue](/reference/failures) is the long version.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** Monday 09:12. Support says *"several customers can't load the bookings page — it spins then errors. Others are fine."* No deploy since Thursday.
+
+<Evidence title="triage sweep">
+
+```text
+Q1 everyone or some?   → SOME. ~1 in 3 requests to /api/bookings fail; /api/rooms is 100% fine
+Q2 everything or one?  → ONE endpoint: /api/bookings (list + create)
+Q3 sudden or gradual?  → SUDDEN. First error 09:04:11. Clean before that.
+```
+
+</Evidence>
+
+<Evidence title="app logs 09:04">
+
+```text
+09:04:02 INFO  GET /api/bookings 200 180ms
+09:04:11 ERROR GET /api/bookings 500 5004ms
+  Error: timeout exceeded when trying to connect
+      at Pool._pulseQueue (node_modules/pg-pool/index.js:98)
+09:04:14 INFO  GET /api/rooms 200 6ms   (cache: hit)
+09:04:19 ERROR GET /api/bookings 500 5002ms
+  Error: timeout exceeded when trying to connect
+09:04:23 INFO  GET /api/bookings 200 201ms
+```
+
+</Evidence>
+
+<Evidence title="dashboards and change log">
+
+```text
+Postgres: connections 10/10 used (app pool), 97/100 total on the server
+          longest running query: 14 min 22 s  (state: idle in transaction)
+Redis:    fine — which is why /api/rooms is unaffected
+Deploys:  none since Thursday 16:40
+Crons:    "monthly-invoice-backfill" — started 08:50 Monday, still running
+Status:   all third parties green
+```
+
+</Evidence>
+
+Which box, and what's the mechanism? Be specific about *why* `/api/rooms` is unaffected — that detail is doing real work.
+
+<Reveal label="Reveal the cause">
+
+**Box: the database — specifically its connection pool. Mechanism: starvation by a long-running job.**
+
+Read the triage answers together. *Sudden* (09:04) says an event, not accumulation. *One feature* says it isn't shared infrastructure. *Some requests* — intermittent on one endpoint — is the signature of a **contended resource**: enough capacity for some callers, not all.
+
+The stack trace names the box twice (`pg-pool`, "timeout exceeded when trying to connect"): the app never got a connection to *ask* its question. Connections sit at 10/10, flat at the ceiling, and a transaction has been open for 14 minutes `idle in transaction` — holding its connection while doing nothing.
+
+The change log supplies the event: `monthly-invoice-backfill` started at 08:50. It has been accumulating connections since, and at 09:04 it took the last one.
+
+**Why `/api/rooms` is immune, and why that's the key clue:** that endpoint is served from Redis (`cache: hit`) and never asks for a Postgres connection at all. It isn't healthy because the system is healthy — it's healthy because it doesn't touch the starved resource. An endpoint being fine tells you only that it doesn't depend on the broken thing, and reasoning about *which* dependencies each endpoint has is how you convert "some things work" into a precise box.
+
+**Confirm it:**
+```sql
+SELECT pid, state, now() - xact_start AS open_for, left(query, 60)
+  FROM pg_stat_activity
+ WHERE state <> 'idle' ORDER BY xact_start LIMIT 10;
+SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+```
+
+**Fix, in order:** mitigate by stopping or throttling the backfill (and `pg_terminate_backend` the stuck transaction) to restore service; then fix the cause — the job gets a small dedicated connection budget, processes in chunks, and never holds a transaction open across slow work (M7.9); then alert on pool waiters > 0 so the next one pages you at 08:52 instead of reaching your customers.
+
+**What the agent would have said:** given only one error line, "add retry logic to the bookings endpoint." Retries would add demand to an exhausted pool — the mechanism, fed. That's the same trap as [M8.6's break-fix](/lessons/m08-l06), and the triage sweep is what immunises you against it.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Here is my architecture map: [paste]. For each box, list the two or three most likely ways it fails in production, the symptom I would observe from the outside, and the single cheapest check that confirms or eliminates it. Format as a table I can keep. Mark which failures produce NO error logs."}>
+The last instruction is the valuable one. Verify the no-error-log rows especially — races, lost updates, stale caches, jobs that didn't run — because those are the ones your monitoring will never tell you about. Cross-check the result against the [failure catalogue](/reference/failures) and keep whichever version you'll actually open.
+</AgentTask>
+
+<AgentTask prompt={"Symptom: [describe it]. Before proposing any fix, answer: (1) is it affecting everyone or some users, (2) everything or one feature, (3) sudden or gradual — and say which evidence you'd need if I haven't given you enough to answer. Then name at most two candidate boxes and the cheapest check for each."}>
+If it answers all three questions without evidence, it's guessing — make it tell you what it's missing. Then run the checks yourself. Note how differently it behaves when you *do* supply a timeline: "sudden at 09:04, cron started 08:50" produces a different and much better answer than a lone error line.
+</AgentTask>
+
+<AgentTask prompt={"Add a startup check to this app that fails loudly with the variable NAME if any required environment variable or dependency is missing, instead of starting and failing later at request time. Then show me what the log output looks like when DATABASE_URL is absent."}>
+Test it by actually unsetting the variable and starting the app. You want the process to refuse to start with one clear line naming the variable — turning a scattered, mid-traffic failure into an unmissable boot failure. Confirm it doesn't print the *values* of anything.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The sweep, as a card to keep:
+
+1. **Who?** Everyone → shared box. Some → per-user factor (region, their data, auth, cache).
+2. **How wide?** Everything → infrastructure (DNS, TLS, proxy, process). One feature → that path's query/provider/job.
+3. **When and how?** Sudden → an event (deploy, config, expiry, outage). Gradual → accumulation (growth, leak, disk, quota).
+4. **Cheapest checks first:** third-party status pages, then your change log, then the first error in the window.
+5. **Then** name two candidate boxes and the one check that separates them.
+
+Questions worth asking before anything breaks: Which of my boxes can fail without producing an error log? Which failure would I not notice for a week? Which arrow has no timeout? What grew last month?
+
+What good looks like: three minutes from page to two named candidates, with code reading as a late step, not a first one.
+
+Red flags: proposing a fix before answering the three questions; "no errors in the logs, so nothing's wrong" (the app-logic row has no errors by definition); and reading the latest error instead of the first one.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m00-l04"
+  questions={[
+    {
+      q: "Which triage question most often gets skipped, and why does skipping it cost the most?",
+      options: [
+        "Everyone or some — because support tickets rarely say",
+        "Sudden or gradual — because sudden and gradual have completely different cause lists, so skipping it means searching both",
+        "Everything or one feature — because per-route metrics are rarely set up",
+        "Which box — because it needs an up-to-date map"
+      ],
+      answer: 1,
+      explain: "Sudden means something changed (deploy, config, expiry, outage); gradual means something accumulated (growth, leak, disk, quota). The lists don't overlap, and no amount of reading the last diff explains a gradual failure."
+    },
+    {
+      q: "A page is slow for everyone, everything is affected, and it started at an exact minute with no deploy. What are the two cheapest checks?",
+      options: [
+        "Add indexes to the slowest tables, then profile the app",
+        "Third-party status pages and your config/secret change log — a sudden, total failure with no deploy points at a shared box or an expiry",
+        "Restart the app and watch whether it recurs",
+        "Read the most recent error in the logs and paste it to your agent"
+      ],
+      answer: 1,
+      explain: "Sudden + everyone + everything means an event on something shared. Status pages and the change log (including secret/cert expiries) take seconds and cover most of that space, long before you touch code."
+    },
+    {
+      q: "In the break-fix, why was /api/rooms working while /api/bookings failed one in three times?",
+      options: [
+        "The rooms endpoint is simpler and therefore faster",
+        "It was served from Redis and never requested a Postgres connection, so it didn't touch the starved resource",
+        "Reads are unaffected by connection limits; only writes are",
+        "The load balancer routed rooms traffic to a healthy instance"
+      ],
+      answer: 1,
+      explain: "A working endpoint tells you only that it doesn't depend on the broken thing. Mapping each endpoint's dependencies is what turns 'some things work' into a precise box — here, the pool, not the database engine."
+    },
+    {
+      q: "Which category of failure characteristically produces NO error logs at all?",
+      options: [
+        "Database connection exhaustion",
+        "Application-logic bugs — races, lost updates, double-charges — which produce wrong data rather than exceptions",
+        "Expired TLS certificates",
+        "Out-of-memory kills"
+      ],
+      answer: 1,
+      explain: "Nothing throws when two writers overwrite each other; the API returns 200 and the data is quietly wrong. That's why 'no errors in the logs' never means 'nothing is broken', and why M7 exists."
+    },
+    {
+      q: "You ran the concurrent-editors drill: 20 notes accepted, 6 survived. Why is this failure class so dangerous in practice?",
+      options: [
+        "It corrupts the database schema",
+        "Every layer reports success, so no alert fires and you learn about it from a customer weeks later",
+        "It only happens under extreme load, so it's hard to reproduce",
+        "It cannot be fixed without migrating to a different database"
+      ],
+      answer: 1,
+      explain: "The API said 200 twenty times. Logs, dashboards and uptime checks are all green while data is being destroyed — the detection has to come from invariants on the data, not from error monitoring."
+    }
+  ]}
+/>
+
+</Section>

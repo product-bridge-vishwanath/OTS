@@ -211,6 +211,61 @@ terms:
     name: Prompt injection
     def: Malicious instructions hidden in content a model reads (a document, a web page) that try to override what you asked it to do — the SQL injection of the LLM era.
 
+  # --- machine, part two (M1) ---
+  vps:
+    name: VPS
+    def: A virtual private server — a rented Linux machine you control entirely, and are entirely responsible for. Hetzner, DigitalOcean and Lightsail sell them by the month.
+  pid:
+    name: PID
+    def: The number the operating system gives a running process. You need it to inspect or kill that specific process, and it changes every restart.
+  exit-code:
+    name: Exit code
+    def: The number a process returns when it ends — 0 means success, anything else is failure. 137 means it was killed (usually out of memory), 1 is a generic crash.
+  graceful-shutdown:
+    name: Graceful shutdown
+    def: Finishing in-flight requests and closing connections when asked to stop (SIGTERM) instead of dying instantly. Without it, every deploy drops whatever users were mid-request.
+  systemd:
+    name: systemd
+    def: The service manager on most Linux servers. It starts your app at boot, restarts it when it crashes, and collects its output into the journal (`journalctl`).
+  health-check:
+    name: Health check
+    def: A URL the platform calls on a schedule to decide whether your instance should receive traffic. Returning 200 while actually broken is how outages hide.
+  region:
+    name: Region
+    def: The physical datacenter location a service runs in. Putting your app and database in different regions adds an ocean round trip to every query.
+  shell:
+    name: Shell
+    def: The program that reads your typed commands and runs them (bash, zsh). Its environment variables and working directory are why a command works for you and fails in cron.
+
+  # --- observability, part two (M8) ---
+  log-level:
+    name: Log level
+    def: The severity label on a log line (debug, info, warn, error). Levels let you keep detail available without drowning in it — and let you turn detail up during an incident.
+  span:
+    name: Span
+    def: One timed step inside a trace — a database query, an API call. Spans nest, so a trace shows where a slow request actually spent its time.
+  sampling:
+    name: Sampling
+    def: Recording only a fraction of traces (say 1 in 100) to control cost and volume. Keep 100% of errors and slow requests, sample the boring ones.
+  cardinality:
+    name: Cardinality
+    def: How many distinct values a metric label can take. Putting user IDs or request IDs in a label explodes cardinality and is the main way teams accidentally run up huge metrics bills.
+  dead-mans-switch:
+    name: Dead man's switch
+    def: Monitoring built backwards — the job pings a service on success, and the service alerts when pings stop. The only reliable way to notice something that failed to run at all.
+  slo:
+    name: SLO
+    def: A target you commit to, like "99.9% of requests succeed" — the number that decides whether something is worth waking a human for.
+  error-budget:
+    name: Error budget
+    def: The failure an SLO permits (99.9% allows ~43 minutes a month). Spending it slowly is normal; burning it fast is what should page someone.
+  alert-fatigue:
+    name: Alert fatigue
+    def: What happens when alerts fire too often or for things nobody acts on — people start ignoring all of them, including the real one.
+  apm:
+    name: APM
+    def: Application performance monitoring — tooling (Datadog, New Relic, Sentry Performance) that traces requests and surfaces slow queries and endpoints automatically.
+
   # --- operating ---
   runbook:
     name: Runbook

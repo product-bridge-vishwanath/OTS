@@ -1,0 +1,42 @@
+id: sc-own-map-01
+module: M0
+lesson: m00-l03
+title: "The job nobody noticed had stopped"
+difficulty: realistic
+symptom: "Customers report their weekly digest emails stopped arriving nine days ago. The app has no errors and every dashboard is green."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: infra
+      apply: scripts/break/remove-cron-service.sh   # the scheduled worker is gone; nothing logs it
+evidence:
+  logs: true
+  metrics: [http.5xx, worker.last_run_at]
+  db_console: true
+  notes: "Billing history and the platform service list (including suspended services) are available to the learner."
+agent:
+  context: "You have access to the application code but not to the platform's service list."
+  bias: "looks for bugs in the digest-sending code rather than asking whether it ran"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - digest-job-runs-on-schedule
+    - dead-mans-switch-present        # absence must now be detectable
+  root_cause_markers:
+    - learner identifies that the scheduled box is absent, not broken
+    - monitoring added that alerts on missing runs rather than on errors
+  symptom_only_markers:
+    - digest code edited with no scheduler restored
+    - manual one-off run performed and declared fixed
+hints:
+  - "The app logs contain nothing about digests at all. What does total silence imply?"
+  - "Which boxes on your map run without a user request? Is each one still deployed?"
+  - "Compare last month's bill with this month's, line by line."
+  - "Reveal: the cron service is gone. Restore it, then add a dead man's switch so silence pages someone."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

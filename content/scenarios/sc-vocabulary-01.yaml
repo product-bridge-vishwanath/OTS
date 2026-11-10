@@ -1,0 +1,41 @@
+id: sc-vocabulary-01
+module: M0
+lesson: m00-l02
+title: "The 'async' change that stopped the work happening"
+difficulty: realistic
+symptom: "The admin page got fast after a change described as 'moved report generation to a background job'. No reports have been produced since."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/fire-and-forget-report.patch  # drops the await, adds no queue or worker
+evidence:
+  logs: true
+  metrics: [http.2xx, report.rows_written]
+  db_console: true
+agent:
+  context: "You previously made this change and described it as moving the work to a background job."
+  bias: "defends the change as correct and suggests increasing the function timeout"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - reports-written-under-load      # reports must actually appear
+    - admin-page-latency              # and the page must stay responsive
+  root_cause_markers:
+    - work moved to a process that outlives the request (queue + worker, or scheduled job)
+    - learner names the missing box rather than only the missing await
+  symptom_only_markers:
+    - await restored with no latency fix (page slow again, reports work)
+    - function timeout raised with fire-and-forget left in place
+hints:
+  - "Draw the change as boxes and arrows. Which new box appeared?"
+  - "What happens to unawaited work when a serverless function returns its response?"
+  - "Asynchrony needs something that outlives the request. What are the options?"
+  - "Reveal: no queue and no worker were added. Add a durable job path, or make it a scheduled job as worker/cron.js does."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

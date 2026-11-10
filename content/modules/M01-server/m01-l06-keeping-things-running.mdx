@@ -1,0 +1,449 @@
+---
+id: m01-l06
+module: M1
+title: "Keeping things running: supervisors, restarts and crash loops"
+order: 6
+difficulty: 2
+depth: both
+platforms: [docker, render, railway, fly]
+concepts: [process-supervision, processes, env-vars]
+prerequisites: [m01-l04]
+lab: demo-repo
+scenario_ids: [sc-crash-loop-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A developer deployed his first app to a VPS. He SSHed in, ran `npm start`, saw it working, and closed his laptop. The app died the moment his SSH session ended.
+
+His agent explained `nohup node server.js &`, which worked — until the server rebooted for kernel updates eleven days later and the app never came back. He found out from a customer.
+
+He then moved to `pm2`, which handled both problems. Six weeks later the app started "flapping": up for a few seconds, down, up again. `pm2 list` showed `restarts: 4,281`. He killed it, restarted it, and it flapped again. The logs, when he finally read them from the *start* of a boot attempt rather than the end, said the same thing every time: `Error: connect ECONNREFUSED 127.0.0.1:5432`.
+
+His database provider had migrated him to a new host and emailed him the new connection string. The app was crashing at startup on a stale `DATABASE_URL`, and pm2 was faithfully restarting it into the same wall four thousand times.
+
+Three lessons, in order: something must keep your process alive; something must start it at boot; and **a restart policy is not a fix — it's a way to hide a crash.**
+
+</Section>
+
+<Section kind="already-did">
+
+If you deploy to a PaaS you've been getting supervision for free: your app restarts when it crashes and comes back after platform maintenance, because the platform runs a supervisor you never configured. You may have noticed an instance "restarting" in a dashboard, or seen a deploy marked failed after several attempts — that was a supervisor giving up.
+
+You've also probably seen `restarts: 2,847` in a `pm2 list` and read it as a sign of resilience. It isn't. It's a count of how many times your app died.
+
+</Section>
+
+<Section kind="mental-model">
+
+Three distinct jobs, often confused, and you need all three:
+
+1. **Keep it alive** — restart the process when it exits unexpectedly.
+2. **Start it at boot** — survive a reboot without a human.
+3. **Tell you it's unhealthy** — so a loop doesn't masquerade as uptime.
+
+A supervisor does the first two. **Only you can do the third**, and it's the one that matters.
+
+### The restart loop, and why it hides things
+
+<svg viewBox="0 0 780 240" role="img" aria-label="A crash loop: the process starts, crashes at boot, the supervisor restarts it, and the cycle repeats forever while status output looks active" className="diagram">
+  <defs>
+    <marker id="arrc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="40" y="24" width="170" height="56" rx="10" />
+  <text x="125" y="48" textAnchor="middle">start</text>
+  <text x="125" y="66" textAnchor="middle" className="sub">reads config, connects</text>
+
+  <rect x="305" y="24" width="170" height="56" rx="10" />
+  <text x="390" y="48" textAnchor="middle">crash</text>
+  <text x="390" y="66" textAnchor="middle" className="sub">bad env · DB unreachable</text>
+
+  <rect x="570" y="24" width="170" height="56" rx="10" />
+  <text x="655" y="48" textAnchor="middle">supervisor restarts</text>
+  <text x="655" y="66" textAnchor="middle" className="sub">…into the same wall</text>
+
+  <path d="M 210 52 L 301 52" className="arrow" markerEnd="url(#arrc)" />
+  <path d="M 475 52 L 566 52" className="arrow" markerEnd="url(#arrc)" />
+  <path d="M 655 80 L 655 108 L 125 108 L 125 84" className="arrow" markerEnd="url(#arrc)" />
+  <text x="300" y="126" className="sub">4,281 times</text>
+
+  <rect x="40" y="150" width="700" height="72" rx="10" />
+  <text x="390" y="176" textAnchor="middle">What you see from outside</text>
+  <text x="390" y="196" textAnchor="middle" className="sub">systemctl: &quot;active (running)&quot; · pm2: &quot;online&quot; · dashboard: a green dot</text>
+  <text x="390" y="214" textAnchor="middle" className="sub">The truth is in the restart counter and the FIRST lines of each boot attempt</text>
+</svg>
+
+A <Term k="crash-loop">crash loop</Term> is a process that dies during startup, gets restarted, and dies the same way — forever. Its signature is deceptive: at any instant something *is* running, so status checks look fine. The two reliable tells are the **restart counter** and the **uptime measured in seconds**.
+
+<Callout type="key">
+**Read the first lines of a boot attempt, not the last lines of the log.** A crash loop's log tail shows the dying gasp of attempt #4,281; the actual error is in the first few lines after each start. `journalctl -u app -n 200` and scroll to a boundary, or `docker logs app | head -30`. This is M8.6's "read the first error" as a concrete habit.
+</Callout>
+
+### What a process exiting actually means
+
+| <Term k="exit-code">Exit code</Term> | Meaning | Where to look |
+|---|---|---|
+| `0` | Clean exit — it *meant* to stop | Is this a worker that finished and shouldn't have? |
+| `1` | Unhandled error | Your code; read the stack trace at boot |
+| `137` | SIGKILL — almost always <Term k="oom">OOM</Term> | Memory limit; `dmesg | grep -i kill` |
+| `139` | Segfault | Native module or runtime bug |
+| `143` | SIGTERM — asked to stop | Normal during a deploy |
+
+Exit `137` is worth memorising: it means something killed it, and in containers that's nearly always the memory limit. No stack trace will exist, because your code never got to run an error handler.
+
+### Restart policies: the knobs that matter
+
+A naive "always restart immediately" turns a crash into a CPU-burning, log-flooding loop. Three settings fix that:
+
+- **Backoff** — wait progressively longer between attempts (1s, 2s, 4s…). systemd: `RestartSec`; Docker: `on-failure` with a max count.
+- **A give-up threshold** — after N failures in M seconds, stop and stay stopped, loudly. systemd: `StartLimitBurst`/`StartLimitIntervalSec`. A process that *stays* down is more honest than one that flaps, because it can't be mistaken for healthy.
+- **A startup grace period** — don't let a health check kill a process that's merely slow to boot (migrations, warm-up). Otherwise your health check *causes* the loop it then reports.
+
+### The three jobs on each platform
+
+| | Keep alive | Start at boot | Tell you |
+|---|---|---|---|
+| `nohup … &` | ❌ | ❌ | ❌ |
+| `screen`/`tmux` | ❌ | ❌ | ❌ |
+| **systemd** | ✅ `Restart=always` | ✅ `systemctl enable` | ⚠️ you add monitoring |
+| **pm2** | ✅ | ✅ only after `pm2 startup` + `pm2 save` | ⚠️ `pm2 list` shows restarts |
+| **Docker** | ✅ `restart: unless-stopped` | ✅ with the daemon | ⚠️ you add monitoring |
+| **PaaS** | ✅ | ✅ | ⚠️ dashboard + alerts you configure |
+
+Every row has a ⚠️ in the last column. Supervision is solved; *noticing* is still yours.
+
+<Operator>
+
+```bash
+# ── Is this thing in a crash loop? Three checks ───────────────────────
+systemctl status riverside --no-pager | grep -E "Active:|Main PID:"
+#   "active (running) since … 6s ago" with a changing PID = flapping
+systemctl show riverside -p NRestarts
+docker compose ps                      # STATUS column: "Restarting (1) 4s ago"
+docker inspect --format '{{.RestartCount}} restarts, last exit {{.State.ExitCode}}' demo-app-app-1
+pm2 list                               # the restarts column
+
+# ── Read the START of a boot attempt (where the real error is) ─────────
+journalctl -u riverside -n 200 --no-pager | grep -n "Started\|Stopping\|Main process exited" | tail -5
+#   then read the ~20 lines AFTER the last "Started":
+journalctl -u riverside --no-pager | tail -200 | sed -n '/Started/,/Main process exited/p' | head -30
+docker compose logs app | head -30
+docker compose logs --tail 500 app | grep -n -A8 "Starting\|listening on" | head -40
+
+# ── Why did it die? ──────────────────────────────────────────────────
+systemctl status riverside --no-pager | grep -E "Process:|code=|status="
+docker inspect --format '{{.State.OOMKilled}} oomkilled, exit {{.State.ExitCode}}' demo-app-app-1
+dmesg 2>/dev/null | grep -i "killed process" | tail -3      # OOM evidence
+
+# ── A systemd unit with the knobs that matter ─────────────────────────
+sudo tee /etc/systemd/system/riverside.service >/dev/null <<'EOF'
+[Unit]
+Description=Riverside Studios
+After=network-online.target
+
+[Service]
+Type=simple
+User=riverside
+WorkingDirectory=/srv/app
+EnvironmentFile=/srv/app/.env          # mode 600, owned by riverside
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3                           # backoff, not a tight loop
+StartLimitBurst=5                      # give up after 5 failures…
+StartLimitIntervalSec=120              # …within 2 minutes, and STAY down
+KillSignal=SIGTERM
+TimeoutStopSec=20                      # time to finish in-flight requests
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now riverside      # enable = survives reboot. Both matter.
+systemctl is-enabled riverside             # verify the boot half explicitly
+
+# ── pm2, done properly (the two commands people skip) ────────────────
+pm2 start server.js --name riverside --max-memory-restart 500M
+pm2 startup        # prints a command to run with sudo — RUN IT
+pm2 save           # persists the current process list
+pm2 logs riverside --lines 50
+
+# ── Prove the reboot story before you need it ────────────────────────
+sudo systemctl stop riverside && sudo systemctl start riverside
+sudo reboot                                # then verify it came back by itself
+```
+
+`systemctl is-enabled` is the one-second check that would have prevented the eleven-day story: "running now" and "will come back after a reboot" are different facts, and only one of them shows up in `status`.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | Use when | Watch out for |
+|---|---|---|
+| **systemd** | Any Linux VPS — the default, already installed | Unit file syntax; `enable` ≠ `start` |
+| **pm2** | Node apps, clustering, quick setup | `pm2 startup` + `pm2 save` are mandatory and easily forgotten |
+| **Docker restart policies** | Containerised anything | `unless-stopped` vs `always` differ after a manual stop |
+| **Platform supervision** | PaaS — you get it free | Health check timing; startup grace periods |
+| **Healthchecks.io / Cronitor** | Noticing that something *didn't* run | The <Term k="dead-mans-switch">dead man's switch</Term> — the only thing that catches silence |
+| **Sentry / error tracker** | Catching the crash *reason*, not just the restart | Needs to initialise before the crashing code |
+
+What good looks like: your service survives both `kill -9` and a full reboot without a human, backs off instead of tight-looping, gives up loudly after repeated failures, **and** pages you when restart count climbs. The last clause is the one most setups are missing.
+
+The monitoring rule worth internalising: **alert on restart count and on uptime resets, not just on "is it up".** An uptime check polling every 60 seconds will cheerfully report 100% availability for an app that restarts every 20 seconds, because something is always listening by the time it looks.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Confirm supervision exists and see its policy:**
+   ```bash
+   docker inspect --format 'policy={{.HostConfig.RestartPolicy.Name}} restarts={{.RestartCount}}' demo-app-app-1
+   ```
+2. **Kill the process violently and watch it come back:**
+   ```bash
+   docker compose kill app
+   sleep 3; docker compose ps app
+   docker inspect --format 'restarts={{.RestartCount}}' demo-app-app-1
+   docker compose start app
+   ```
+   (Compose's default policy is `no` unless set — notice whether it actually restarted. If it didn't, that's the lesson: *nothing* is keeping it alive here, which is a deliberate difference from production.)
+3. **Create a real crash loop** and practise diagnosing it. Point the app at a nonexistent database and give it a restart policy:
+   ```bash
+   docker run -d --name looper --restart on-failure:10 \
+     -e DATABASE_URL=postgres://ots:ots@nope:5432/demo \
+     -e REDIS_URL=redis://nope:6379 \
+     demo-app-app
+   sleep 12
+   docker ps -a --filter name=looper --format "{{.Status}}"
+   docker inspect --format 'restarts={{.RestartCount}} exit={{.State.ExitCode}}' looper
+   ```
+4. **Now find the cause the right way** — the first lines of a boot attempt, not the tail:
+   ```bash
+   docker logs looper 2>&1 | head -20          # the real error
+   docker logs looper 2>&1 | tail -5           # compare: far less informative
+   docker rm -f looper
+   ```
+5. **Feel the OOM failure mode.** Exit code 137 with no stack trace:
+   ```bash
+   docker run -d --name hungry --memory 16m --restart on-failure:3 \
+     demo-app-app node -e 'const a=[];for(;;)a.push(Buffer.alloc(1e6))'
+   sleep 8
+   docker inspect --format 'oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' hungry
+   docker logs hungry 2>&1 | tail -3        # note: no useful error from your code
+   docker rm -f hungry
+   ```
+   Memorise that pairing: `exit=137`, `oom=true`, and silence from your application.
+
+6. **Add graceful shutdown to the worker** (`demo-app/worker/cron.js` currently has none) so SIGTERM closes the pool and exits 0. Test with `docker compose stop worker` and confirm a clean shutdown line appears in the logs.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A deploy at 14:02 "succeeded". The platform dashboard shows the service green. Customers report the site is up but "randomly logs me out and sometimes errors". Uptime monitoring (60-second interval) reports 100% availability for the period.
+
+<Evidence title="platform / container state">
+
+```text
+$ docker compose ps
+NAME      SERVICE   STATUS                          PORTS
+app       app       Up 7 seconds                    0.0.0.0:3001->3000/tcp
+db        db        Up 3 hours (healthy)            0.0.0.0:5432->5432/tcp
+cache     cache     Up 3 hours                      0.0.0.0:6379->6379/tcp
+
+$ docker inspect --format 'restarts={{.RestartCount}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' app
+restarts=312 exit=1 oom=false
+
+$ date -u; docker inspect --format 'started={{.State.StartedAt}}' app
+Fri Nov  7 14:49:03 UTC 2026
+started=2026-11-07T14:48:56Z
+```
+
+</Evidence>
+
+<Evidence title="logs — the tail everyone pasted">
+
+```text
+$ docker compose logs --tail 6 app
+app  | booking.created id=5512 room=2 2026-11-09 14-16
+app  | GET /api/rooms 200 4ms (cache: hit)
+app  | GET /api/bookings 200 212ms
+app  | redis.error Connection is closed.
+app  | GET /api/rooms 200 38ms (cache: miss)
+app  | GET /api/bookings 200 198ms
+```
+
+</Evidence>
+
+<Evidence title="logs — the first lines after a start">
+
+```text
+$ docker compose logs app 2>&1 | grep -n "listening on port" | tail -3
+18411:app  | listening on port 3000
+18498:app  | listening on port 3000
+18585:app  | listening on port 3000
+
+$ docker compose logs app 2>&1 | sed -n '18585,18612p'
+app  | listening on port 3000
+app  | [sessions] in-memory store initialised
+app  | GET /api/bookings 200 204ms
+app  | POST /api/bookings 201 318ms
+app  | <--- Last few GCs --->
+app  | [1:0x5a2f] 41203 ms: Mark-sweep 498.2 (512.0) -> 497.1 (512.0) MB
+app  | FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+app  | 1: 0xb8a0e0 node::Abort() [node]
+app  |
+app  | (exited with code 1, restarting)
+
+$ git log --oneline -2
+e41a0c7 feat: cache booking lookups in memory for speed   ← deployed 14:02
+a19f3d1 chore: bump deps
+$ git show e41a0c7 | grep -E "^[+].*(Map|cache|sessions)" | head -4
++const bookingCache = new Map()            // keyed by query string, never evicted
++const sessions = new Map()
+```
+
+</Evidence>
+
+Why does every dashboard say this service is healthy, and what's actually wrong?
+
+<Reveal label="Reveal the cause">
+
+**An unbounded in-memory cache is leaking until the Node heap is exhausted; the process dies, the supervisor restarts it, and this has happened 312 times.** The dashboards are green because at any given instant a process *is* listening — restarts take under a second, and a 60-second uptime check will essentially never land in the gap.
+
+**Read the evidence in the right order:**
+
+- `restarts=312` is the headline, and it's the number no status page shows you. "Up 7 seconds" next to a 3-hour-old database is the second tell: this container is far younger than its siblings.
+- The log *tail* is useless — it shows normal traffic, because the tail is always mid-life of the newest attempt. Grepping for the startup line and reading forward from the **last** one exposes `Reached heap limit … JavaScript heap out of memory` and `exit code 1`.
+- Commit `e41a0c7`, deployed at 14:02, added `const bookingCache = new Map()` at module scope with **no eviction**. Every distinct query string adds an entry that is never removed. Memory climbs for ~40 seconds of traffic, V8 hits its heap limit, the process aborts.
+- `oom=false` with `exit=1` is the precise fingerprint of **V8's own heap limit**, not the kernel's OOM killer (which would give `exit=137`, `oom=true`, and no JavaScript error at all). Two different memory failures, two different signatures — and here the application-level one left a readable message.
+
+**Why customers see random logouts:** the same commit put `sessions` in a module-level `Map` (the M1.1 shape problem). Every crash wipes every session. Users are logged out roughly every 40 seconds of traffic — which also means the restart loop is *visible to customers* while being invisible to monitoring.
+
+**Fix, in order:**
+1. **Roll back `e41a0c7`.** Service restored in a minute; diagnosis continues on a stable system (M14.2).
+2. Re-introduce caching with bounds if it's still wanted: an LRU with a maximum size and TTL, or Redis — which the app already has, and which survives restarts. Unbounded module-level `Map`s are a memory leak with extra steps.
+3. Move sessions out of process memory entirely (Redis or signed cookies).
+4. **Fix the monitoring gap, which is the real lesson:** alert on restart count and on uptime resets, not just on "does it answer". Add `--max-memory-restart`/container memory limits so a leak becomes a bounded, visible restart rather than a surprise, and alert at 80% heap.
+5. Give the supervisor a give-up threshold (`StartLimitBurst`) so 312 silent restarts become one loud, stopped service.
+
+**The transferable lesson:** a restart policy converted a hard crash into a soft, invisible, customer-visible degradation. Supervision keeps you up; it does not keep you *correct*, and it actively conceals the failure it's papering over. That's why "tell you it's unhealthy" is the third job — and the only one a supervisor can't do for you.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Write a systemd unit for my app at [path] running as user [user]. It must restart on failure with backoff, give up after 5 failures in 2 minutes and stay stopped, read env from an EnvironmentFile, send SIGTERM with a 20-second shutdown timeout, log to the journal, and start at boot. Then give me the commands to install it, enable it, and verify BOTH that it's running and that it will survive a reboot."}>
+Verify the two facts separately: `systemctl is-active` and `systemctl is-enabled`. Then actually reboot a test box — the eleven-day story in the lesson happened because "running" was confirmed and "enabled" never was. Check the unit doesn't set `Restart=always` without `StartLimitBurst`, which is the crash-loop-hiding combination.
+</AgentTask>
+
+<AgentTask prompt={"My service shows a high restart count. Find the cause: locate the first lines after each startup in the logs (not the tail), identify the exit code and whether it was OOM-killed by the kernel or hit the runtime's own heap limit, and tell me which commit or config change correlates with the restarts beginning. Do not propose increasing the restart limit."}>
+The last sentence blocks the tempting non-fix. Check it actually read the *start* of boot attempts — ask which log line numbers it used. Exit 137 + `OOMKilled=true` means the container memory limit; exit 1 + a V8 heap message means an application leak. They have different fixes and an agent will conflate them.
+</AgentTask>
+
+<AgentTask prompt={"Audit this app for unbounded in-memory growth: module-level Maps, arrays, Sets or objects that are added to but never evicted; event listeners or timers registered per request; and caches without a size limit or TTL. For each, give file:line and estimate what grows it. Then show me how to add an LRU with a max size to the worst one."}>
+This is the break-fix as a preventive scan. Verify a hit or two yourself — `grep -n "new Map()" -r lib/ app/`. Anything at module scope that only ever grows is a leak; anything at module scope at all is also the multi-instance problem from M1.1, so check both properties while you're there.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The three jobs — verify each one separately:
+
+1. **Keep alive:** does it come back after `kill -9`?
+2. **Start at boot:** does it come back after a reboot? (`systemctl is-enabled`, `pm2 save`, restart policy)
+3. **Tell you:** does anything alert on restart count, uptime resets, or memory approaching the limit?
+
+Before you trust a restart policy:
+
+- Is there backoff, or does it tight-loop?
+- Is there a give-up threshold so a broken service *stays* down, loudly?
+- Is there a startup grace period, so a health check can't cause the loop it reports?
+- Is there a memory limit, so a leak surfaces as a bounded restart rather than a surprise?
+- Does the app handle SIGTERM gracefully, so routine restarts don't drop in-flight work?
+
+What good looks like: restart count is a monitored metric with an alert; a crash loop pages someone within minutes; `systemctl is-enabled` and `is-active` are both verified after setup.
+
+Red flags: `nohup`/`tmux` as a production strategy; a four-figure restart count treated as resilience; uptime monitoring as the only health signal; `Restart=always` with no give-up threshold.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l06"
+  questions={[
+    {
+      q: "A supervisor does two of the three jobs. Which one can it never do for you?",
+      options: [
+        "Restarting the process after a crash",
+        "Telling you the service is unhealthy — a restart policy converts a visible crash into an invisible loop",
+        "Starting the process at boot",
+        "Passing environment variables to the process"
+      ],
+      answer: 1,
+      explain: "Supervision keeps you up; it doesn't keep you correct, and it actively conceals the failure. 312 restarts behind a green dashboard was the break-fix."
+    },
+    {
+      q: "You're diagnosing a crash loop. Why is the tail of the log the wrong place to look?",
+      options: [
+        "Log tails are truncated by the supervisor",
+        "The tail shows normal traffic from the newest attempt's short life; the real error is in the first lines after each startup",
+        "Crash messages are written to a separate file",
+        "The tail only contains messages from before the crash"
+      ],
+      answer: 1,
+      explain: "Grep for the startup line and read forward from the last one. The lesson's evidence showed a perfectly healthy-looking tail hiding a heap-exhaustion abort at every boot."
+    },
+    {
+      q: "A container exits with code 137 and `OOMKilled=true`, with no error from your application. What happened?",
+      options: [
+        "The app threw an unhandled exception",
+        "The kernel or container runtime killed it for exceeding its memory limit — your code never got to run an error handler",
+        "The health check failed and the platform stopped it",
+        "A SIGTERM was sent during a deploy"
+      ],
+      answer: 1,
+      explain: "137 means SIGKILL, and in containers that's almost always the memory limit. Note the contrast with exit 1 plus a V8 'heap limit' message, which is the runtime's own ceiling and does leave a readable error."
+    },
+    {
+      q: "Why does a 60-second uptime check report 100% availability for an app restarting every 20 seconds?",
+      options: [
+        "Uptime checks cache their results",
+        "Restarts take under a second, so a process is nearly always listening when the check lands — the signal to watch is restart count and uptime resets",
+        "The check only tests DNS resolution",
+        "The load balancer serves a cached response during restarts"
+      ],
+      answer: 1,
+      explain: "This is why 'is it up' is a weak health signal. Customers experienced it as random logouts, because every crash wiped the in-memory session store."
+    },
+    {
+      q: "Why add a give-up threshold (e.g. StartLimitBurst) rather than restarting forever?",
+      options: [
+        "It reduces CPU usage during a loop",
+        "A service that stays down loudly can't be mistaken for healthy, whereas endless flapping looks like uptime to most monitoring",
+        "Systemd requires it for Restart=always",
+        "It prevents the log files from growing"
+      ],
+      answer: 1,
+      explain: "Honesty beats false resilience. Endless restarts hide a broken deploy behind a green dot; a stopped service with a clear reason gets fixed."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,43 @@
+id: sc-disk-full-01
+module: M1
+lesson: m01-l03
+title: "Everything that writes is failing"
+difficulty: realistic
+symptom: "The app returns 500s at 03:40. It has been up for 11 days with no deploy. The service reports active and running."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: disk
+      apply: scripts/break/fill-disk-with-debug-logs.sh   # debug level + no rotation, 26GB log
+evidence:
+  logs: true
+  metrics: [disk.used_pct, http.5xx]
+  db_console: true
+agent:
+  context: "You have shell access but have not inspected the filesystem."
+  bias: "focuses on application errors rather than the ENOSPC in the stack trace"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - app-health
+    - disk-below-80-pct
+    - log-rotation-configured          # space must stay freed, not just be freed once
+  root_cause_markers:
+    - space reclaimed by truncating the open file rather than deleting it
+    - log level corrected
+    - rotation configured so any log is bounded
+  symptom_only_markers:
+    - log file deleted with rm while the process holds it (space not returned)
+    - disk resized with level and rotation unchanged
+hints:
+  - "Read the full stack trace. What does ENOSPC mean?"
+  - "`df -h` first. Then walk down with `du --max-depth=1`, following the biggest child."
+  - "The process holds that file open. What does deleting it do to the free space?"
+  - "Reveal: an unrotated debug log filled the disk. Truncate in place, fix the level, configure rotation, alert at 80%."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

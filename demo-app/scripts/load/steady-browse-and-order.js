@@ -1,7 +1,7 @@
 // Background traffic generator: a steady stream of browsing and bookings, so
 // metrics and logs have signal during drills. Runs until Ctrl-C.
 //   node scripts/load/steady-browse-and-order.js
-const APP = process.env.APP_URL ?? "http://localhost:3000";
+const APP = process.env.APP_URL ?? "http://localhost:3001";
 const INTERVAL_MS = Number(process.env.INTERVAL_MS ?? 700);
 
 let n = 0;

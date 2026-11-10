@@ -1,0 +1,42 @@
+id: sc-request-journey-01
+module: M0
+lesson: m00-l01
+title: "Works for you, unreachable for them"
+difficulty: guided
+symptom: "A customer gets 'this site can't be reached'. It loads fine for you, and every dashboard is green."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: dns
+      apply: scripts/break/stale-dns-record.sh   # old A record cached with a 12h TTL
+evidence:
+  logs: true
+  metrics: [http.2xx, http.5xx]
+  db_console: false
+  notes: "Learner gets two shells: their own, and one on a host using a resolver with the stale cache."
+agent:
+  context: "You assume the application is at fault when users report errors."
+  bias: "proposes redeploying the app before checking name resolution"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - app-health                      # the app must still be healthy and untouched
+    - no-redeploy-performed           # redeploying is not a fix here
+  root_cause_markers:
+    - learner identifies DNS (hop 2) as the failing hop from dig output
+    - learner states the TTL as the reason some resolvers still fail
+  symptom_only_markers:
+    - app redeployed or restarted
+    - code changes made to the application
+hints:
+  - "How far did the request get? Check the customer's network tab before anything else."
+  - "Compare `dig +short yourapp.com` against `dig +short yourapp.com @1.1.1.1`."
+  - "The record is correct. So why does one resolver disagree? Look at the TTL in the answer section."
+  - "Reveal: DNS hop. The old answer is cached for its TTL; keep the old host serving and lower TTL before future migrations."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

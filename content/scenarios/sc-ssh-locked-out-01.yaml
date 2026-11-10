@@ -1,0 +1,43 @@
+id: sc-ssh-locked-out-01
+module: M1
+lesson: m01-l02
+title: "CI can't deploy, but you can log in fine"
+difficulty: realistic
+symptom: "The nightly deploy fails with 'Permission denied (publickey)'. SSH from the engineer's laptop works normally. Nothing was deployed yesterday."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: ci
+      apply: scripts/break/rename-ci-ssh-secret.sh   # workflow references a secret name that does not exist
+evidence:
+  logs: true
+  metrics: [deploy.success_rate]
+  db_console: false
+  notes: "Learner has the CI run log, the server's authorized_keys (read-only via an existing session), and repository git history."
+agent:
+  context: "You have the CI logs but cannot see repository secret settings."
+  bias: "proposes regenerating SSH keys, which risks overwriting the working key"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - ci-deploy-succeeds
+    - existing-keys-unchanged           # regenerating or replacing server keys fails this
+  root_cause_markers:
+    - learner identifies the empty key file from the first log line, not the auth error
+    - secret restored under the referenced name, or the reference corrected
+    - validation added so an empty secret fails the job loudly
+  symptom_only_markers:
+    - new keypair generated and installed
+    - password authentication enabled on the server
+hints:
+  - "Read the FIRST line of the CI failure, not the last."
+  - "What does a secrets system substitute when a secret name does not exist?"
+  - "Compare the secret name in the workflow against the names that are actually defined."
+  - "Reveal: a renamed secret wrote an empty key file. Restore the name and fail loudly on an empty key."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

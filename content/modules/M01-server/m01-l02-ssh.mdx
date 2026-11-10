@@ -1,0 +1,398 @@
+---
+id: m01-l02
+module: M1
+title: "SSH: how you get inside the machine"
+order: 2
+difficulty: 2
+depth: both
+platforms: [aws, docker, github-actions]
+concepts: [ssh, permissions, secrets]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-ssh-locked-out-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A solo founder's VPS stopped responding to deploys. His agent told him to SSH in and check the logs. He tried, and got `Permission denied (publickey)`.
+
+What followed is the part worth learning from. He asked the agent for help; it suggested regenerating his key — so he ran `ssh-keygen` and accepted the defaults, which **overwrote `~/.ssh/id_ed25519`**, the only key the server trusted. He now had a new key the server had never heard of, and no way in to add it. The agent then suggested `ssh-copy-id`, which requires… the ability to log in.
+
+He rebuilt the server from scratch over two days. The original problem turned out to be that he'd run `chmod -R 777 ~` a week earlier while fighting an unrelated permissions error. SSH refuses to use a private key that other users can read — a safety feature, reported as "permission denied", which he had read as "wrong key".
+
+Two days, and the cause was a permission bit and a misread error message.
+
+</Section>
+
+<Section kind="already-did">
+
+If you've used GitHub over SSH, you've already done all of this: you ran `ssh-keygen`, pasted a string starting with `ssh-ed25519 AAAA…` into a settings page, and from then on `git push` just worked. That string was your **public** key. The file you didn't paste is your **private** key, and the asymmetry between them is the whole system.
+
+You may also have: pasted a `-----BEGIN OPENSSH PRIVATE KEY-----` blob into a CI secret so a deploy could reach a server; accepted a scary "The authenticity of host … can't be established" prompt by typing `yes`; or run a deploy script with `ssh user@host 'cd /app && git pull && pm2 restart'` without quite parsing what each part did.
+
+This lesson makes those moments legible — and, more importantly, teaches you how not to lock yourself out.
+
+</Section>
+
+<Section kind="mental-model">
+
+SSH is a **lock and a key, where the lock is public and the key never moves.**
+
+<svg viewBox="0 0 780 250" role="img" aria-label="SSH key pair: the private key stays on your laptop in the .ssh directory, the public key is copied to the server's authorized_keys file, and authentication happens by proving possession without sending the private key" className="diagram">
+  <defs>
+    <marker id="arrk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="8" y="30" width="300" height="120" rx="10" />
+  <text x="158" y="56" textAnchor="middle">Your laptop</text>
+  <text x="158" y="80" textAnchor="middle" className="sub">~/.ssh/id_ed25519</text>
+  <text x="158" y="98" textAnchor="middle" className="sub">PRIVATE — never leaves, mode 600</text>
+  <text x="158" y="122" textAnchor="middle" className="sub">~/.ssh/id_ed25519.pub</text>
+  <text x="158" y="140" textAnchor="middle" className="sub">PUBLIC — safe to paste anywhere</text>
+
+  <rect x="472" y="30" width="300" height="120" rx="10" />
+  <text x="622" y="56" textAnchor="middle">The server</text>
+  <text x="622" y="80" textAnchor="middle" className="sub">~/.ssh/authorized_keys</text>
+  <text x="622" y="98" textAnchor="middle" className="sub">a list of public keys allowed in</text>
+  <text x="622" y="122" textAnchor="middle" className="sub">one key per line, mode 600</text>
+  <text x="622" y="140" textAnchor="middle" className="sub">dir ~/.ssh must be mode 700</text>
+
+  <path d="M 312 70 L 468 70" className="arrow" markerEnd="url(#arrk)" />
+  <text x="390" y="64" textAnchor="middle" className="sub">copy the .pub once</text>
+
+  <path d="M 468 118 L 312 118" className="arrow" markerEnd="url(#arrk)" />
+  <text x="390" y="112" textAnchor="middle" className="sub">"prove you hold the private key"</text>
+
+  <text x="12" y="192" className="sub">The private key is never transmitted. The server sends a challenge; your client signs it.</text>
+  <text x="12" y="212" className="sub">Anyone can hold your public key — it only lets them verify, never impersonate.</text>
+  <text x="12" y="236" className="sub">Lose the private key → you are locked out. Leak it → someone else is in.</text>
+</svg>
+
+**The analogy that actually fits:** your public key is a padlock you mail to people, open. They lock their door with it. Only your key opens it, and your key stays in your pocket — it's never posted, never shown. "Copying your key to the server" means mailing padlocks, not keys, which is why pasting a `.pub` anywhere is harmless.
+
+### The four files, and what each one does
+
+| Path | What it is | Required mode | If it's wrong |
+|---|---|---|---|
+| `~/.ssh/` (your laptop) | Your key directory | `700` | SSH may refuse to use keys inside it |
+| `~/.ssh/id_ed25519` | **Private key** — the secret | `600` | "Permissions too open" → refuses to use it → *Permission denied (publickey)* |
+| `~/.ssh/id_ed25519.pub` | Public key — shareable | `644` | Harmless |
+| `~/.ssh/authorized_keys` (server) | Public keys allowed to log in as this user | `600`, dir `700` | Silent "permission denied" — **the single most common cause** |
+
+<Callout type="warn">
+`Permission denied (publickey)` almost never means "your key is wrong". In order of real-world frequency it means: (1) your public key isn't in that user's `authorized_keys`, (2) **file permissions are too open** on either side, (3) you're connecting as the wrong *user*, (4) your client is offering a different key than you think. Diagnose with `ssh -v`, which narrates all four.
+</Callout>
+
+### Never lock yourself out: the two rules
+
+1. **Open a second terminal before you change anything.** Before editing `sshd_config`, `authorized_keys`, firewall rules or permissions, have a *working* session open and keep it open. If the change locks you out, the live session is your way back. This rule has saved more servers than any amount of knowledge.
+2. **Never accept `ssh-keygen`'s default path when you already have a key.** It silently offers to overwrite `~/.ssh/id_ed25519`. Always `-f ~/.ssh/newkey`, and add keys to `authorized_keys` *additively* — it's a list, one per line, and you can trust several at once.
+
+### What "connecting" actually involves
+
+1. DNS resolves the host; TCP connects on port 22.
+2. The server presents its **host key**; your client compares it to `~/.ssh/known_hosts`. First time → the "authenticity can't be established" prompt. A *changed* key later → a loud warning, which is either a rebuilt server or a genuine man-in-the-middle.
+3. Your client offers public keys; the server checks them against `authorized_keys` for the user you named.
+4. Match found → the server sends a challenge, your client signs it with the private key, the server verifies with the public key. The secret never crosses the wire.
+5. You get a shell — or, with a command appended, just that command's output.
+
+<Operator>
+
+```bash
+# --- Create a key (the modern default; never reuse one key everywhere) ---
+ssh-keygen -t ed25519 -C "laptop-2026" -f ~/.ssh/riverside_deploy
+#   -f is not optional in practice: it stops you overwriting an existing key.
+#   A passphrase is strongly recommended; ssh-agent means you type it once per boot.
+
+# --- Install the public key on a server you can already reach ---
+ssh-copy-id -i ~/.ssh/riverside_deploy.pub deploy@203.0.113.7
+#   No ssh-copy-id? Append it yourself, additively — note >> not >:
+cat ~/.ssh/riverside_deploy.pub | ssh deploy@203.0.113.7 \
+  'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+
+# --- Connect, and diagnose when you can't ---
+ssh -i ~/.ssh/riverside_deploy deploy@203.0.113.7
+ssh -v deploy@203.0.113.7 2>&1 | grep -iE "offering|authentications that can continue|denied|bad permissions"
+#   "Offering public key: …" tells you WHICH key your client tried.
+#   "Bad permissions" tells you it refused a key before even trying it.
+
+# --- Fix the classic permission problems ---
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_* && chmod 644 ~/.ssh/*.pub     # your laptop
+#   On the server (from a session you already have open!):
+chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+ls -la ~/.ssh         # verify before you log out
+
+# --- Stop typing flags: ~/.ssh/config ---
+cat >> ~/.ssh/config <<'EOF'
+Host riverside
+  HostName 203.0.113.7
+  User deploy
+  IdentityFile ~/.ssh/riverside_deploy
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+ssh riverside                       # that's the whole command now
+#   IdentitiesOnly yes matters: without it your client offers every key it has,
+#   and servers with MaxAuthTries can cut you off before reaching the right one.
+
+# --- Run one command without an interactive shell (what deploy scripts do) ---
+ssh riverside 'systemctl status myapp --no-pager | head -20'
+ssh riverside 'journalctl -u myapp -n 50 --no-pager'
+
+# --- Move files ---
+scp ~/backup.sql riverside:/tmp/                       # to the server
+scp riverside:/var/log/myapp/app.log ./                 # from the server
+rsync -avz --progress ./dist/ riverside:/var/www/app/   # better: resumable, incremental
+
+# --- Reach a server-only port from your laptop (tunnel) ---
+ssh -L 5433:localhost:5432 riverside
+#   Now psql postgres://user@localhost:5433/db hits the SERVER's Postgres,
+#   without exposing 5432 to the internet. This is how you use a GUI client
+#   against a database that correctly refuses public connections.
+
+# --- Host key changed warning: verify, then fix deliberately ---
+ssh-keygen -R 203.0.113.7        # removes the old entry; only after you KNOW why it changed
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | What it's for | Note |
+|---|---|---|
+| OpenSSH (`ssh`, `scp`, `ssh-keygen`) | The baseline, everywhere | On macOS/Linux already installed |
+| `ssh-agent` + `ssh-add` | Type your passphrase once per session | macOS: `ssh-add --apple-use-keychain` |
+| `~/.ssh/config` | Named hosts, per-host keys, jump hosts | The highest-value 5 minutes in this lesson |
+| 1Password / Secretive SSH agent | Keys held in a vault or Secure Enclave | Private key can't be copied off the machine |
+| Tailscale SSH | Identity-based access, no key management, no port 22 exposed | Increasingly the right answer for small teams |
+| AWS SSM Session Manager | Shell into EC2 with no SSH port, no keys | IAM-governed, audited |
+| `mosh` | Survives network changes and sleep | Great on flaky connections |
+| Platform shells (`railway ssh`, `fly ssh console`, `docker compose exec`) | Getting inside a managed container | No keys involved — the platform authenticates you |
+
+What good looks like: separate keys per machine, all keys passphrase-protected, a `~/.ssh/config` so you type `ssh riverside`, and **more than one** key in `authorized_keys` on anything you care about — a backup key is the cheapest insurance against the story at the top.
+
+For teams: stop managing `authorized_keys` by hand. Tailscale SSH or SSM removes the whole key-distribution problem, including the "person left the company, is their key still on the box?" problem.
+
+</Section>
+
+<Section kind="hands-on">
+
+You don't need a VPS to practise safely — the demo app's containers are stand-ins for "another machine", and `docker compose exec` is the keyless equivalent of SSH.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Get a shell "on another machine"** and look around with the vocabulary from L0.2:
+   ```bash
+   docker compose exec app sh
+   ls -la /app; ps aux; env | grep -i url | sed 's/=.*/=…/'; exit
+   ```
+2. **Run one command without a shell** — the deploy-script pattern:
+   ```bash
+   docker compose exec app sh -c 'node -e "console.log(process.uptime())"'
+   ```
+3. **Copy a file out** (the `scp` equivalent):
+   ```bash
+   docker compose cp app:/app/package.json ./copied-from-container.json && rm ./copied-from-container.json
+   ```
+4. **Reproduce the lockout error in miniature.** Inside the app container, create a key with deliberately bad permissions and watch SSH refuse it:
+   ```bash
+   docker compose exec app sh -c '
+     mkdir -p /tmp/k && ssh-keygen -q -t ed25519 -N "" -f /tmp/k/test 2>/dev/null || apk add --no-cache openssh-client >/dev/null 2>&1 && ssh-keygen -q -t ed25519 -N "" -f /tmp/k/test
+     chmod 644 /tmp/k/test
+     ssh -i /tmp/k/test -o StrictHostKeyChecking=no -o BatchMode=yes -v nobody@127.0.0.1 2>&1 | grep -iE "bad permissions|unprotected|denied" | head -5'
+   ```
+   The "UNPROTECTED PRIVATE KEY FILE" message is exactly what the founder in the story was seeing — reported to him as `Permission denied (publickey)`.
+
+5. **If you do have a VPS**, do the real exercise: create a *second* key with `-f ~/.ssh/backup_key`, append it to `authorized_keys` (with `>>`), and verify you can log in with it — **while your first session stays open**. That's the two-rules drill, and it's the habit that prevents two-day rebuilds.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** The nightly deploy from GitHub Actions has been failing since 02:00. The engineer can SSH in from her laptop without any problem. Nothing was deployed or changed yesterday — or so the team believes.
+
+<Evidence title="GitHub Actions log">
+
+```text
+Run ssh -i ~/.ssh/deploy_key deploy@203.0.113.7 'cd /srv/app && git pull && pm2 restart app'
+Warning: Identity file ~/.ssh/deploy_key not accessible: No such file or directory.
+deploy@203.0.113.7: Permission denied (publickey).
+Error: Process completed with exit code 255.
+```
+
+</Evidence>
+
+<Evidence title="on the server, from her working session">
+
+```text
+$ sudo ls -la /home/deploy/.ssh/
+total 16
+drwx------  2 deploy deploy 4096 Nov  2 14:02 .
+drwxr-xr-x  5 deploy deploy 4096 Oct  9 11:20 ..
+-rw-------  1 deploy deploy  742 Nov  2 14:02 authorized_keys
+
+$ sudo wc -l /home/deploy/.ssh/authorized_keys
+2 /home/deploy/.ssh/authorized_keys
+$ sudo cut -d' ' -f3 /home/deploy/.ssh/authorized_keys
+laptop-asha
+ci-deploy-2025
+
+$ sudo last -n 5 deploy
+deploy  pts/0  86.21.x.x  Mon Nov  3 09:14   still logged in
+deploy  pts/0  86.21.x.x  Sun Nov  2 14:01 - 14:05
+
+$ sudo journalctl -u ssh --since "02:00" | grep -i deploy | head -3
+Nov 03 02:00:11 sshd[8821]: Connection closed by authenticating user deploy 140.82.x.x [preauth]
+```
+
+</Evidence>
+
+<Evidence title="the repository's workflow file, recent history">
+
+```text
+$ git log --oneline -3 -- .github/workflows/deploy.yml
+a91f2c4 chore: tidy up workflow secrets   (Nov 2, 13:58)
+...
+$ git show a91f2c4 --stat
+ .github/workflows/deploy.yml | 4 ++--
+$ git show a91f2c4 | grep -E "^[-+].*(SSH|secret|key)"
+-          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/deploy_key
+-          chmod 600 ~/.ssh/deploy_key
++          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
++          chmod 600 ~/.ssh/deploy_key
+```
+
+</Evidence>
+
+The server's key setup is perfect and her laptop works fine. So what broke, and why does the error message point you in the wrong direction?
+
+<Reveal label="Reveal the cause">
+
+**The CI secret was renamed in the workflow but never created under the new name.** Commit `a91f2c4` ("tidy up workflow secrets") changed `secrets.SSH_DEPLOY_KEY` to `secrets.DEPLOY_SSH_KEY`. GitHub Actions substitutes an **empty string** for a secret that doesn't exist — it does not fail. So the step wrote an empty file, and `chmod 600` on an empty file succeeds silently.
+
+**Read the first line of the log again:** `Identity file ~/.ssh/deploy_key not accessible: No such file or directory.` That line — not the `Permission denied` beneath it — is the actual diagnosis, and it's above the error everyone pasted into their agent. The authentication failure is a *consequence*: with no usable key to offer, SSH fell back to having nothing, and the server correctly refused. This is M8.6's "read the whole error, and the *first* line" in its purest form.
+
+**Why the server evidence is a red herring, usefully:** `authorized_keys` is mode 600 in a 700 directory, owned by `deploy`, containing both the laptop key and `ci-deploy-2025`. The server is configured correctly, which *eliminates* the entire server-side half of the problem — exactly the layer-isolation value of checking it. The `[preauth]` line confirms the client disconnected before offering valid credentials.
+
+**The fix:** add the key under the new name in repository secrets (or revert the rename), then re-run. Afterwards, three things make this class of failure impossible:
+
+- **Fail loudly on an empty secret.** Add `test -s ~/.ssh/deploy_key || { echo "::error::deploy key secret is empty or missing"; exit 1; }` immediately after writing the file. An empty secret should break the build with a clear message, not fifteen lines later with a misleading one.
+- **Rotate to a dedicated, least-privilege key** — this one has been in CI since 2025 and the rename suggests nobody is sure which secret is which. A CI key should be its own key, restricted in `authorized_keys` with `command="…",restrict` so a leak can only run the deploy, not get a shell.
+- Consider removing the key entirely: an OIDC-based deploy or Tailscale SSH means there's no long-lived private key in CI to rename, leak, or lose.
+
+**The transferable trap:** every secrets system in common use substitutes empty for missing. GitHub Actions, Docker, `process.env` — a typo'd secret name produces an empty value, and empty values fail *downstream* of the typo, with error messages about the symptom. Validate at the point of use (this is M4.1's lesson, met here first).
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"I get 'Permission denied (publickey)' connecting to [host] as [user]. Run `ssh -vv` for me and interpret the output line by line: which key did my client offer, did the server reject it or refuse to use it, and what do the permission-related lines say? Tell me which of the four common causes this is before suggesting any change."}>
+Insist it names the cause from the verbose output rather than guessing. **Never** let it run `ssh-keygen` against your default path — that's the story at the top of this lesson. If it proposes generating a key, ask how you'd install the new public key on a server you can't log into.
+</AgentTask>
+
+<AgentTask prompt={"Write me a deploy script that connects over SSH and restarts the app. Requirements: validate that the key file exists and is non-empty before using it, use a named host from ~/.ssh/config, fail with a clear message if any step fails (set -euo pipefail), never echo secret values, and print exactly what it is about to do on which host before doing it."}>
+Test it twice: once working, and once with the key file deliberately emptied. The second run must fail immediately with a message naming the key — if it instead reaches an authentication error, the validation isn't doing its job. That's the break-fix, prevented.
+</AgentTask>
+
+<AgentTask prompt={"Audit SSH access on this server: list every public key in every user's authorized_keys with its comment field, show the permissions of each .ssh directory and file, report whether password authentication and root login are enabled in sshd_config, and flag anything that would lock me out if changed. Do not modify anything."}>
+The comment field is the useful part — keys labelled `laptop-2023` or with no comment at all are keys nobody can account for, which means they can't be safely removed *or* safely kept. Make any change with a second session open, and never apply an `sshd_config` edit the agent wrote without reading it yourself.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before touching anything SSH-related:
+
+- Is a second, working session open right now? (If no: open one.)
+- Am I about to run `ssh-keygen` without `-f`? (If yes: stop.)
+- Am I appending to `authorized_keys` with `>>`, or overwriting with `>`?
+- Does more than one key work on this machine? (Backup key = cheap insurance.)
+- Are permissions right: `~/.ssh` 700, private keys 600, `authorized_keys` 600?
+
+Standing questions for any server you own:
+
+- Which keys are in `authorized_keys`, and can I account for every one by person or system?
+- Is password authentication disabled? Is root login disabled?
+- Does CI hold a long-lived private key? Could it be scoped, rotated, or eliminated?
+- When someone leaves, what's the procedure — and has it ever been run?
+
+What good looks like: per-machine keys with passphrases, `~/.ssh/config` entries instead of remembered IPs, CI keys scoped to a single command, and a documented way back in that doesn't involve rebuilding the server.
+
+Red flags: one key copied across all your machines; `chmod -R 777` anywhere near a home directory; a CI secret nobody can map to a key in `authorized_keys`.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l02"
+  questions={[
+    {
+      q: "Why is it safe to paste your public key into a GitHub settings page, a Slack message, or a server's authorized_keys?",
+      options: [
+        "Because it's encrypted before transmission",
+        "Because a public key can only verify a signature, never produce one — it cannot impersonate you",
+        "Because it expires after a short period",
+        "Because it only works from your current IP address"
+      ],
+      answer: 1,
+      explain: "That's the asymmetry: the public half is a padlock you hand out, the private half is the key that stays in your pocket and is never transmitted — not even during login."
+    },
+    {
+      q: "You get `Permission denied (publickey)`. What is the most common real cause?",
+      options: [
+        "The private key is corrupted and must be regenerated",
+        "Either your public key isn't in that user's authorized_keys, or file permissions are too open — SSH refuses keys that others can read",
+        "The server's SSH daemon has crashed",
+        "The host key has changed since your last connection"
+      ],
+      answer: 1,
+      explain: "Regenerating is the dangerous wrong move — it can overwrite the only key the server trusts. `ssh -v` distinguishes 'rejected' from 'refused to even offer because of bad permissions'."
+    },
+    {
+      q: "What is the one habit that most reliably prevents locking yourself out of a server?",
+      options: [
+        "Keeping a copy of your private key in cloud storage",
+        "Having a second working session open before changing ssh config, keys, permissions or firewall rules",
+        "Using passwords as well as keys",
+        "Taking a snapshot before every change"
+      ],
+      answer: 1,
+      explain: "A live session is an escape hatch the change can't close. Snapshots help but cost downtime and data; the open terminal costs nothing and fixes the mistake in seconds."
+    },
+    {
+      q: "In the break-fix, what did the renamed CI secret actually produce?",
+      options: [
+        "An authentication error from the server, because the key was wrong",
+        "An empty key file, because secrets systems substitute empty for missing — so the real diagnosis was the 'not accessible' line above the permission error",
+        "A corrupted key, because the rename broke the base64 encoding",
+        "A timeout, because the workflow could not reach the host"
+      ],
+      answer: 1,
+      explain: "Missing secrets become empty strings almost everywhere (Actions, Docker, process.env). The failure then surfaces downstream with a misleading message — which is why you validate at the point of use and read the FIRST line of the error."
+    },
+    {
+      q: "What does `ssh -L 5433:localhost:5432 myserver` let you do, and why does it matter?",
+      options: [
+        "Copy files to the server over port 5433",
+        "Reach the server's Postgres from your laptop through the encrypted SSH connection, so the database never needs a public port",
+        "Run the SSH daemon on a non-standard port",
+        "Forward the server's logs to your terminal"
+      ],
+      answer: 1,
+      explain: "A tunnel is how you use a local GUI client against a database that correctly refuses internet connections. Exposing 5432 publicly instead is how databases end up in breach reports."
+    }
+  ]}
+/>
+
+</Section>

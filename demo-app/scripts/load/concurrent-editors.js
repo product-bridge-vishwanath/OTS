@@ -2,7 +2,7 @@
 // to the SAME booking at the same time, 4 rounds each = 20 notes sent.
 // Count how many survive.
 //   node scripts/load/concurrent-editors.js [bookingId]
-const APP = process.env.APP_URL ?? "http://localhost:3000";
+const APP = process.env.APP_URL ?? "http://localhost:3001";
 const BOOKING = process.argv[2] ?? "1";
 
 async function addNote(author, round) {

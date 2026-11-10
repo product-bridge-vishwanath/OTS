@@ -1,0 +1,436 @@
+---
+id: m01-l03
+module: M1
+title: "The commands, taught by the question they answer"
+order: 3
+difficulty: 1
+depth: both
+platforms: [docker, nginx, postgres]
+concepts: [servers, processes, logs]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-disk-full-01]
+estimated_minutes: 40
+---
+
+<Section kind="story">
+
+Two in the morning. An app is down. The founder is in a terminal on the server, and her agent has just said: *"Check the logs for errors."*
+
+She doesn't know where the logs are. She tries `ls`, sees a directory listing that means nothing, and pastes it to the agent. It suggests `cat /var/log/syslog`. Eleven thousand lines scroll past at a speed nobody can read; her terminal's scrollback eats the start. She tries again with `cat` on a different file — 400MB this time — and her SSH session becomes unusable for ninety seconds.
+
+She got there eventually. It took forty minutes, and the answer was six words in a log file she'd already printed twice.
+
+The gap wasn't knowledge of Linux. It was that she knew commands as *names* rather than as *answers to questions*. `cat` wasn't the wrong tool because she misunderstood `cat`; it was wrong because the question was "what errors happened recently?" and `cat` answers "what's in this entire file?"
+
+</Section>
+
+<Section kind="already-did">
+
+Scroll back through your agent conversations and you'll find you have already run most of these commands. `ls -la` when something wasn't where it should be. `tail -f` while watching a deploy. `ps aux | grep node` to see if the app was alive. `df -h` when a deploy mysteriously failed. `chmod +x` on a script. `curl` against your own API to prove it was up.
+
+You ran them because you were told to. They worked, and then you forgot them, because a command you can't connect to a *question* is just a magic incantation — and nobody retains incantations.
+
+This lesson re-files what you've already typed under the questions it answers. The [command cheat sheet](/reference/commands) is the long-form reference; this is the method that makes it stick.
+
+</Section>
+
+<Section kind="mental-model">
+
+You need about 25 commands. They answer six questions, and **the real skill is composition**: joining small tools with a pipe so each one narrows what the next one sees.
+
+<svg viewBox="0 0 780 210" role="img" aria-label="Six questions mapped to commands: where am I, what is in this file, what is running, what is it using, who can do what, and can I reach it" className="diagram">
+  <rect x="8" y="14" width="246" height="80" rx="10" />
+  <text x="131" y="40" textAnchor="middle">Where am I? What&apos;s here?</text>
+  <text x="131" y="62" textAnchor="middle" className="sub">pwd · ls -la · cd · find</text>
+  <text x="131" y="81" textAnchor="middle" className="sub">which · du</text>
+
+  <rect x="267" y="14" width="246" height="80" rx="10" />
+  <text x="390" y="40" textAnchor="middle">What&apos;s in this file/log?</text>
+  <text x="390" y="62" textAnchor="middle" className="sub">less · tail -f · head · grep</text>
+  <text x="390" y="81" textAnchor="middle" className="sub">journalctl · docker logs</text>
+
+  <rect x="526" y="14" width="246" height="80" rx="10" />
+  <text x="649" y="40" textAnchor="middle">What&apos;s running?</text>
+  <text x="649" y="62" textAnchor="middle" className="sub">ps aux · top/htop · kill</text>
+  <text x="649" y="81" textAnchor="middle" className="sub">systemctl · docker ps</text>
+
+  <rect x="8" y="110" width="246" height="80" rx="10" />
+  <text x="131" y="136" textAnchor="middle">What&apos;s it consuming?</text>
+  <text x="131" y="158" textAnchor="middle" className="sub">df -h · du · free -h</text>
+  <text x="131" y="177" textAnchor="middle" className="sub">top · docker stats</text>
+
+  <rect x="267" y="110" width="246" height="80" rx="10" />
+  <text x="390" y="136" textAnchor="middle">Who can do what?</text>
+  <text x="390" y="158" textAnchor="middle" className="sub">whoami · id · chmod</text>
+  <text x="390" y="177" textAnchor="middle" className="sub">chown · sudo</text>
+
+  <rect x="526" y="110" width="246" height="80" rx="10" />
+  <text x="649" y="136" textAnchor="middle">Can I reach it?</text>
+  <text x="649" y="158" textAnchor="middle" className="sub">curl · dig · nc · ss</text>
+  <text x="649" y="177" textAnchor="middle" className="sub">lsof -i · ping</text>
+</svg>
+
+### The composition idea
+
+A pipe (`|`) sends one command's output into the next as input. That's the entire concept, and it's what turns 25 small tools into an arbitrary number of answers.
+
+```bash
+docker compose logs app | grep -i error | tail -20
+#            ↓              ↓              ↓
+#     everything      only error lines   the last 20
+```
+
+Read any pipeline right-to-left to see its purpose, left-to-right to see its mechanics. Four composers do most of the work:
+
+| Tool | Job | The flag that matters |
+|---|---|---|
+| `grep` | Keep lines matching a pattern | `-i` ignore case · `-v` invert · `-c` count · `-E` regex · `-A3/-B3` context |
+| `head` / `tail` | First / last N lines | `-n 50` · `tail -f` to follow live |
+| `sort` / `uniq -c` | Group and count identical lines | `sort | uniq -c | sort -rn` = "top N by frequency" |
+| `wc -l` | Count lines | Turns any listing into a number |
+
+`sort | uniq -c | sort -rn` deserves its own mention: it answers "what is most common here?" for any text at all — error types, URLs, IP addresses, status codes. It's the single most useful composition in operations.
+
+<Callout type="key">
+**Never `cat` a log file.** `cat` prints everything, destroys your scrollback, and can wedge an SSH session on a large file. Logs get `less` (scroll and search), `tail` (recent), `grep` (specific), or `journalctl`/`docker logs` with a time window. This one habit would have saved the founder in the story most of her forty minutes.
+</Callout>
+
+### Choosing between `less`, `tail`, `grep` and `head`
+
+| Your actual question | Tool |
+|---|---|
+| "What's happening *right now*?" | `tail -f`, or `docker compose logs -f` |
+| "What happened in the last half hour?" | `journalctl --since "30 min ago"` / `docker logs --since 30m` |
+| "Did *this specific thing* happen?" | `grep` |
+| "What happened *first*?" | `grep … | head` — the first error, not the latest (M8.6) |
+| "I need to read around and search" | `less` (`/pattern`, `n`, `G`, `q`) |
+| "How many times?" | `grep -c`, or `… | wc -l` |
+
+### Three safety rules
+
+1. **`rm` has no undo.** No trash can. `rm -rf` with a wrong path or a stray space is unrecoverable. Prefer `mv` to `/tmp/` when you mean "get this out of the way".
+2. **Look before you act, with the same pattern.** Run `find … -name "*.log"` *before* `find … -name "*.log" -delete`. The `ls` version of a command is free; the destructive version isn't.
+3. **`sudo` means "no safety rails".** If a command only works with `sudo`, understand why before making it a habit — the real fix is usually ownership (M1.4), not more root.
+
+<Operator>
+
+The pipelines worth committing to muscle memory, grouped by the question they answer.
+
+```bash
+# ── "What errors happened, and what's most common?" ────────────────────
+docker compose logs --since 1h app 2>&1 | grep -iE "error|fatal|exception" | tail -30
+docker compose logs --since 1h app 2>&1 | grep -oE "Error: [A-Za-z ]+" | sort | uniq -c | sort -rn
+journalctl -u myapp --since "1 hour ago" --no-pager | grep -i error | head -5   # FIRST five
+
+# ── "Which endpoints are being hit, and which are failing?" ────────────
+docker compose logs app 2>&1 | grep -oE "(GET|POST|PATCH|DELETE) /[^ ]*" | sort | uniq -c | sort -rn | head
+docker compose logs app 2>&1 | grep -oE " (4|5)[0-9]{2} " | sort | uniq -c | sort -rn
+
+# ── "Where did my disk go?" (walk down, don't guess) ───────────────────
+df -h                                             # which filesystem is full
+du -h --max-depth=1 /var 2>/dev/null | sort -h    # biggest child; repeat downward
+du -h --max-depth=1 /var/log 2>/dev/null | sort -h
+find /var/log -type f -size +100M -exec ls -lh {} \;    # the actual culprits
+#   Docker-specific, and very often the answer:
+docker system df
+
+# ── "What's running, and what's eating the machine?" ───────────────────
+ps aux --sort=-%mem | head -5                     # top 5 by memory
+ps aux --sort=-%cpu | head -5
+free -h                                           # look at "available", not "free"
+uptime                                            # load average vs core count
+nproc
+docker stats --no-stream
+
+# ── "Is the port open, and who has it?" ───────────────────────────────
+ss -tlnp 2>/dev/null || netstat -tln
+lsof -i :3000
+#   Is it bound to all interfaces or only localhost? This is a real outage cause:
+ss -tln | grep 3000        # 0.0.0.0:3000 = reachable · 127.0.0.1:3000 = local only
+
+# ── "Can this box reach that box?" ─────────────────────────────────────
+docker compose exec app sh -c 'nc -zv db 5432; nc -zv cache 6379'
+curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" http://localhost:3001/api/health
+dig +short example.com
+
+# ── "What changed on this machine recently?" ───────────────────────────
+ls -lt /etc | head -10                            # recently modified config
+find /etc -mmin -120 -type f 2>/dev/null          # changed in the last 2 hours
+last -n 10                                        # who logged in
+```
+
+Build your own cheat sheet as you go: every time you work out a pipeline during an incident, save it. The [command reference](/reference/commands) is grouped the same way for exactly this reason.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | Replaces | Worth installing? |
+|---|---|---|
+| `htop` | `top` | Yes — sortable, readable, kill from the UI |
+| `ncdu` | `du` | Yes — interactive disk explorer, finds space in seconds |
+| `jq` | `grep` on JSON | Yes, if you have structured logs (M8.3) |
+| `rg` (ripgrep) | `grep -r` | Nice locally; don't rely on it existing on servers |
+| `bat` | `cat`/`less` | Optional |
+| `ctop` / `lazydocker` | `docker stats` | Handy for container work |
+
+A caution that matters operationally: **learn the boring ones.** `grep`, `ps`, `df`, `tail` and `less` exist on every machine you'll ever touch, including a minimal Alpine container at 3am with no package manager access. `rg` and `ncdu` are better tools that you won't have exactly when you need them most.
+
+Shell quality-of-life worth five minutes: `Ctrl-R` searches your command history (the single best shortcut in the terminal), `!!` repeats the last command (`sudo !!`), `Ctrl-A`/`Ctrl-E` jump to line start/end, and `cd -` returns to the previous directory.
+
+</Section>
+
+<Section kind="hands-on">
+
+Work these against the demo app. Answer each **question** before looking at the command.
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &    # generate some log traffic
+```
+
+1. **"Which endpoint is busiest?"**
+   ```bash
+   docker compose logs app 2>&1 | grep -oE "(GET|POST) /api/[a-z]*" | sort | uniq -c | sort -rn
+   ```
+2. **"Did any request fail, and what was the first failure?"**
+   ```bash
+   docker compose logs app 2>&1 | grep -iE "error" | head -3
+   ```
+3. **"What's running inside the app container, and as which user?"**
+   ```bash
+   docker compose exec app sh -c 'ps aux; whoami'
+   ```
+4. **"How much disk is Docker using?"** — then find the biggest thing in the database volume:
+   ```bash
+   docker system df
+   docker compose exec db sh -c 'du -h --max-depth=1 /var/lib/postgresql/data | sort -h | tail -5'
+   ```
+5. **"Is the app listening, and on which interface?"**
+   ```bash
+   docker compose exec app sh -c 'netstat -tln 2>/dev/null || ss -tln'
+   ```
+   Note whether it's `0.0.0.0:3000` or `127.0.0.1:3000`, and predict what would happen to the port mapping if it were the latter.
+6. **"Can the app reach its dependencies?"**
+   ```bash
+   docker compose exec app sh -c 'nc -zv db 5432; nc -zv cache 6379'
+   ```
+7. **Now the real drill — `tail -f` during a failure.** In one terminal: `docker compose logs -f app`. In another: `docker compose stop db`, then load the site, then `docker compose start db`. Watch the failure arrive, in real time, in words. That's the experience `tail -f` exists for, and it's completely different from reading the same lines afterwards.
+
+Finally, stop the load generator: `kill %1`.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** 03:40. The app is returning 500s. It's been up for 11 days without a deploy. The founder SSHes in and collects the following before waking anyone.
+
+<Evidence title="first look">
+
+```text
+$ systemctl status riverside --no-pager | head -12
+● riverside.service - Riverside Studios
+     Loaded: loaded (/etc/systemd/system/riverside.service; enabled)
+     Active: active (running) since Mon 2026-10-27 09:12:04 UTC; 11 days ago
+
+$ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/api/health
+500
+
+$ journalctl -u riverside --since "30 min ago" --no-pager | grep -i error | head -3
+Nov 07 03:38:02 riverside[1182]: Error: ENOSPC: no space left on device, write
+Nov 07 03:38:02 riverside[1182]:     at async Logger.write (/srv/app/lib/log.js:22)
+Nov 07 03:38:14 riverside[1182]: Error: ENOSPC: no space left on device, write
+```
+
+</Evidence>
+
+<Evidence title="following the evidence">
+
+```text
+$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vda1        39G   39G     0 100% /
+tmpfs           2.0G  1.1M  2.0G   1% /run
+
+$ du -h --max-depth=1 / 2>/dev/null | sort -h | tail -5
+1.2G    /usr
+2.1G    /home
+3.4G    /var/lib/postgresql
+31G     /var
+38G     /
+
+$ du -h --max-depth=1 /var 2>/dev/null | sort -h | tail -4
+312M    /var/cache
+3.4G    /var/lib
+27G     /var/log
+31G     /var
+
+$ du -h --max-depth=1 /var/log 2>/dev/null | sort -h | tail -4
+184M    /var/log/journal
+1.1G    /var/log/nginx
+26G     /var/log/riverside
+27G     /var/log
+
+$ ls -lh /var/log/riverside/ | tail -4
+-rw-r--r-- 1 riverside riverside  26G Nov  7 03:40 app.log
+-rw-r--r-- 1 riverside riverside  12K Oct 27 09:12 app.log.1
+
+$ grep -c "" /var/log/riverside/app.log     # line count without printing it
+48211903
+
+$ tail -3 /var/log/riverside/app.log
+{"level":"debug","msg":"cache lookup","key":"rooms:all","hit":true}
+{"level":"debug","msg":"cache lookup","key":"rooms:all","hit":true}
+{"level":"debug","msg":"cache lookup","key":"rooms:all","hit":true}
+```
+
+</Evidence>
+
+Name the cause, say what you do in the next sixty seconds, and note which single command in that transcript is doing the most work.
+
+<Reveal label="Reveal the cause">
+
+**Disk full (100% on `/`), caused by an unrotated log file that has grown to 26GB — filled with `debug`-level lines.**
+
+**The mechanism, in order:** someone left the log level at `debug` (or shipped a change that did). Each request writes several lines. Over 11 days at steady traffic that's 48 million lines. `/var/log/riverside/app.log` has no rotation — note `app.log.1` is 12KB and dated the day of the last deploy, so rotation ran once and never again. The disk reaches 100%. Now *every* write fails: the app's own logging (`ENOSPC` in the stack trace), Postgres writes, session files, uploads. The 500s are a downstream symptom of a full disk, and the service is still `active (running)` — nothing crashed, so `systemctl status` is reassuring and useless here.
+
+**The command doing the most work:** `du -h --max-depth=1` run three times, walking *down* one level at a time — `/` → `/var` → `/var/log`. That's the technique: `df` tells you *which* filesystem, then you descend by always following the biggest child. Guessing where the space went, or running `du -h /` unqualified (which prints a million lines), both fail. `grep -c ""` is the other quiet hero: it counts 48 million lines without printing a single one, which is exactly the mistake the founder in the story made.
+
+**The next sixty seconds — free space without losing the evidence:**
+```bash
+# DON'T `rm app.log` — the process holds the file descriptor and space won't return.
+# Truncate in place instead; the process keeps writing to the same (now empty) file:
+tail -n 5000 /var/log/riverside/app.log > /tmp/app-tail.log   # keep a sample first
+: > /var/log/riverside/app.log                                 # truncate to zero
+df -h                                                          # confirm space is back
+```
+That `rm` detail is the trap people hit: deleting an open file removes the directory entry but not the data, so `df` keeps showing 100% until the process restarts. Truncation (`: >`) returns the space immediately.
+
+**Then fix the causes — there are two.** First, turn the log level back to `info` (debug logging in production is the proximate cause, and M8.3 covers levels properly). Second, and more important, **configure rotation**, because any log will eventually fill any disk:
+```bash
+cat > /etc/logrotate.d/riverside <<'EOF'
+/var/log/riverside/*.log {
+  daily
+  rotate 7
+  size 100M
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+logrotate --debug /etc/logrotate.d/riverside     # verify before trusting it
+```
+Then **alert at 80% disk**. This failure gives you *weeks* of warning and still takes sites down at 3am, purely because nobody is watching a number that moves slowly. (Failure catalogue: "disk full".)
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"I need to answer this question on a Linux server: [your question, e.g. 'which file is filling the disk', 'which process is using the most memory']. Give me a single pipeline that answers it, then explain each stage and what its output means. Use only tools present on a minimal install — no ripgrep, ncdu, or jq — and make it read-only: it must not modify or delete anything."}>
+The read-only constraint is the important one; ask it explicitly whether anything in the pipeline writes or deletes. Run the inspection version before any destructive version of the same command (`find … -name` before `find … -delete`). If you can't explain each stage after its explanation, ask again — you'll be running this at 3am.
+</AgentTask>
+
+<AgentTask prompt={"Here is log output from my app: [paste 30-50 lines]. Give me three grep or pipeline commands that would have surfaced the important lines from a 500,000-line version of this file: one for errors with surrounding context, one to count occurrences by error type, and one to find the first occurrence in a time window."}>
+Test each against the real file. The count-by-type one (`grep -oE … | sort | uniq -c | sort -rn`) is the one you'll reuse most; make sure its regex actually matches your log format rather than a generic one. Check the "first occurrence" command really uses `head`, not `tail` — the first error is the diagnostic one.
+</AgentTask>
+
+<AgentTask prompt={"Set up log rotation for my app's logs at [path], keeping 7 days, compressing old files, with a 100MB size cap, and using copytruncate since my process holds the file open. Then show me how to test the configuration without waiting a day, and how to verify it ran."}>
+Verify with `logrotate --debug` (dry run) before trusting it, then force a real run with `logrotate -f` and check the rotated files appeared. Also ask what happens if the disk is *already* full when rotation runs — a rotation that needs space to compress can fail exactly when you need it. This is the fix that prevents the break-fix.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The six questions, as your mental index:
+
+1. **Where am I / what's here?** `pwd`, `ls -la`, `find`, `which`
+2. **What's in this file?** `less`, `tail -f`, `head`, `grep`, `journalctl`, `docker logs`
+3. **What's running?** `ps aux`, `htop`, `systemctl status`, `docker ps`
+4. **What's it consuming?** `df -h`, `du`, `free -h`, `docker system df`
+5. **Who can do what?** `whoami`, `id`, `chmod`, `chown`
+6. **Can I reach it?** `curl`, `dig`, `nc -zv`, `ss -tlnp`, `lsof -i`
+
+Habits that separate a calm terminal from a panicked one:
+
+- Never `cat` a log; use `less`, `tail`, `grep`, or a time window.
+- Read the **first** error in a window, not the latest.
+- `df -h` then `du` **walking down one level at a time** — don't guess where space went.
+- Truncate open log files (`: > file`), don't `rm` them.
+- Run the read-only version of any command before the destructive one.
+- Save every pipeline you work out during an incident.
+
+What good looks like: given a symptom, you reach for the question first and the command second — and you can answer all six questions on an unfamiliar server without looking anything up.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l03"
+  questions={[
+    {
+      q: "Why is `cat /var/log/app.log` a bad habit on a server?",
+      options: [
+        "It requires root privileges on most systems",
+        "It prints the entire file — destroying scrollback and potentially wedging your session on a large file — when your real question is almost always 'what happened recently' or 'did X happen'",
+        "It locks the file so the application cannot write to it",
+        "It doesn't work on compressed logs"
+      ],
+      answer: 1,
+      explain: "The founder in the story printed a 400MB file twice. The question determines the tool: `tail -f` for now, a time window for recently, `grep` for specific, `less` for reading around."
+    },
+    {
+      q: "What does `grep -oE \"Error: [A-Za-z ]+\" app.log | sort | uniq -c | sort -rn` tell you?",
+      options: [
+        "The first error that occurred in the file",
+        "Which error messages are most frequent, ranked — the 'what is most common here' composition",
+        "Every line containing the word Error, in chronological order",
+        "The total number of errors in the file"
+      ],
+      answer: 1,
+      explain: "`sort | uniq -c | sort -rn` is the most reusable composition in operations: it turns any text into a frequency ranking — error types, URLs, IPs, status codes."
+    },
+    {
+      q: "Your disk is at 100%. What's the correct method to find the cause?",
+      options: [
+        "Run `du -h /` and read the output",
+        "`df -h` to find the full filesystem, then `du --max-depth=1` repeatedly, descending into the largest child each time",
+        "Delete everything in /tmp and /var/cache first, then investigate",
+        "Check `free -h` to see if memory pressure is causing disk writes"
+      ],
+      answer: 1,
+      explain: "`du -h /` prints a million lines and buries the answer. Walking down one level at a time following the biggest child gets you from / to the actual 26GB file in three commands."
+    },
+    {
+      q: "A 26GB log file is filling the disk and the app still has it open. Why is `rm app.log` the wrong move?",
+      options: [
+        "It would crash the application immediately",
+        "The space isn't returned while the process holds the file descriptor — `df` still shows 100%; truncating with `: > file` frees it at once",
+        "It requires stopping the service first, causing downtime",
+        "The file would be recreated instantly at the same size"
+      ],
+      answer: 1,
+      explain: "Deleting removes the directory entry, not the data the open process still references. Truncation keeps the same file descriptor valid and returns the space immediately — a detail that costs people a lot of 3am confusion."
+    },
+    {
+      q: "Why should you learn `grep`, `ps`, `df` and `less` rather than relying on `rg`, `htop` and `ncdu`?",
+      options: [
+        "The modern tools are less reliable",
+        "The boring ones exist on every machine — including a minimal container at 3am where you can't install anything",
+        "They are faster on large files",
+        "The modern tools require root access"
+      ],
+      answer: 1,
+      explain: "Better tools are worth installing where you can. But the failure mode is needing a tool you don't have, on an unfamiliar box, under pressure — so the universal set is what you must actually know."
+    }
+  ]}
+/>
+
+</Section>

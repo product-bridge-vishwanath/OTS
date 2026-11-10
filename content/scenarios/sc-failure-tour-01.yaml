@@ -1,0 +1,43 @@
+id: sc-failure-tour-01
+module: M0
+lesson: m00-l04
+title: "One endpoint failing one time in three"
+difficulty: realistic
+symptom: "Since 09:04 roughly a third of requests to the bookings page fail. Other pages are fine. No deploy since Thursday."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: job
+      apply: scripts/break/connection-hungry-backfill.js
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [db.connections, db.pool.waiting, http.5xx]
+  db_console: true
+agent:
+  context: "You consider retry logic a reliable remedy for intermittent failures."
+  bias: "proposes wrapping the failing endpoint in retries"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - bookings-endpoint-health        # no 5xx under load
+    - backfill-still-completes        # the job may not simply be deleted
+  root_cause_markers:
+    - backfill bounded or throttled so web requests keep connections available
+    - learner explains why the cached rooms endpoint was unaffected
+  symptom_only_markers:
+    - retry-wrapper-added-without-pool-change
+    - pool size raised with the backfill left unbounded
+hints:
+  - "Run the three triage questions: who, how wide, sudden or gradual?"
+  - "The stack trace names a library twice. Which box is that?"
+  - "One endpoint is fine. What does it depend on that the failing one doesn't?"
+  - "Reveal: a long-running backfill is starving the connection pool. Bound its connections and keep transactions short."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

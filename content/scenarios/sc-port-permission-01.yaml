@@ -1,0 +1,45 @@
+id: sc-port-permission-01
+module: M1
+lesson: m01-l04
+title: "Healthy app, 502 from the proxy"
+difficulty: realistic
+symptom: "Every request returns 502. The service is active, the app logs no errors, and curl against localhost returns 200. Uploads were also reported broken earlier in the week."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/bind-localhost-only.patch     # server.listen(PORT, "127.0.0.1")
+    - type: permissions
+      apply: scripts/break/root-owned-uploads.sh         # uploads dir owned by root, app runs as another user
+evidence:
+  logs: true
+  metrics: [http.5xx, proxy.upstream_errors]
+  db_console: false
+  notes: "Learner has both the proxy error log and shell access inside the app container."
+agent:
+  context: "You can read application logs but have not inspected listening sockets."
+  bias: "suggests restarting the proxy and raising its timeouts"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - proxy-reaches-app
+    - uploads-writable-by-app-user
+  root_cause_markers:
+    - listening interface corrected (or proxy target aligned deliberately)
+    - uploads ownership fixed with chown rather than loosened modes
+  symptom_only_markers:
+    - chmod 777 applied to the uploads directory
+    - proxy timeout increased
+    - app run as root to bypass permissions
+hints:
+  - "The app answers on localhost but the proxy gets connection refused. What differs between those two requests?"
+  - "`ss -tlnp` — which interface is it bound to?"
+  - "For uploads: which user is the process, and who owns the directory?"
+  - "Reveal: a localhost-only bind plus a root-owned directory. Both are identity/location mismatches, not code bugs."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

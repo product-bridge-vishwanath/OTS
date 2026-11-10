@@ -30,6 +30,19 @@ const PLATFORM_VOCAB = new Set([
   "anthropic",
 ]);
 
+// Components the MDX renderer provides (components/mdx.tsx). Anything else
+// in a lesson is a typo that would throw at render time, so fail here instead.
+const KNOWN_COMPONENTS = new Set([
+  "Section",
+  "Term",
+  "Reveal",
+  "Evidence",
+  "AgentTask",
+  "Callout",
+  "Quiz",
+  "Operator",
+]);
+
 const REQUIRED_SECTIONS = [
   "story",
   "already-did",
@@ -82,6 +95,29 @@ for (const l of lessons) {
       errors.push(`${l.id}: missing lesson section "${section}"`);
     }
   }
+  // Unknown components throw at render time; catch them here.
+  for (const m of l.content.matchAll(/<([A-Z][A-Za-z0-9]*)[\s/>]/g)) {
+    if (!KNOWN_COMPONENTS.has(m[1])) {
+      errors.push(
+        `${l.id}: unknown component <${m[1]}> — not provided by components/mdx.tsx`
+      );
+    }
+  }
+
+  // Every Section must declare a kind the renderer knows.
+  for (const m of l.content.matchAll(/<Section\s+kind="([^"]+)"/g)) {
+    if (!REQUIRED_SECTIONS.includes(m[1])) {
+      errors.push(`${l.id}: <Section kind="${m[1]}"> is not a known section kind`);
+    }
+  }
+
+  // Quizzes must be bound to their own lesson, or progress records the wrong one.
+  for (const m of l.content.matchAll(/<Quiz\s+lessonId="([^"]+)"/g)) {
+    if (m[1] !== l.id) {
+      errors.push(`${l.id}: <Quiz lessonId="${m[1]}"> does not match this lesson's id`);
+    }
+  }
+
   const expectedModulePrefix = `m${l.module.slice(1).padStart(2, "0")}-`;
   if (!l.id.startsWith(expectedModulePrefix)) {
     errors.push(`${l.id}: id does not match module ${l.module}`);

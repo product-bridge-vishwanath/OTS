@@ -1,0 +1,44 @@
+id: sc-env-undefined-01
+module: M1
+lesson: m01-l05
+title: "The nightly report is always zero"
+difficulty: hard
+symptom: "The report job writes a row every night, but revenue is always $0.00. The admin dashboard shows the correct numbers from the same database."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/worker-timezone-split.sh   # TZ set on the worker only
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [report.rows_written, report.revenue_total]
+  db_console: true
+agent:
+  context: "You added the worker timezone setting to make report timestamps match the studio's local day."
+  bias: "looks for a bug in the aggregate SQL rather than comparing the two services' environments"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - report-matches-dashboard         # same day, same numbers
+    - report-day-unique                # one row per day
+  root_cause_markers:
+    - timezone divergence between services identified
+    - processes and database aligned on UTC internally
+    - target day passed explicitly rather than relying on CURRENT_DATE at call time
+  symptom_only_markers:
+    - query rewritten with an interval offset to compensate for the skew
+    - report time shifted without removing the divergence
+hints:
+  - "Nothing is undefined and the SQL is right. Compare the two services' environments line by line."
+  - "Run `date` inside each service and `SELECT now()` in the database. Do they agree?"
+  - "Who evaluates CURRENT_DATE — the worker or Postgres? And at what moment does the worker ask?"
+  - "Reveal: TZ on the worker only means it asks for 'today' when the database has already rolled over. Standardise on UTC and pass the day explicitly."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

@@ -1,0 +1,47 @@
+id: sc-serverless-shape-01
+module: M1
+lesson: m01-l01
+title: "Three symptoms, one shape change"
+difficulty: hard
+symptom: "After moving hosts, uploads over 5MB fail, data exports never arrive, and users are randomly logged out. The database provider is warning about connection limits."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: platform
+      apply: scripts/break/simulate-per-request-shape.sh   # multiple instances, no shared memory, frozen after response
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [db.connections, http.4xx, http.5xx]
+  db_console: true
+  notes: "Learner can see instance identifiers in log lines, which is how the multi-instance behaviour becomes observable."
+agent:
+  context: "You performed this host migration and consider it complete and correct."
+  bias: "treats the three symptoms as three unrelated bugs"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - sessions-survive-instance-change
+    - export-work-completes
+    - db-connections-bounded
+  root_cause_markers:
+    - learner identifies one shared cause (per-request shape) rather than three bugs
+    - session state moved out of process memory
+    - deferred work moved to a process that outlives the request
+    - connection pooling addressed for many short-lived instances
+  symptom_only_markers:
+    - session TTL extended without moving the store
+    - export timeout raised with fire-and-forget retained
+hints:
+  - "Three symptoms appeared at once after one change. What single property changed?"
+  - "What does module-level state mean when several instances serve requests?"
+  - "What happens to work that was started but not awaited when a function returns?"
+  - "Reveal: the code assumed a long-running process. Move state to Redis, deferred work to a worker, and pool connections."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

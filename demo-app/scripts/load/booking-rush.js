@@ -1,7 +1,7 @@
 // Double-booking drill (M7.2): 15 customers try to book the SAME slot at the
 // same moment. A correct system lets exactly one win.
 //   node scripts/load/booking-rush.js
-const APP = process.env.APP_URL ?? "http://localhost:3000";
+const APP = process.env.APP_URL ?? "http://localhost:3001";
 
 async function main() {
   const date = new Date(Date.now() + 86400000 * 7).toISOString().slice(0, 10);

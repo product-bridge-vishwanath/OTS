@@ -1,0 +1,432 @@
+---
+id: m01-l05
+module: M1
+title: "Environment variables: why it's undefined in production"
+order: 5
+difficulty: 2
+depth: both
+platforms: [vercel, render, railway, docker, github-actions]
+concepts: [env-vars, config, secrets]
+prerequisites: [m01-l01]
+lab: demo-repo
+scenario_ids: [sc-env-undefined-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder shipped a Stripe integration on a Thursday. It worked perfectly in development. In production, the checkout button produced a blank error page.
+
+He pasted the error to his agent, which observed that `process.env.STRIPE_SECRET_KEY` was `undefined` and suggested adding it to `.env`. It was already in `.env`. He added it again. Redeployed. Still undefined.
+
+Four hours later he discovered three separate things, each individually sufficient to cause it: `.env` was in `.gitignore` (correctly) so it had never reached the server; the platform dashboard had the variable spelled `STRIPE_SECRET` (set six weeks earlier for a different attempt); and the value in his local `.env` was a **test** key, so even when he finally fixed the name, live charges failed with a different error entirely.
+
+The code was never wrong. The code read one name, and three different environments had three different ideas of what that name was and what it held.
+
+</Section>
+
+<Section kind="already-did">
+
+You have done every part of this. Copied `.env.example` to `.env` on day one. Pasted keys into a Vercel or Render dashboard. Added `.env` to `.gitignore` because an agent or a linter told you to. Seen something work locally and be `undefined` in production, and fixed it by trial and error without quite knowing which attempt worked.
+
+What you may not have is the **precedence model**: when the same variable name exists in a `.env` file, your shell, a Docker compose file, a platform dashboard and a CI secret, exactly one value wins, and which one depends on rules you can learn in ten minutes. Everything frustrating about environment variables is a precedence question wearing a disguise.
+
+</Section>
+
+<Section kind="mental-model">
+
+An environment variable is a **string handed to a process when it starts**. That sentence contains all three of the things that trip people up:
+
+1. **A string.** There are no types. `PORT=3000` is `"3000"`. `DEBUG=false` is `"false"`, which is truthy in JavaScript.
+2. **Handed to a process.** Not to your project, not to your repo — to one running process. A different process (your worker, your cron, your CI job) gets its own set.
+3. **When it starts.** Changing a value does nothing to a running process. **Every env change requires a restart or redeploy.** This single fact explains an enormous share of "I set it and nothing happened".
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Environment variable sources ranked by precedence: real process environment beats dotenv file values, and each environment has its own separate source of truth" className="diagram">
+  <defs>
+    <marker id="arre" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <text x="12" y="20" className="sub">WHO SETS THE VALUE — highest precedence at the top (typical setup)</text>
+
+  <rect x="8" y="30" width="520" height="40" rx="8" />
+  <text x="24" y="55" className="sub">1 · Set inline on the command: PORT=4000 npm start</text>
+
+  <rect x="8" y="78" width="520" height="40" rx="8" />
+  <text x="24" y="103" className="sub">2 · Exported in the shell / systemd unit / Dockerfile ENV / compose environment</text>
+
+  <rect x="8" y="126" width="520" height="40" rx="8" />
+  <text x="24" y="151" className="sub">3 · Platform dashboard (Vercel, Render, Railway) — becomes the real env at boot</text>
+
+  <rect x="8" y="174" width="520" height="40" rx="8" />
+  <text x="24" y="199" className="sub">4 · .env file, loaded by dotenv/framework — usually does NOT override 1–3</text>
+
+  <rect x="8" y="222" width="520" height="40" rx="8" />
+  <text x="24" y="247" className="sub">5 · Defaults in your code: process.env.PORT ?? 3000</text>
+
+  <rect x="556" y="30" width="216" height="232" rx="10" />
+  <text x="664" y="56" textAnchor="middle">Each environment</text>
+  <text x="664" y="76" textAnchor="middle" className="sub">is a SEPARATE list</text>
+  <text x="664" y="104" textAnchor="middle" className="sub">your laptop</text>
+  <text x="664" y="124" textAnchor="middle" className="sub">CI runner</text>
+  <text x="664" y="144" textAnchor="middle" className="sub">preview deploy</text>
+  <text x="664" y="164" textAnchor="middle" className="sub">production web</text>
+  <text x="664" y="184" textAnchor="middle" className="sub">production worker</text>
+  <text x="664" y="212" textAnchor="middle" className="sub">A value set in one</text>
+  <text x="664" y="230" textAnchor="middle" className="sub">is absent in the rest</text>
+
+  <path d="M 532 146 L 552 146" className="arrow" markerEnd="url(#arre)" />
+</svg>
+
+### The rule that resolves most confusion
+
+**`.env` files are a development convenience, not a deployment mechanism.** They are read by a library (`dotenv`) or your framework *inside your process*, and by convention they do not overwrite variables that already exist in the real environment. They're also gitignored, which means they do not travel. On a server or a PaaS, the real environment comes from the platform, the systemd unit, or the container definition — never from a `.env` file you forgot you had.
+
+### The five environments you actually have
+
+Each is a separate list, and a variable set in one is simply absent in the others:
+
+| Environment | Where its values live | Common trap |
+|---|---|---|
+| Your laptop | `.env`, your shell | Works here, nowhere else |
+| CI (tests/build) | GitHub Actions secrets/vars | Missing secret becomes **empty string**, not an error |
+| Preview / staging deploys | Platform, per-environment scope | Variable set for "production" only, so previews break |
+| Production web | Platform dashboard, systemd unit | The one people remember |
+| Production worker / cron | **Its own** service settings | The one people forget — M0's silent cron failures live here |
+
+<Callout type="warn">
+**Build time vs run time** is the trap unique to frontend frameworks. In Next.js, `NEXT_PUBLIC_*` variables are **baked into the JavaScript bundle at build time** — changing them in the dashboard does nothing until you rebuild, and anything in them is **publicly visible to every visitor**. Non-prefixed variables are read at runtime on the server only. Putting a secret in a `NEXT_PUBLIC_` variable publishes it; this is one of the most common real-world key leaks (M10.3).
+</Callout>
+
+### Why it's `undefined` in production: the checklist in causal order
+
+1. **Not set in that environment at all** — set locally, never in the platform.
+2. **Set in the wrong scope** — production only, while you're testing a preview deploy.
+3. **Set on the wrong service** — the web app has it; the worker doesn't.
+4. **Name mismatch** — `STRIPE_SECRET` vs `STRIPE_SECRET_KEY`. Compare machine-to-machine, not by eye.
+5. **Not restarted** — set correctly, process still running with the old environment.
+6. **Needed at build time** but set after the build (the `NEXT_PUBLIC_` case).
+7. **Value has stray whitespace or quotes** — `KEY="abc"` sometimes yields literal quotes; a trailing newline from a copy-paste breaks an API key in ways that look like "invalid credentials".
+
+### Config, secrets, and the line between them
+
+| Kind | Example | Where it belongs |
+|---|---|---|
+| Config | `PORT`, `LOG_LEVEL`, `REPORT_EVERY_MINUTES` | Env var, safe to commit in `.env.example` |
+| Secret | `DATABASE_URL`, API keys, signing keys | Env var from a secret store; **never** in git |
+| Feature flag | "is checkout v2 on?" | A flag service or database row — because you'll want to change it *without a deploy* |
+
+The practical test for the third row: if you'd need to flip it during an incident, an env var is the wrong home — flipping it means a redeploy. (M14.2 uses flags as kill switches for exactly this reason.)
+
+<Operator>
+
+The core skill is seeing what a **running process** actually received, which is often not what you set.
+
+```bash
+# ── Ground truth: what did THIS process get? ──────────────────────────
+#   Linux, by PID — the definitive answer:
+sudo tr '\0' '\n' < /proc/$(pgrep -f "node.*server.js" | head -1)/environ | sort
+#   Containers:
+docker compose exec app env | sort
+docker compose exec worker env | sort            # compare the two services!
+#   Platform:
+vercel env ls                                    # names + scopes, not values
+railway variables
+
+# ── Compare what the code NEEDS against what exists ───────────────────
+grep -rhoE "process\.env\.[A-Z0-9_]+" --include="*.ts" --include="*.tsx" --include="*.js" . \
+  2>/dev/null | sed 's/process\.env\.//' | sort -u > /tmp/needed.txt
+docker compose exec -T app env | cut -d= -f1 | sort -u > /tmp/have.txt
+comm -23 /tmp/needed.txt /tmp/have.txt           # NEEDED BUT MISSING  ← the bug
+comm -13 /tmp/needed.txt /tmp/have.txt           # set but unused (dead config)
+
+# ── Catch name mismatches without trusting your eyes ──────────────────
+diff <(grep -oE "^[A-Z0-9_]+" .env.example | sort) <(vercel env ls 2>/dev/null | awk '{print $1}' | sort)
+
+# ── Catch whitespace and quote damage (invisible, breaks API keys) ─────
+docker compose exec -T app sh -c 'printf "%s" "$DATABASE_URL" | wc -c'   # length check
+docker compose exec -T app sh -c 'printf "%s" "$DATABASE_URL" | od -c | tail -2'
+#   Look for \n or literal " at the end. A trailing newline reads as an invalid key.
+
+# ── Prove the restart requirement to yourself ─────────────────────────
+docker compose exec app printenv POOL_MAX        # current value
+#   edit compose.yaml → POOL_MAX: "20"
+docker compose exec app printenv POOL_MAX        # UNCHANGED — still the old process
+docker compose up -d app                         # recreate the container
+docker compose exec app printenv POOL_MAX        # now it's 20
+
+# ── Never print secrets to a shared terminal or a log ─────────────────
+docker compose exec app env | sed -E 's/(KEY|SECRET|TOKEN|PASSWORD|URL)=.*/\1=<redacted>/'
+#   Length + first 4 chars is usually enough to identify a key safely:
+docker compose exec -T app sh -c 'echo "${ANTHROPIC_API_KEY:0:7}… (${#ANTHROPIC_API_KEY} chars)"'
+```
+
+`comm -23 needed have` is the highest-value command in this lesson: it's the mechanical version of "which variable am I missing?", and it beats reading two lists by eye every time.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool | Note |
+|---|---|---|
+| Local development | `.env` + `dotenv` / framework support | Gitignored; `.env.example` committed as the contract |
+| Platform config | Vercel / Render / Railway dashboards | Per-environment scopes; **restart required** |
+| Shared team secrets | Doppler, 1Password, Infisical | Solves "the new hire can't run the app" |
+| Cloud-native secrets | AWS Secrets Manager, SSM, GCP Secret Manager, Vault | Audit trail, rotation, IAM-scoped |
+| CI | GitHub Actions secrets + variables | Missing → **empty string** (see L1.2's break-fix) |
+| Validation at boot | `zod`, `envalid`, or 10 lines of your own | The highest-return item here |
+| Leak detection | `gitleaks`, GitHub push protection | Catches `.env` committed by accident |
+
+**Boot-time validation is the single best investment in this lesson.** Ten lines turn a scattered, mid-traffic, hours-later mystery into an unmissable startup failure that names the variable:
+
+```ts
+// lib/env.ts — imported once, at the top of your entry point
+const required = ["DATABASE_URL", "REDIS_URL", "STRIPE_SECRET_KEY"] as const;
+const missing = required.filter((k) => !process.env[k]?.trim());
+if (missing.length) {
+  console.error(`FATAL: missing required env vars: ${missing.join(", ")}`);
+  process.exit(1);
+}
+```
+
+Note `?.trim()` — it catches the empty-string case that CI and typo'd secret names produce, which a plain truthiness check misses.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **See the real environment of two different services** and notice they differ:
+   ```bash
+   docker compose exec app env | grep -iE "url|pool" | sort
+   docker compose exec worker env | grep -iE "url|pool|report" | sort
+   ```
+   The worker has `REPORT_EVERY_MINUTES` and no `REDIS_URL`; the app is the reverse. Two processes, two environments — this is why "I set the variable" is an incomplete sentence.
+
+2. **Prove the restart requirement.** Change `POOL_MAX` in `compose.yaml` to `"20"`, then:
+   ```bash
+   docker compose exec app printenv POOL_MAX     # still 10 — old process
+   docker compose up -d app
+   docker compose exec app printenv POOL_MAX     # 20
+   ```
+
+3. **Break it the way production breaks.** Comment out `DATABASE_URL` in the app's compose environment and recreate it:
+   ```bash
+   docker compose up -d app
+   curl -s localhost:3001/api/health | python3 -m json.tool
+   docker compose logs --tail 20 app
+   ```
+   Notice *where* it failed: the app started fine and failed later, at request time, with a connection error pointing at `localhost` (the code's fallback). That's the diagnostic distance a boot-time check removes. Restore the variable and recreate.
+
+4. **Run the missing-variable audit** on the demo app:
+   ```bash
+   grep -rhoE "process\.env\.[A-Z0-9_]+" --include="*.ts" app/ lib/ | sed 's/process\.env\.//' | sort -u
+   docker compose exec -T app env | cut -d= -f1 | sort -u
+   ```
+   Which names does the code read that the environment doesn't define? (`ANTHROPIC_API_KEY` and `LLM_MODEL` — both deliberately optional, with code that degrades. Check `app/api/assistant/route.ts` to see how a *deliberately* optional variable should be handled.)
+
+5. **Add boot-time validation** to the demo app using the snippet above, then start it with `DATABASE_URL` removed. You want the process to refuse to start with one clear line. Compare that experience to step 3.
+
+Then on your own product: run the `comm -23` audit between what your code reads and what production actually sets.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** The report worker has been writing *empty* reports for nine days — the row appears nightly, but revenue is always `$0.00`. The web app is completely fine: the same numbers render correctly on the admin dashboard.
+
+<Evidence title="the data">
+
+```text
+$ docker compose exec -T db psql -U ots -d demo -c \
+   "SELECT day, body FROM reports ORDER BY day DESC LIMIT 3;"
+    day     |                      body
+------------+------------------------------------------------
+ 2026-11-07 | Bookings today: 0. Projected revenue: $0.00.
+ 2026-11-06 | Bookings today: 0. Projected revenue: $0.00.
+ 2026-11-05 | Bookings today: 0. Projected revenue: $0.00.
+
+Admin dashboard (same day): 14 bookings, $3,480 projected.
+```
+
+</Evidence>
+
+<Evidence title="the two environments">
+
+```text
+$ docker compose exec app env | grep -E "DATABASE_URL|TZ"
+DATABASE_URL=postgres://ots:ots@db:5432/demo
+
+$ docker compose exec worker env | grep -E "DATABASE_URL|TZ"
+DATABASE_URL=postgres://ots:ots@db:5432/demo
+TZ=America/Los_Angeles
+
+$ docker compose exec worker date
+Fri Nov  7 17:12:40 PST 2026
+$ docker compose exec app date
+Sat Nov  8 01:12:41 UTC 2026
+$ docker compose exec db psql -U ots -d demo -c "SELECT now(), current_date;"
+              now              | current_date
+-------------------------------+--------------
+ 2026-11-08 01:12:42.113+00    | 2026-11-08
+```
+
+</Evidence>
+
+<Evidence title="the worker's query and the deploy history">
+
+```text
+worker/cron.js:
+  WHERE b.date = CURRENT_DATE          -- evaluated by Postgres
+  INSERT INTO reports (day, body) VALUES (CURRENT_DATE, $1)
+
+$ git log --oneline -3 -- demo-app/compose.yaml
+b7723f1 fix: set worker timezone so report timestamps match the studio's local day
+...
+(deployed 9 days ago)
+```
+
+</Evidence>
+
+Both processes have an identical `DATABASE_URL` and the query is correct. What's wrong?
+
+<Reveal label="Reveal the cause">
+
+**A `TZ` environment variable set on one service created a timezone split — and the report now runs during the *previous* day in the database's reckoning.**
+
+Commit `b7723f1` added `TZ=America/Los_Angeles` to the worker (and only the worker) nine days ago, with a reasonable-sounding motive. Trace the consequence:
+
+- The worker fires its interval at what it believes is a sensible hour, e.g. 17:00 **PST** on Nov 7.
+- That same instant is **01:12 UTC on Nov 8** for Postgres, whose `CURRENT_DATE` is therefore `2026-11-08`.
+- `WHERE b.date = CURRENT_DATE` matches bookings dated Nov 8 — of which there are none yet, because Nov 8 has barely begun in UTC.
+- It writes a row for `day = 2026-11-08` containing zeros, and nobody ever sees a row for the day that actually had the bookings.
+
+The admin dashboard is unaffected because the app has no `TZ` override, runs in UTC like the database, and asks the same question at a consistent moment.
+
+**Why this is so hard to spot:** nothing is `undefined`, nothing errors, the `DATABASE_URL`s are identical, the SQL is correct, and a row *is* produced every night. The failure is entirely in the **difference between two environments** — exactly the thing a single-environment mental model cannot represent. Note also that `CURRENT_DATE` is evaluated by Postgres, not by Node, so the worker's `TZ` doesn't change the query's reference point; it only changes *when* the worker chooses to ask, which is the subtle half.
+
+**The fix, in order:**
+1. **Remove `TZ` from the worker** so every process and the database agree on UTC. Uniform UTC internally is the rule (M7.10); convert to local time only when *displaying* to humans.
+2. **Make the query's day explicit** rather than relying on whatever "today" means at call time: pass the target date in as a parameter the job computes deliberately, e.g. "the day that just ended in the studio's timezone", and use `WHERE b.date = $1`.
+3. **Add a `UNIQUE(day)` constraint** on `reports` — then this bug would have surfaced as a visible conflict rather than silently writing a second, wrong row for a new day. (That's planted anti-pattern AP7 in the demo app; M7.8 fixes it properly.)
+4. Backfill the nine missing days, once, deliberately.
+
+**The transferable rule:** environment variables are **per-process**, and a variable set on one service and not another is a *divergence* you have to reason about, not a setting you've applied. When you add a variable, ask which of your five environments and which of your services need it — and whether the ones that don't need it will now behave differently from the ones that do.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit environment variables in this repo: list every name the code reads (grep process.env / os.environ), cross-reference against .env.example, and tell me which names are read but undocumented, documented but unused, or read in only one service. Flag any NEXT_PUBLIC_ (or other client-exposed) variable that looks like a secret. Print names only — never values."}>
+The "read in only one service" group is where the break-fix lived. Verify the client-exposed flags by searching your built bundle for the value — `grep -r "sk_" .next/static/` finding anything is an emergency (rotate immediately, M4.1). "Names only" keeps secrets out of your terminal scrollback.
+</AgentTask>
+
+<AgentTask prompt={"Add fail-fast env validation to this app: on startup, verify every required variable is present AND non-empty after trimming, print all missing names at once in a single clear line, and exit non-zero. Include DATABASE_URL format validation. Then show me the exact output when two variables are missing."}>
+Test it by actually removing two variables and starting the app. You want one line naming both, and a non-zero exit — not a stack trace, and not a successful boot that fails later at request time. Check it reports *all* missing names at once; validating one at a time means several restart cycles to discover them.
+</AgentTask>
+
+<AgentTask prompt={"I set [VARIABLE] in my platform dashboard and my app still reads it as undefined. Walk the precedence chain for my setup: which environment and scope did I set it in, is this a build-time or runtime variable, which service needs it, and has the process restarted since? Tell me how to inspect what the running process actually received."}>
+The answer you want is a specific place to look, not a list of possibilities. Confirm with ground truth yourself: `/proc/<pid>/environ` on a VPS, or `docker compose exec app env`. If the variable is build-time (`NEXT_PUBLIC_*`), the only fix is a rebuild — no amount of restarting helps.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+When a variable is "not working", check in this order:
+
+1. Which **environment**? (laptop, CI, preview, production web, production worker)
+2. Which **service**? Every process has its own list.
+3. Is the **name** identical? Compare mechanically, not by eye.
+4. Has the process **restarted** since you set it?
+5. Is it needed at **build time** rather than run time?
+6. Any **whitespace, quotes or trailing newline** in the value?
+7. Is the value from the **right environment** (test key vs live key)?
+
+Standing practice:
+
+- `.env.example` committed, listing every name with a safe placeholder — it's the contract.
+- `.env` gitignored, always, and `chmod 600` on servers.
+- Boot-time validation that names all missing variables and exits non-zero.
+- Secrets never in `NEXT_PUBLIC_`/client-exposed variables.
+- A different key per environment, so a leaked staging key can't touch production.
+- Anything you'd flip during an incident lives in a flag service, not an env var.
+
+What good looks like: a missing variable stops the deploy with a clear message instead of producing `undefined` three layers deep at request time.
+
+Red flags: a `.env` file on a production server; the same API key in development and production; `NEXT_PUBLIC_` on anything secret; "I set it but nothing changed" (you didn't restart).
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m01-l05"
+  questions={[
+    {
+      q: "You update a variable in your platform dashboard. The app still reports the old value. Why?",
+      options: [
+        "The dashboard caches values for a few minutes",
+        "Environment variables are handed to a process when it starts — the running process still holds the old set until it restarts or redeploys",
+        "The variable was set in the wrong scope",
+        "Platform variables require a cache purge"
+      ],
+      answer: 1,
+      explain: "'Handed to a process at start' is the whole model. Every env change needs a restart, and this one fact explains a large share of 'I set it and nothing happened'."
+    },
+    {
+      q: "Why can't you deploy configuration by putting values in a `.env` file?",
+      options: [
+        "`.env` files only support strings",
+        "They're gitignored so they don't travel, and they're read by a library inside your process — the real environment on a server comes from the platform, systemd unit or container definition",
+        "`.env` files are only read in development mode",
+        "They must be encrypted before deployment"
+      ],
+      answer: 1,
+      explain: "`.env` is a development convenience. By convention dotenv also won't override variables that already exist in the real environment, which is why a stale `.env` on a server can be quietly ignored — or quietly win, depending on configuration."
+    },
+    {
+      q: "What's dangerous about putting a secret in a NEXT_PUBLIC_ variable?",
+      options: [
+        "It will be undefined on the server",
+        "It's baked into the browser bundle at build time, so every visitor can read it — and changing it in the dashboard does nothing until you rebuild",
+        "It can only be read during the build",
+        "It gets logged by the platform"
+      ],
+      answer: 1,
+      explain: "Client-exposed prefixes publish the value to every visitor. It's one of the most common real key leaks — and worth grepping your built bundle for key prefixes to confirm you haven't done it."
+    },
+    {
+      q: "In the break-fix, both services had an identical DATABASE_URL and the SQL was correct. What caused empty reports?",
+      options: [
+        "The worker's database connection was pointing at a replica",
+        "A TZ variable set on the worker only, so it asked for 'today' at a moment when the database's CURRENT_DATE had already rolled to the next day",
+        "The worker lacked REDIS_URL so it couldn't read cached totals",
+        "CURRENT_DATE was evaluated in Node rather than Postgres"
+      ],
+      answer: 1,
+      explain: "Env vars are per-process, so a variable on one service is a divergence between environments. Nothing was undefined and nothing errored — the bug lived entirely in the difference between two processes' environments."
+    },
+    {
+      q: "Why should required-variable validation check for empty strings, not just missing keys?",
+      options: [
+        "Empty strings are converted to the string \"undefined\"",
+        "Secrets systems substitute an empty value for a missing or misnamed secret — so a typo produces a present-but-empty variable that passes a truthiness check",
+        "Empty strings consume memory in the environment block",
+        "Platforms trim values automatically"
+      ],
+      answer: 1,
+      explain: "That's L1.2's break-fix: a renamed CI secret became an empty key file and failed as a misleading authentication error. `?.trim()` catches it at boot with the variable's name."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,330 @@
+---
+id: m00-l01
+module: M0
+title: "The request journey: what happens when someone opens your app"
+order: 1
+difficulty: 1
+depth: both
+platforms: [vercel, cloudflare, postgres, redis]
+concepts: [request-journey, layer-isolation]
+prerequisites: []
+lab: demo-repo
+scenario_ids: [sc-request-journey-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder's app went down for 40 minutes. She had shipped nothing that day. Her agent, shown the error page, suggested redeploying — twice. Both deploys succeeded. The site stayed broken.
+
+What had actually happened: her domain registrar had sent a renewal-of-contact-details email 30 days earlier. Unverified, the domain was suspended. <Term k="dns">DNS</Term> stopped resolving her name to an address. Her app — healthy, running, logging nothing unusual, serving requests fine to anyone who typed its raw IP — was never involved.
+
+She spent 40 minutes debugging the last box in the chain because it was the only box she knew existed.
+
+That's the real cost of not having the map: **you can only look where you know how to look.** Every incident becomes a search of the one or two places you understand, no matter where the problem actually is.
+
+</Section>
+
+<Section kind="already-did">
+
+You have typed a URL into a browser roughly a hundred thousand times. You have also, by now, deployed an app and watched a URL start working. Between those two facts sits a chain of six or seven distinct systems — and following an agent's instructions, you have configured most of them without being told that's what you were doing.
+
+"Add an A record pointing to this IP." That was DNS. "Enable the proxy toggle in Cloudflare." That was a <Term k="cdn">CDN</Term> and <Term k="reverse-proxy">reverse proxy</Term>. "Your app needs to listen on `process.env.PORT`." That was the platform's load balancer telling your app where to be. "Add `DATABASE_URL` to your environment variables." That was the hop from app to database.
+
+You built the chain. This lesson names it, so that next time something breaks you can ask *which hop* rather than *what's wrong with my app*.
+
+</Section>
+
+<Section kind="mental-model">
+
+One request. Seven hops. Each one can fail independently, and each one fails in its own recognisable way.
+
+<svg viewBox="0 0 780 300" role="img" aria-label="The request journey: browser to DNS to CDN to load balancer, down to app server, then cache and database, with the response travelling back up the same chain" className="diagram">
+  <defs>
+    <marker id="arrj" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="8" y="16" width="170" height="60" rx="10" />
+  <text x="93" y="42" textAnchor="middle">1 · Your browser</text>
+  <text x="93" y="61" textAnchor="middle" className="sub">asks for a URL</text>
+
+  <rect x="203" y="16" width="170" height="60" rx="10" />
+  <text x="288" y="42" textAnchor="middle">2 · DNS</text>
+  <text x="288" y="61" textAnchor="middle" className="sub">name → IP address</text>
+
+  <rect x="398" y="16" width="170" height="60" rx="10" />
+  <text x="483" y="42" textAnchor="middle">3 · CDN / edge</text>
+  <text x="483" y="61" textAnchor="middle" className="sub">cached? answer now</text>
+
+  <rect x="593" y="16" width="170" height="60" rx="10" />
+  <text x="678" y="42" textAnchor="middle">4 · Load balancer</text>
+  <text x="678" y="61" textAnchor="middle" className="sub">picks a healthy instance</text>
+
+  <rect x="593" y="130" width="170" height="60" rx="10" />
+  <text x="678" y="156" textAnchor="middle">5 · App server</text>
+  <text x="678" y="175" textAnchor="middle" className="sub">your code finally runs</text>
+
+  <rect x="398" y="130" width="170" height="60" rx="10" />
+  <text x="483" y="156" textAnchor="middle">6 · Cache</text>
+  <text x="483" y="175" textAnchor="middle" className="sub">answered this recently?</text>
+
+  <rect x="203" y="130" width="170" height="60" rx="10" />
+  <text x="288" y="156" textAnchor="middle">7 · Database</text>
+  <text x="288" y="175" textAnchor="middle" className="sub">the authoritative answer</text>
+
+  <path d="M 178 46 L 199 46" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 373 46 L 394 46" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 568 46 L 589 46" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 678 76 L 678 126" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 589 160 L 573 160" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 394 160 L 378 160" className="arrow" markerEnd="url(#arrj)" />
+  <path d="M 288 190 L 288 252 L 93 252 L 93 80" className="arrow" markerEnd="url(#arrj)" />
+  <text x="318" y="257" className="sub">the response travels back up the same chain</text>
+</svg>
+
+**The analogy.** Ordering a part for your car. You look up the supplier's address (DNS). You call the local branch, which may have it on the shelf (CDN). If not, reception routes you to whichever salesperson is free (load balancer). That person checks the desk drawer (cache) before walking to the warehouse (database). Any link can break: wrong address, branch closed, nobody answers the phone, warehouse locked. "The part didn't arrive" is not a diagnosis — it's the starting point.
+
+### What each hop does, and how it fails
+
+| # | Hop | Its one job | Classic failure | What you'd see |
+|---|-----|-------------|-----------------|----------------|
+| 1 | Browser | Run your frontend, send requests | JavaScript error before any request leaves | Console error, **no request** in the network tab |
+| 2 | <Term k="dns">DNS</Term> | Turn `yourapp.com` into an IP | Record wrong, expired, or domain suspended | "Server not found"; `dig` returns nothing or an old IP |
+| 3 | <Term k="cdn">CDN</Term> / edge | Serve cached copies close to users | Serving stale content; <Term k="tls">TLS</Term> cert expired | Old prices after a deploy; certificate warnings |
+| 4 | <Term k="load-balancer">Load balancer</Term> / proxy | Route to a healthy instance | No healthy instance to route to | <Term k="five-oh-two">502</Term> / 503 / 504 from the platform |
+| 5 | App server | Run your code | Unhandled exception, crash, <Term k="oom">OOM</Term> | 500 with a <Term k="stack-trace">stack trace</Term> in your logs |
+| 6 | <Term k="cache">Cache</Term> | Return recent answers fast | Stale data; cache down | Wrong-but-plausible data; sudden load on the DB |
+| 7 | Database | Hold the truth | Connections exhausted, slow query, locked rows | 500s or timeouts, with DB errors in app logs |
+
+<Callout type="key">
+The single most useful question in any incident is not "what's broken?" — it's **"how far did the request get?"** Each hop that demonstrably worked eliminates everything before it. That's the whole technique; the rest is knowing the hops.
+</Callout>
+
+### Not every app has every hop
+
+Your product probably skips some. A Vercel-hosted Next.js app with Supabase has hops 1, 2, 3, 4 (invisible, Vercel's), 5, and 7 — no Redis, so no hop 6. A VPS running Node behind Nginx has 1, 2, 5 and 7, with Nginx as a local version of 4, and no CDN unless you added Cloudflare.
+
+Missing hops matter as much as present ones. No cache means every read hits the database. No CDN means every image comes from your one server. No load balancer means one instance is the whole service.
+
+<Operator>
+
+Walk the chain yourself, one hop at a time. Each command proves one hop works, which is how you isolate a layer without guessing.
+
+```bash
+# Hop 2 — does the name resolve, and to what?
+dig +short yourapp.com
+dig +short yourapp.com @1.1.1.1    # compare resolvers; mismatch = propagation/TTL
+
+# Hop 3+4 — does the edge answer, and who served it?
+curl -sI https://yourapp.com | grep -iE "^(http|server|cf-cache-status|x-vercel|age)"
+
+# Hop 3 — is TLS valid, and for how much longer?
+echo | openssl s_client -connect yourapp.com:443 2>/dev/null \
+  | openssl x509 -noout -subject -dates
+
+# Hops 1-5 timing breakdown — where do the milliseconds go?
+curl -s -o /dev/null -w "dns:%{time_namelookup}s tls:%{time_appconnect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  https://yourapp.com/
+
+# Hop 5 — bypass the edge entirely and ask the app directly
+#   (from the server, or with the platform's internal URL)
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/api/health
+
+# Hops 6+7 — can the app reach its own dependencies?
+#   The demo app's health endpoint checks both and names which one failed.
+curl -s http://localhost:3001/api/health | python3 -m json.tool
+```
+
+Read `time_namelookup` vs `time_starttransfer` carefully: 2 seconds in DNS and 2 seconds waiting for the first byte are completely different problems, and the user experiences both as "slow".
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+Each hop has tools that make it visible. You don't need all of them; you need to know which one answers which question.
+
+| Hop | Who provides it | How you inspect it | Zero-setup option |
+|---|---|---|---|
+| DNS | Registrar / Cloudflare / Route 53 | `dig`, `nslookup`, registrar dashboard | `dig +short yourapp.com` |
+| CDN / edge | Cloudflare, platform edge, CloudFront | Response headers (`cf-cache-status`, `age`) | `curl -I` |
+| Load balancer | Your PaaS, ALB, Nginx | Platform dashboard, instance health page | Platform's "deployments / instances" tab |
+| App | You | Logs, error tracker, <Term k="health-check">health check</Term> | Platform log tab |
+| Cache | Upstash, ElastiCache, your own Redis | `redis-cli`, provider dashboard | `redis-cli ping` |
+| Database | Supabase / Neon / RDS | SQL console, `pg_stat_activity` | Provider's SQL editor |
+
+What good looks like: for your own product you can name, right now, who provides each hop and where its dashboard is. If you can't name the provider for a hop, that hop is a blind spot — and blind spots are where 40-minute outages live.
+
+</Section>
+
+<Section kind="hands-on">
+
+The demo app (`/demo-app`) is a complete chain you can walk end to end in ten minutes.
+
+```bash
+cd demo-app
+docker compose up -d --build
+```
+
+Now trace a single request through every hop:
+
+1. **Hop 5 — the app.** `curl -s localhost:3001/api/health | python3 -m json.tool`. This reports hops 6 and 7 too (Redis and Postgres). Note that it names *which* dependency failed, if any — that's deliberate design, and you'll copy it in M8.
+2. **Hop 6 — the cache.** `curl -s localhost:3001/api/rooms` twice. The first says `"cache":"miss"`, the second `"cache":"hit"`. You just watched hop 6 do its job.
+3. **Hop 7 — the database.** `docker compose exec db psql -U ots -d demo -c "SELECT count(*) FROM bookings;"` — the authoritative answer, with no app involved.
+4. **Break hop 6 and watch the chain degrade.** `docker compose stop cache`, then load the homepage. It still works — the app falls through to the database. Check `docker compose logs app | grep redis` to see the failure it absorbed. Then `docker compose start cache`.
+5. **Break hop 7 and watch it fail.** `docker compose stop db`, reload the homepage, then `curl -s localhost:3001/api/health`. Now compare: which hop failed, how did the symptom differ from step 4, and how quickly could you tell? Restart with `docker compose start db`.
+
+Write down the difference between what you saw in step 4 and step 5. "Degrades" vs "fails" is a design decision someone made — and in M9 you'll make it deliberately.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** a customer emails: *"Your site doesn't work. I get a 'can't be reached' error."* You open it on your laptop — it loads fine. Your platform dashboard is all green, no errors in logs, no recent deploys.
+
+<Evidence title="what you collect">
+
+```text
+From your laptop:
+  $ curl -sI https://riverside-studios.example | head -1
+  HTTP/2 200
+
+From the customer's machine (screen-shared):
+  $ curl -sI https://riverside-studios.example
+  curl: (6) Could not resolve host: riverside-studios.example
+
+  $ dig +short riverside-studios.example
+  (no output)
+
+  $ dig +short riverside-studios.example @1.1.1.1
+  203.0.113.45
+
+Your own resolver:
+  $ dig +short riverside-studios.example
+  203.0.113.45
+  $ dig riverside-studios.example | grep -A1 "ANSWER SECTION"
+  ;; ANSWER SECTION:
+  riverside-studios.example. 43200 IN A 203.0.113.45
+
+Platform: app healthy, 0 errors in 24h, last deploy 6 days ago.
+Change log: DNS A record updated 4 hours ago (IP 198.51.100.9 → 203.0.113.45).
+```
+
+</Evidence>
+
+Which hop is this, what does the evidence prove, and — the part people miss — what do you tell the customer *right now*?
+
+<Reveal label="Reveal the cause">
+
+**Hop 2 — DNS.** Not your app. The app answered a request from your laptop with a 200 while the customer couldn't resolve the name at all; a request that never resolves never reaches hops 3–7. Everything downstream being green is consistent with, not evidence against, a DNS problem.
+
+**What the evidence proves:** the customer's own resolver returns nothing, but Cloudflare's resolver (`@1.1.1.1`) returns the new IP correctly. The record itself is fine. The problem is *distribution*: you changed the A record 4 hours ago, and that record carries a **43200-second TTL — 12 hours**. The customer's resolver cached the *previous* answer. (Here it cached a now-dead entry; depending on the resolver you'd equally see traffic still arriving at the old IP.)
+
+**The fix has two halves.** Right now: nothing you deploy helps — the record is already correct, and you cannot flush someone else's resolver. If the old server still exists, keep it running and serving until the old TTL has fully expired; that's the mitigation. Going forward: lower the TTL to 300 seconds *before* a planned migration, make the change, then raise it again. "DNS propagation" is not weather — it's other people's caches honouring the TTL you published, and the time to control it is before you cut over, not after.
+
+**What you tell the customer:** "A DNS change is still reaching some networks; it should clear within 12 hours. In the meantime it will work on a different network or if you switch your device's DNS to 1.1.1.1." That answer is only available to someone who knows hop 2 exists.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Here is my stack: [list your hosting, domain/DNS provider, CDN, database, cache, any workers]. Map it onto this chain: browser → DNS → CDN/edge → load balancer → app → cache → database. For each hop tell me (a) which product of mine provides it, (b) where I inspect it, and (c) the single most likely way it fails. If my stack has no component for a hop, say so explicitly and what that implies."}>
+The useful output is the list of hops you *don't* have. Check each claim against a dashboard you can actually open — an agent will confidently name a CDN you aren't using. Save the result; it becomes your map in lesson L0.3.
+</AgentTask>
+
+<AgentTask prompt={"Write me a health endpoint for [my framework] that checks every downstream dependency this app has (database, cache, any external API), returns 200 only if all pass, and names exactly which dependency failed in the response body. It must time out each check after 2 seconds rather than hanging."}>
+Verify by breaking a dependency on purpose: stop your local database and call the endpoint. It must return a non-200 and name the database. A health check that returns 200 while a dependency is down is worse than none — it tells your <Term k="load-balancer">load balancer</Term> to keep sending traffic to a broken instance. Also check it doesn't leak credentials in the error text.
+</AgentTask>
+
+<AgentTask prompt={"Given this symptom: [paste the symptom and any error]. Using only the request-journey chain, tell me which hop to investigate first and which single command or dashboard would confirm or eliminate it. Do not propose a fix."}>
+A good answer names one hop and one check. If it jumps to "it's probably your code", push back: ask which hop's evidence rules out the five hops before it. This is the layer-isolation habit from M8.6, applied with the map in hand.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before you consider your map complete, you should be able to answer:
+
+- Who provides each of my seven hops, and where is its dashboard?
+- Which hops does my product not have? What do I lose and gain by that?
+- What is the TTL on my DNS records right now — and did I choose it?
+- Does my app have a health check, and does it actually fail when a dependency is down?
+- When a user says "the site is down", what is the first command I run?
+- Can I reach my app *bypassing* the CDN and load balancer? (If not, you can't isolate hops 3–4 from hop 5.)
+
+What good looks like: a one-page diagram of your own stack, with provider names on every box, pinned where you'll find it during an incident. Not in your head — on a page.
+
+Red flag: any incident where the first action is "redeploy and see". That's a guess that the problem lives in hop 5, made before checking hops 1–4.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m00-l01"
+  questions={[
+    {
+      q: "A user reports the site is unreachable. The browser's network tab shows no request was sent at all. Which hops can you immediately eliminate?",
+      options: [
+        "None — you need server logs first",
+        "Hops 2 through 7: if no request left the browser, nothing downstream was involved",
+        "Only the database, since the page never loaded data",
+        "Hops 3 and 4, because the CDN and load balancer would have logged it"
+      ],
+      answer: 1,
+      explain: "A request that was never sent cannot have failed anywhere downstream. The failure is in hop 1 — frontend code erroring before the fetch. That single observation eliminates six hops."
+    },
+    {
+      q: "Your platform returns a 502 for every request. What does that tell you about how far the request got?",
+      options: [
+        "It reached the load balancer, which couldn't get a valid response from the app behind it",
+        "It never got past DNS",
+        "The database rejected the connection",
+        "The browser blocked the request"
+      ],
+      answer: 0,
+      explain: "A 502 is hop 4 reporting on hop 5: the proxy itself is alive and answered you, but its upstream gave nothing usable. DNS, CDN and routing all worked — look at the app process."
+    },
+    {
+      q: "You changed a DNS A record an hour ago. Some users reach the new server, some the old one. What's happening?",
+      options: [
+        "The new server is misconfigured and intermittently refusing connections",
+        "Resolvers are still serving the cached old answer until its TTL expires",
+        "The load balancer is splitting traffic between both servers",
+        "The CDN is caching two different versions of the site"
+      ],
+      answer: 1,
+      explain: "This is 'propagation': other people's resolvers honour the TTL you published. The lever is lowering TTL before a migration, and keeping the old server alive until the old TTL fully expires."
+    },
+    {
+      q: "In the hands-on, stopping Redis left the app working while stopping Postgres broke it. What distinguishes the two?",
+      options: [
+        "Redis is faster, so its failure is less noticeable",
+        "The cache is an optimisation the code can fall through; the database holds the only copy of the truth",
+        "Postgres has no health check, so failures surface differently",
+        "Redis failures are always silent by design"
+      ],
+      answer: 1,
+      explain: "Hop 6 holds a disposable copy — code written to fall through degrades gracefully. Hop 7 holds the authoritative data, so its loss is a hard failure. Which dependencies are optional is a design choice, and you make it deliberately in M9."
+    },
+    {
+      q: "What makes a health check that returns 200 while the database is down actively harmful?",
+      options: [
+        "It wastes a request on every check interval",
+        "It tells the load balancer the instance is fine, so traffic keeps being routed to a broken app",
+        "It hides the error from your error tracker",
+        "It causes the CDN to cache the failure"
+      ],
+      answer: 1,
+      explain: "The health check's only consumer is the thing deciding whether to send you traffic. A check that can't fail is a check that can't protect users — and it removes the signal you'd otherwise get for free."
+    }
+  ]}
+/>
+
+</Section>

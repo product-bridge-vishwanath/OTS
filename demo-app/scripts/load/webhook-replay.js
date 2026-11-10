@@ -1,7 +1,7 @@
 // Webhook replay drill (M7.7): the payment provider delivers the SAME event
 // twice (at-least-once delivery — this is normal, not a bug on their side).
 //   node scripts/load/webhook-replay.js
-const APP = process.env.APP_URL ?? "http://localhost:3000";
+const APP = process.env.APP_URL ?? "http://localhost:3001";
 
 async function main() {
   const event = {

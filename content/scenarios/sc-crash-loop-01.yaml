@@ -1,0 +1,46 @@
+id: sc-crash-loop-01
+module: M1
+lesson: m01-l06
+title: "Green dashboard, 312 restarts"
+difficulty: realistic
+symptom: "Customers say the site is up but logs them out randomly and sometimes errors. Uptime monitoring reports 100% availability."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/unbounded-memory-cache.patch   # module-level Map, never evicted; sessions in memory
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [process.restarts, process.heap_used, http.5xx]
+  db_console: false
+  notes: "Restart count and container start time are visible; uptime checks poll every 60s and show green."
+agent:
+  context: "You added the in-memory cache for speed and consider the deploy successful."
+  bias: "suggests raising the memory limit and the restart cap"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-restarts-under-load-10min
+    - sessions-survive-restart
+    - restart-alerting-present
+  root_cause_markers:
+    - unbounded cache bounded (LRU with max size/TTL) or moved to Redis
+    - session state moved out of process memory
+    - alerting on restart count or uptime resets added
+  symptom_only_markers:
+    - memory limit raised with the leak intact
+    - restart limit raised or give-up threshold removed
+hints:
+  - "The dashboards are green. What number are they not showing you?"
+  - "Read the first lines after a startup, not the log tail."
+  - "Exit 1 with a V8 heap message is not the same as exit 137. Which is it, and what does that distinguish?"
+  - "Reveal: an unbounded module-level Map exhausts the heap every ~40s. Bound it, move sessions out of memory, and alert on restarts."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20
