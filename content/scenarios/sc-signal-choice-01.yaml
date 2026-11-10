@@ -1,0 +1,42 @@
+id: sc-signal-choice-01
+module: M8
+lesson: m08-l01
+title: "Three reports of intermittent slowness, no evidence left"
+difficulty: guided
+symptom: "Customers report the site felt slow for a few minutes, three times this week. By the time anyone looks, everything is normal."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: traffic
+      apply: scripts/load/periodic-latency-spike.js   # bursts of slowness every few minutes
+evidence:
+  logs: true
+  metrics: []
+  db_console: true
+  notes: "Log retention is deliberately capped at a short window and no metrics exist, so the learner must add a signal."
+agent:
+  context: "You have access to logs only and no historical metrics."
+  bias: "proposes adding indexes and caching speculatively"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - latency-recorded-over-time       # some durable record of p50/p95 now exists
+    - spike-window-identified
+  root_cause_markers:
+    - learner adds a metric or durable latency record before proposing a fix
+    - a before/after measurement accompanies any change
+  symptom_only_markers:
+    - indexes or caching added with no measurement
+    - fix declared successful because the symptom did not recur during the session
+hints:
+  - "Which of the four signals answers 'is this getting worse' and 'when did it start'?"
+  - "Your logs expire. What survives long enough to answer questions about last Monday?"
+  - "Before changing anything, how will you know whether the change helped?"
+  - "Reveal: this is a missing-signal problem. Record latency percentiles and error ratio first, then diagnose with a baseline."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

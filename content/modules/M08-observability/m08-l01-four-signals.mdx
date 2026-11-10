@@ -1,0 +1,379 @@
+---
+id: m08-l01
+module: M8
+title: "Logs, metrics, traces, alerts: what question each one answers"
+order: 1
+difficulty: 1
+depth: both
+platforms: [sentry, grafana, datadog, vercel, postgres]
+concepts: [logs, metrics, traces, alerts]
+prerequisites: [m00-l01]
+lab: demo-repo
+scenario_ids: [sc-signal-choice-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder was told by an investor's technical advisor that she "needed observability". She signed up for Datadog, installed the agent, and watched $400/month start accruing. Six weeks later production broke, and she spent thirty-five minutes clicking through dashboards she'd never configured, looking for something that would tell her what was wrong.
+
+She eventually found the answer where she'd always found it: the platform's log tab, with `grep`.
+
+The $400 wasn't wasted because Datadog is bad — it's excellent. It was wasted because she'd bought *tools* without knowing which **question** each tool answers. Dashboards answer "how is the system behaving overall?" She needed "what exactly happened to this one request at 14:06?" Those are different questions with different instruments, and no amount of spend converts one into the other.
+
+</Section>
+
+<Section kind="already-did">
+
+You already use three of the four, probably without the names.
+
+You've opened your platform's log tab after a failed request — **logs**. You've looked at a response-time or invocation-count graph in a dashboard, or watched your database provider's connections chart — **metrics**. You've received an email saying your site was down, or a Stripe webhook failed — **alerts**. You've probably never deliberately used **traces**, which is why "why is this endpoint slow?" is usually the hardest question on your list.
+
+What's missing isn't tooling. It's knowing which of the four to reach for, so you stop trying to answer "is this getting worse?" by reading individual log lines, and "what happened to this request?" by staring at an aggregate graph.
+
+</Section>
+
+<Section kind="mental-model">
+
+Four signals. Each answers a different shape of question, and they differ along one axis: **individual events versus aggregates over time.**
+
+<svg viewBox="0 0 780 320" role="img" aria-label="Four observability signals: logs answer what happened to this one thing, metrics answer how is the system behaving over time, traces answer where did the time go in one request, and alerts answer should a human look now" className="diagram">
+  <rect x="8" y="24" width="372" height="124" rx="10" />
+  <text x="194" y="50" textAnchor="middle">LOGS</text>
+  <text x="194" y="72" textAnchor="middle" className="sub">&quot;What happened to this one thing?&quot;</text>
+  <text x="194" y="94" textAnchor="middle" className="sub">individual events, with detail and context</text>
+  <text x="194" y="116" textAnchor="middle" className="sub">high volume · searchable · expensive to keep</text>
+  <text x="194" y="138" textAnchor="middle" className="sub">→ debugging a specific failure</text>
+
+  <rect x="400" y="24" width="372" height="124" rx="10" />
+  <text x="586" y="50" textAnchor="middle">METRICS</text>
+  <text x="586" y="72" textAnchor="middle" className="sub">&quot;How is the system behaving over time?&quot;</text>
+  <text x="586" y="94" textAnchor="middle" className="sub">numbers aggregated into series</text>
+  <text x="586" y="116" textAnchor="middle" className="sub">cheap · tiny · no per-request detail</text>
+  <text x="586" y="138" textAnchor="middle" className="sub">→ trends, capacity, &quot;when did it start?&quot;</text>
+
+  <rect x="8" y="166" width="372" height="124" rx="10" />
+  <text x="194" y="192" textAnchor="middle">TRACES</text>
+  <text x="194" y="214" textAnchor="middle" className="sub">&quot;Where did the time go in this request?&quot;</text>
+  <text x="194" y="236" textAnchor="middle" className="sub">one request&apos;s path across services, timed</text>
+  <text x="194" y="258" textAnchor="middle" className="sub">sampled · needs instrumentation</text>
+  <text x="194" y="280" textAnchor="middle" className="sub">→ slowness, N+1 queries, which hop</text>
+
+  <rect x="400" y="166" width="372" height="124" rx="10" />
+  <text x="586" y="192" textAnchor="middle">ALERTS</text>
+  <text x="586" y="214" textAnchor="middle" className="sub">&quot;Should a human look right now?&quot;</text>
+  <text x="586" y="236" textAnchor="middle" className="sub">a rule on top of metrics or logs</text>
+  <text x="586" y="258" textAnchor="middle" className="sub">not a signal — a decision</text>
+  <text x="586" y="280" textAnchor="middle" className="sub">→ waking someone, or not</text>
+
+  <text x="12" y="312" className="sub">Metrics tell you something is wrong and when it began. Logs and traces tell you what and where.</text>
+</svg>
+
+### The division of labour, as a sentence
+
+**Metrics notice. Alerts interrupt. Logs and traces explain.**
+
+That maps directly onto the debugging method from L8.6:
+
+| Debugging step | Signal |
+|---|---|
+| 3 · Build a timeline — "when did it start?" | **Metrics** (a graph has a corner; a log line doesn't) |
+| 2 · Read the actual error | **Logs** |
+| 4 · Isolate the layer | **Traces**, or logs across services |
+| — you found out at all | **Alerts** |
+
+<Callout type="key">
+The most common mistake is using one signal for another's job. Reading individual log lines to judge whether errors are increasing is slow and unreliable — that's a metric. Looking at an aggregate error-rate graph to understand *why* a particular customer's checkout failed tells you nothing — that's a log line. When a question feels unanswerable, check whether you're holding the wrong instrument.
+</Callout>
+
+### What each signal costs
+
+Cost shapes what you can keep, and that shapes what you can answer later.
+
+| Signal | Volume | Cost driver | Retention you can afford |
+|---|---|---|---|
+| Logs | One or more lines **per event** | Bytes ingested and stored | Days to weeks |
+| Metrics | A few numbers **per interval** | Number of distinct series (<Term k="cardinality">cardinality</Term>) | Months to years, cheaply |
+| Traces | One per request, usually <Term k="sampling">sampled</Term> | Spans ingested | Days |
+| Alerts | One per incident | Human attention | Forever (they're history) |
+
+Metrics are cheap because they throw away detail: "147 requests averaged 230ms" is a few bytes regardless of traffic. Logs keep everything, so they scale with traffic and get expensive fast. This is why you can graph latency for two years but can't keep last March's logs — and why "when did this start?" is a metrics question even when the answer feels like it should be in the logs.
+
+**The cardinality trap** is worth knowing before you create it: a metric's cost scales with its number of distinct label combinations. `http_requests{route="/api/bookings", status="500"}` is a handful of series. Add `user_id` as a label and you get one series *per user* — thousands of series, an enormous bill, and a tool that slows to a crawl. User IDs belong in logs and traces, never in metric labels.
+
+### What a trace actually shows
+
+A trace is one request's timeline, broken into nested <Term k="span">spans</Term>:
+
+```text
+POST /api/bookings                                   318ms  ← trace
+├── middleware: auth                                   4ms
+├── SELECT clash check                                 21ms
+├── fraudCheck (external HTTP)                        152ms  ← half the time
+├── INSERT booking                                     18ms
+├── INSERT event                                       11ms
+└── render response                                     3ms
+```
+
+That picture answers "where did the time go?" instantly. Logs could tell you the request took 318ms; only a trace tells you 152ms of it was one external call. This is the signal most small teams skip and then spend days guessing at.
+
+<Operator>
+
+Practise asking each question with the matching instrument, on the demo app.
+
+```bash
+cd demo-app
+
+# ── LOGS: "what happened to this one request?" ────────────────────────
+docker compose logs app 2>&1 | grep "booking.created" | tail -5
+docker compose logs --since 10m app 2>&1 | grep -iE "error|fatal" | head -5
+
+# ── METRICS (the poor-man's version): "how is it behaving over time?" ──
+#   Derive a metric from logs by counting per unit:
+docker compose logs --since 10m app 2>&1 | grep -oE " (2|4|5)[0-9]{2} " \
+  | sort | uniq -c | sort -rn
+#   Real metrics the database already keeps for you:
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT numbackends AS connections, xact_commit, xact_rollback,
+         blks_hit, blks_read
+    FROM pg_stat_database WHERE datname = 'demo';"
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT relname, seq_scan, idx_scan, n_live_tup
+    FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 5;"
+#   seq_scan climbing on a large table is a metric that predicts an incident.
+
+# ── TRACES (the poor-man's version): "where did the time go?" ─────────
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup}s connect:%{time_connect}s ttfb:%{time_starttransfer}s total:%{time_total}s\n" \
+  http://localhost:3001/api/bookings
+#   Compare an endpoint that hits Redis against one that hits Postgres:
+for p in /api/rooms /api/bookings; do
+  curl -s -o /dev/null -w "$p %{time_total}s\n" "http://localhost:3001$p"
+done
+#   Inside the database, the real per-statement timing:
+docker compose exec -T db psql -U ots -d demo -c '\timing' \
+  -c 'EXPLAIN ANALYZE SELECT * FROM bookings WHERE date = CURRENT_DATE;'
+
+# ── ALERTS: "should a human look?" — a rule, not a signal ─────────────
+#   The simplest honest alert is a threshold on a number you can already get:
+docker compose exec -T db psql -U ots -d demo -tAc "
+  SELECT count(*) FROM pg_stat_activity WHERE datname='demo';" \
+  | awk '{ if ($1 > 8) print "ALERT: connections " $1 " of 10"; else print "ok (" $1 ")" }'
+```
+
+Notice what the "poor-man's" versions demonstrate: you can answer all four questions with tools you already have. Paid tools make it faster and historical, not possible.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Signal | Free / built-in | Worth paying for | What the paid version buys |
+|---|---|---|---|
+| **Logs** | Platform log tab, `docker logs`, `journalctl` | Axiom, Better Stack, Grafana Loki, Datadog | Search across services, retention, structured queries |
+| **Metrics** | Platform metrics, `pg_stat_*`, `/metrics` endpoints | Grafana Cloud, Datadog, platform-native | History, custom dashboards, alert rules |
+| **Traces** | `curl -w`, framework timing logs | Sentry Performance, Datadog APM, Honeycomb | Automatic instrumentation, flamegraphs, cross-service |
+| **Alerts** | Platform alerts, uptime checks (Healthchecks.io) | PagerDuty, Better Stack, Opsgenie | Escalation, on-call rotation, deduplication |
+
+**The order to adopt them**, for a small team, by return on effort:
+
+1. **An error tracker** (Sentry). One SDK line. Gives you the full <Term k="stack-trace">stack trace</Term>, first-seen time, frequency, and which release introduced it — that single product covers debugging-method steps 2, 3 and 5 at once, and it's the highest-leverage observability purchase that exists.
+2. **An uptime check plus a <Term k="dead-mans-switch">dead man's switch</Term>** for every scheduled job. Cheap, and catches the silent failures nothing else can.
+3. **Metrics on the four golden signals** (L8.4), mostly already available from your platform and database.
+4. **Structured logging** (L8.3) — free, and it's what makes logs queryable later.
+5. **Traces**, when "why is this slow?" has cost you a day more than once.
+
+What good looks like: you can name, for each of the four questions, exactly where you'd go. If any answer is "I'm not sure", that's the gap to close this week — not during an incident.
+
+</Section>
+
+<Section kind="hands-on">
+
+Answer four questions about the demo app, each with the right instrument. Don't mix them up.
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &
+```
+
+1. **A logs question:** "What happened to the most recent booking?" Find the single log line for one specific booking, with its id and room.
+2. **A metrics question:** "Is the error rate increasing?" Count statuses per minute over the last ten minutes and compare the first minute to the last. (Logs can *produce* a metric; notice how much more work it is than reading a graph.)
+3. **A traces question:** "Which is slower, the cached endpoint or the database one, and by how much?" Time `/api/rooms` against `/api/bookings` ten times each and compare. Then explain the difference from the architecture, not the numbers.
+4. **An alerts question:** "Should a human be woken if the booking endpoint returns one 500?" Write down your answer and the reason. (It's a decision about consequence and urgency, not a technical measurement — which is why L8.8 is its own lesson.)
+
+Then the experiment that makes the distinction concrete:
+
+5. **Break it and watch which signal notices first.** Run `node scripts/break/connection-hungry-backfill.js 15 2` and observe, in order: the **metric** (`pg_stat_activity` count climbing) moves *before* the **log** (first timeout error) appears, which is before a **human** would notice. That ordering — metric, then log, then human — is the entire argument for having metrics at all.
+
+```bash
+kill %1   # stop the load generator
+```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** Support has three tickets this week saying "the site felt really slow for a few minutes". Each is from a different customer, at a different time. By the time anyone checks, everything is fine. The team has the platform's log tab and nothing else.
+
+<Evidence title="what they have">
+
+```text
+Platform log tab: searchable for the last 24 hours only.
+  Searching "error" over the three reported windows: 0 results.
+  Searching "slow": 0 results (nothing logs that word).
+  Request log lines exist and include duration:
+    GET /api/bookings 200 212ms
+    GET /api/bookings 200 4821ms
+    GET /api/bookings 200 198ms
+
+No metrics dashboard. No error tracker. No traces.
+Ticket times: Mon 09:12, Wed 14:40, Thu 21:05 (log retention covers Thu only).
+```
+
+</Evidence>
+
+<Evidence title="what they tried">
+
+```text
+1. Read the log tab around Thu 21:05. Saw some 4-second durations among
+   many fast ones. Could not tell if this was normal.
+2. Asked their agent, which suggested "add indexes and enable caching".
+3. Shipped both. Thursday's complaint has not recurred — but neither had
+   Monday's or Wednesday's by the time they looked.
+```
+
+</Evidence>
+
+They may have fixed it. They may not. Which signal is missing, and what should they do instead?
+
+<Reveal label="Reveal the cause">
+
+**This isn't a diagnosis failure — it's a missing-signal failure, and the missing signal is metrics.**
+
+Every question the team needs to answer is an aggregate-over-time question, and they are trying to answer all of them with individual events:
+
+- *"Is 4.8 seconds unusual?"* requires knowing the normal distribution. A single log line can't tell you; a <Term k="p95">p95</Term> latency graph tells you instantly.
+- *"When did it start and has it recurred?"* requires history. Their logs expire after 24 hours, so Monday and Wednesday are **permanently unanswerable** — the evidence is gone. Metrics would still have both, because they're small enough to keep for a year.
+- *"Did our fix work?"* requires a before-and-after comparison. With no baseline, "it hasn't recurred" is indistinguishable from "we haven't looked during a bad window". They cannot tell whether they fixed anything, which is the worst position to be in after shipping two speculative changes.
+
+**Why the agent's advice was unverifiable rather than wrong.** Indexes and caching are plausible remedies for intermittent slowness. But with no metrics there was no measurement before and no measurement after, so the team has two changes in production, an unknown cause, and no way to attribute the outcome. That's not engineering; it's hoping with extra deployment risk. (And they skipped debugging-method steps 1–5 entirely — no reproduction, no timeline, no layer.)
+
+**What to do, in order:**
+
+1. **Start recording latency percentiles and error rate per route today** — platform metrics, or a `/metrics` endpoint, or even a cron that writes p50/p95/p99 per route into a table. Future-you needs the history, and the cheapest version is enormously better than none.
+2. **Install an error tracker** so first-seen times and frequencies are captured automatically, with retention measured in weeks.
+3. **Log durations in a parseable form** (L8.3) so logs can at least be aggregated: `duration_ms=4821 route=/api/bookings` is greppable and countable; prose is not.
+4. **Then** investigate with the method: wait for the next occurrence *with instruments in place*, or reproduce it with load (`scripts/load/steady-browse-and-order.js` plus the backfill script) and watch which metric moves.
+5. Consider reverting the speculative changes, or at least labelling them as unverified, so they don't become load-bearing folklore.
+
+**The transferable lesson:** when a question is genuinely unanswerable with the signals you have, the correct response is to **add the signal, not to guess harder.** Intermittent problems are specifically a metrics problem, because their defining feature is that they're gone when you look — and the only thing that outlives the moment is a number you recorded at the time.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"For each of these questions about my app, tell me which signal answers it — logs, metrics, traces or alerts — and where exactly I would look in my current stack [describe it]: (1) why did this specific user's checkout fail at 14:06, (2) is p95 latency worse than last week, (3) which part of this slow endpoint is slow, (4) should someone be woken up right now. If I have no source for one of them, say so plainly."}>
+The "no source" answers are the deliverable — that's your observability gap list, ordered by the questions you actually need to answer. Don't let it recommend a platform before it has told you which questions you currently can't answer at all.
+</AgentTask>
+
+<AgentTask prompt={"Add request logging to this app that emits one structured line per request with: method, route (the pattern not the raw URL), status, duration in milliseconds, and a request id. Keep it to one line per request, never log request bodies or headers that could contain secrets, and show me the exact output format."}>
+Check the route is the *pattern* (`/api/bookings/:id`) not the raw path — raw paths with ids are unaggregatable and, in metrics, a cardinality disaster. Verify no `Authorization` header or body content appears. Then confirm you can count by status and route with a one-line pipeline; if you can't, the format isn't parseable enough.
+</AgentTask>
+
+<AgentTask prompt={"Give me the smallest possible metrics setup for this app that would let me answer 'when did this start' and 'is it getting worse' three months from now. I want at most two moving parts, a monthly cost estimate, and an explicit statement of which label values must NEVER become metric labels and why."}>
+The cardinality answer should name user ids, request ids, raw URLs and timestamps. If it suggests high-cardinality labels, that's a future surprise bill and a slow dashboard — push back. Check the proposal keeps data for months, since the whole point is answering questions after the evidence in your logs has expired.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The four questions — be able to answer where you'd look for each:
+
+- "What happened to this one request?" → **logs**
+- "How is the system behaving over time, and when did it change?" → **metrics**
+- "Where did the time go inside this request?" → **traces**
+- "Should a human look right now?" → **alerts** (a decision, not a measurement)
+
+Before an incident, verify:
+
+- Do I have *any* historical metrics, and how far back do they go?
+- How long are my logs retained? (If 24 hours, last week is unanswerable forever.)
+- Do I have an error tracker with first-seen times?
+- Does every scheduled job have a dead man's switch?
+- Are durations logged in a parseable form?
+- Is any user id, request id or raw URL being used as a *metric label*? (Fix that now.)
+
+What good looks like: metrics with months of history, logs with weeks, an error tracker, and alerts on consequence rather than on noise.
+
+Red flags: answering "is this getting worse?" by reading log lines; shipping a fix for an intermittent problem with no before-and-after measurement; paying for a dashboard product before you have an error tracker.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l01"
+  questions={[
+    {
+      q: "Which signal answers \"when did this problem start?\" and why not the others?",
+      options: [
+        "Logs, because they have timestamps on every line",
+        "Metrics — a time series has a visible corner, and metrics are cheap enough to retain for months after logs have expired",
+        "Traces, because they show request timing",
+        "Alerts, because they fire at the moment of onset"
+      ],
+      answer: 1,
+      explain: "Log lines have timestamps but you'd have to aggregate millions to see a change, and retention is short. A latency or error-rate graph shows the inflection instantly — and still exists next quarter."
+    },
+    {
+      q: "Why is adding `user_id` as a metric label a serious mistake?",
+      options: [
+        "Metrics cannot store string values",
+        "It creates one time series per user — exploding cardinality, cost, and query time; user ids belong in logs and traces",
+        "It violates data protection rules in all jurisdictions",
+        "Metric labels are publicly visible"
+      ],
+      answer: 1,
+      explain: "Metrics are cheap because they aggregate. High-cardinality labels destroy that property and are the main way teams accidentally run up huge observability bills and unusably slow dashboards."
+    },
+    {
+      q: "A request takes 318ms. Which signal tells you that 152ms of it was one external HTTP call?",
+      options: [
+        "Logs, if the log level is set to debug",
+        "A trace — nested spans break one request into timed steps",
+        "Metrics, via the p95 latency series",
+        "Alerts, if a latency threshold is configured"
+      ],
+      answer: 1,
+      explain: "Logs can report total duration; metrics can report the distribution across requests. Only a trace decomposes one request into where its time actually went — which is why 'why is this slow' is hard without them."
+    },
+    {
+      q: "In the break-fix, why couldn't the team tell whether their indexes-and-caching fix worked?",
+      options: [
+        "The changes were deployed together, so effects were confounded",
+        "They had no metrics, so there was no baseline before the change and no measurement after — 'it hasn't recurred' was indistinguishable from 'we haven't looked'",
+        "Their log retention was too long to search efficiently",
+        "The cache masked the underlying query performance"
+      ],
+      answer: 1,
+      explain: "Intermittent problems are specifically a metrics problem: they're gone when you look, so the only thing that survives the moment is a number recorded at the time. Without it, a fix is unverifiable."
+    },
+    {
+      q: "What's the single highest-leverage first observability investment for a small team?",
+      options: [
+        "A full APM platform with dashboards",
+        "An error tracker like Sentry — one SDK line gives full stack traces, first-seen times, frequencies and the release that introduced each error",
+        "Log aggregation across all services",
+        "Distributed tracing with OpenTelemetry"
+      ],
+      answer: 1,
+      explain: "An error tracker covers debugging-method steps 2, 3 and 5 at once for almost no setup. Dashboards are valuable later; the founder in the story bought them first and still debugged with grep."
+    }
+  ]}
+/>
+
+</Section>

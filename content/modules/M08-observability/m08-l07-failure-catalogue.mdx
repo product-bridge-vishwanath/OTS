@@ -1,0 +1,401 @@
+---
+id: m08-l07
+module: M8
+title: "Building your own failure catalogue"
+order: 7
+difficulty: 2
+depth: both
+platforms: [postgres, redis, nginx, vercel, sentry]
+concepts: [failure-triage, debugging-method, runbooks]
+prerequisites: [m08-l06]
+lab: demo-repo
+scenario_ids: [sc-catalogue-lookup-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A two-person team hit the same outage three times in five months.
+
+**March.** Connections exhausted during a batch import. Four hours to diagnose, because nobody knew what `pg-pool` meant. Fixed by restarting everything.
+
+**June.** Same symptom. The developer who'd fixed it in March was on holiday. The other one spent ninety minutes rediscovering it, then found a Slack message from March with the answer — after the incident was over.
+
+**August.** Same symptom again. This time they found it in eleven minutes, because after June they'd written four lines in a file called `FAILURES.md`:
+
+```text
+## Intermittent 500s on one endpoint, "connection terminated" in logs
+Cause: a long-running job holding pool connections (check for backfills/imports)
+Confirm: SELECT count(*), state FROM pg_stat_activity GROUP BY state;
+Fix: stop the job; bound its connections; alert on pool waiters > 0
+```
+
+Four lines. Four hours → eleven minutes. The third incident wasn't cheaper because they got smarter; it was cheaper because the knowledge stopped living in one person's memory and a Slack thread.
+
+</Section>
+
+<Section kind="already-did">
+
+You have solved production problems you can no longer explain. Something broke, you worked it out, you moved on — and the knowledge evaporated. You may even have solved the *same* thing twice without recognising it, because the second time the symptom presented slightly differently.
+
+You've also almost certainly searched your own Slack, your agent chat history, or a browser tab graveyard looking for "that thing we did last time". That search is the tax you pay for not having a catalogue, and it falls due at exactly the worst moment.
+
+</Section>
+
+<Section kind="mental-model">
+
+A failure catalogue is a lookup table **keyed by symptom**, because a symptom is all you have when an incident starts.
+
+That keying choice is the entire design. You cannot look up "connection pool exhaustion" — you don't know that yet. You *can* look up "intermittent 500s on one endpoint".
+
+### The four-field entry
+
+Every entry has exactly four fields, and each maps to a step of the debugging method:
+
+| Field | Content | Method step |
+|---|---|---|
+| **Symptom** | What you observe from outside, in the words you'd actually use | 1 · Reproduce |
+| **Likely causes** | Two to four, most common first | 4 · Isolate the layer |
+| **How to confirm** | A specific command or query that proves it | 2 · Read the evidence |
+| **Fix** | Mitigation first, then the cause-level fix | 6 · Fix the cause |
+
+The **"how to confirm"** field is what separates a catalogue from folklore. Without it, an entry is a guess with a confident tone; with it, an entry is a test. "Likely causes: connection exhaustion" invites you to act on a hunch. "Confirm: `SELECT count(*), state FROM pg_stat_activity GROUP BY state;` — look for a count flat against max" makes you check.
+
+<Callout type="key">
+Write the **mitigation** and the **cause-level fix** as separate lines. During an incident you want service restored (stop the job, roll back, truncate the log); afterwards you want the mechanism fixed (bound the job's connections, add the index, configure rotation). Conflating them is how teams restore service and then never fix anything — the cause-level line is the one that stops a fourth incident.
+</Callout>
+
+### Where entries come from
+
+Three sources, in order of value to you:
+
+1. **Your own incidents.** Highest value: these are failures your specific system actually produces, in your words. Every incident ends with a four-line entry — that's the rule.
+2. **The shared catalogue.** The [failure catalogue reference](/reference/failures) holds the ~25 failures that recur across almost every product: OOM, disk full, port in use, expired cert, missing env var, connections exhausted, DNS, bad deploy, CORS, 502/504, crash loop, slow query, lock wait, cron didn't run, cron ran twice, webhook replayed, stale cache, rate limited, provider outage, clock skew, timezone, wrong region, cold starts, N+1, memory leak, leaked secret. Start from it; don't retype it.
+3. **Near misses and drills.** The failures you *caused on purpose* in this module's hands-on sections are catalogue entries you got for free, without an outage.
+
+### From catalogue to runbook
+
+A catalogue entry is a *diagnosis* aid. A <Term k="runbook">runbook</Term> is a *procedure* for a situation you expect to recur: ordered steps, including who to tell and how to verify. The progression is natural — when an entry's "fix" has been executed twice, promote it into a runbook with exact commands. M14.3 covers the five runbooks every product needs; this lesson is where their raw material comes from.
+
+### What makes an entry good
+
+| Weak | Strong |
+|---|---|
+| "Database problems" | "Intermittent 500s on one endpoint, others fine" |
+| "Check the database" | "`SELECT count(*), state FROM pg_stat_activity GROUP BY state;` — flat against max means starvation" |
+| "Restart the service" | "Mitigate: stop the job. Cause: bound its pool to 2 and chunk it (M7.9)" |
+| "Happens sometimes" | "Started 2026-06-14; recurred 2026-08-02; both during monthly imports" |
+
+Note the last row: **dates and recurrence counts**. An entry that has fired three times is an argument for engineering effort, in a form you can show someone.
+
+<Operator>
+
+Keep it in the repo, in Markdown, next to the code. Not in Notion, not in a wiki nobody opens — somewhere a `grep` finds it and a PR can update it.
+
+```bash
+# ── Create it, keyed by symptom ───────────────────────────────────────
+cat > FAILURES.md <<'EOF'
+# Failure catalogue — Riverside Studios
+Keyed by SYMPTOM, because that's all you have at the start.
+Shared catalogue: /reference/failures
+
+---
+## Intermittent 500s on one endpoint, others fine
+First seen: 2026-06-14 · Recurred: 2026-08-02, 2026-11-07 (3x)
+
+Likely causes
+  1. Connection pool starved by a long-running job (most common here)
+  2. A slow query under lock contention
+
+Confirm (healthy: count well under max, no long-open transactions)
+  SELECT count(*), state FROM pg_stat_activity
+    WHERE datname='demo' GROUP BY state;
+  SELECT pid, now()-xact_start AS open_for, left(query,60)
+    FROM pg_stat_activity
+   WHERE state='idle in transaction' ORDER BY xact_start;
+  -> flat count against max_connections = starvation; check running imports
+
+Mitigate
+  Stop or throttle the job; pg_terminate_backend(<pid>) on stuck transactions.
+
+Fix the cause
+  Bound the job to 2 connections, chunk it, never hold a transaction across
+  slow work (M7.9). Alert on pool waiters > 0.
+EOF
+
+# ── Find an entry fast, mid-incident ─────────────────────────────────
+grep -i -A12 "intermittent 500" FAILURES.md
+grep -in "^## " FAILURES.md                 # list every symptom you have an entry for
+
+# ── Harvest entries from your own history (do this once, today) ──────
+git log --oneline --grep -iE "fix|hotfix|revert|incident" --since="6 months ago" | head -20
+#   Each hotfix was an incident. Was it written down?
+gh issue list --label incident --state all --limit 20 2>/dev/null
+#   Search your own chat history for "it was" / "turned out" — those are causes.
+
+# ── Turn this module's drills into free entries ──────────────────────
+#   Each of these you have already caused and diagnosed deliberately:
+#     scripts/break/connection-hungry-backfill.js   → pool starvation
+#     scripts/break/missing-index-growth.sql        → slow query after growth
+#     scripts/load/concurrent-editors.js            → lost updates, no errors
+#     scripts/load/webhook-replay.js                → duplicate payments
+#     scripts/load/booking-rush.js                  → double booking
+#     docker compose stop db / app                  → hard dependency failure vs 502
+
+# ── Keep the confirm commands honest: test them when nothing is broken ─
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT count(*), state FROM pg_stat_activity WHERE datname='demo' GROUP BY state;"
+#   A confirm command that errors at 3am is worse than no entry at all.
+```
+
+That last point deserves emphasis: **run your confirm commands periodically while everything is healthy.** They rot — table names change, flags change, a tool gets removed. Knowing what the *healthy* output looks like is also half the value, because during an incident you need to recognise abnormal.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Where to keep it | For | Honest assessment |
+|---|---|---|
+| **`FAILURES.md` in the repo** | Almost everyone | Greppable, PR-reviewable, next to the code. The default |
+| Runbook per service in the repo | Procedures with steps | The next stage up, once entries stabilise (M14.3) |
+| Notion / Confluence | Teams already living there | Goes stale; hard to grep at 3am; still better than nothing |
+| Incident tool (incident.io, FireHydrant) | Funded teams | Generates timelines and postmortems automatically |
+| Your error tracker's issue comments | Per-error notes | Excellent for "we've seen this, here's why" on a specific exception |
+
+The format matters less than two properties: **findable by symptom in under a minute**, and **updated by the person who just finished the incident**. A beautiful wiki that's six months stale loses to four lines in a repo.
+
+What good looks like: every incident produces or updates an entry before the person closes their laptop; entries record recurrence dates; confirm commands are tested periodically; and new team members are pointed at `FAILURES.md` on day one.
+
+</Section>
+
+<Section kind="hands-on">
+
+You've already caused and diagnosed six failures in this module and M1. Now harvest them — this is the lesson's deliverable.
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Create `FAILURES.md`** in your own product's repo (not the demo app's) using the four-field format.
+
+2. **Write three entries from the drills you've already run.** Use the demo app to re-trigger each one so your confirm command is tested against real output, not remembered:
+
+   - **Pool starvation:** `node scripts/break/connection-hungry-backfill.js 12 2 &`, then write the symptom as you'd *observe* it, and verify your confirm query shows the ceiling.
+   - **Lost updates with no errors:** `node scripts/load/concurrent-editors.js 1`. The symptom line here is the hard part — write it as a customer would report it ("my edits disappear"), and make the confirm a *data invariant* check, since nothing is in the logs:
+     ```bash
+     docker compose exec -T db psql -U ots -d demo -c \
+       "SELECT id, jsonb_array_length(notes) AS notes FROM bookings WHERE id=1;"
+     ```
+   - **Duplicate payments:** `node scripts/load/webhook-replay.js`, confirm with the group-by query that finds duplicate `provider_event_id`s.
+
+3. **Write down what healthy looks like.** For each confirm command, record the normal output next to it. During an incident you need to recognise abnormal, and "connections: 3 of 10" means nothing unless you know it's usually 3.
+
+4. **Harvest your real history.** Run the `git log --grep` command from the Operator block on your own repo. For each hotfix or revert in the last six months, write a one-line entry — symptom and cause. Anything you can't remember the cause of is a lesson in why this file exists.
+
+5. **Test one entry cold.** Hand `FAILURES.md` to someone else (or come back tomorrow), have them run only the confirm command for one entry, and see whether the output is interpretable without you explaining it. Fix the entry if not.
+
+Then add one line to your calendar: a quarterly check that every confirm command still runs.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A new engineer is on call alone for the first time. At 02:14 she's paged: *"Checkout failing — customers can't complete bookings."* She has the team's `FAILURES.md`. Here's the relevant part of it.
+
+<Evidence title="FAILURES.md — the entry she finds">
+
+```text
+## Checkout broken
+Causes: Stripe issues, database problems, deploy problems
+Confirm: check the logs
+Fix: usually a restart fixes it. If not, ask Dev.
+```
+
+</Evidence>
+
+<Evidence title="what she actually observes">
+
+```text
+POST /api/bookings → 500, every attempt (100%, not intermittent)
+GET  /api/rooms    → 200 (cache: hit)
+GET  /api/bookings → 200
+Last deploy: 6 days ago
+status.stripe.com: all systems operational
+
+App logs, first error at 02:11:04:
+  ERROR POST /api/bookings 500 89ms
+    error: null value in column "room_id" violates not-null constraint
+      at async POST (app/api/bookings/route.ts:41)
+```
+
+</Evidence>
+
+<Evidence title="what she does, following the entry">
+
+```text
+02:18  Restarts the app ("usually a restart fixes it"). No change.
+02:24  Restarts the database. No change. Brief total outage during restart.
+02:31  Pages Dev, who is asleep.
+02:52  Dev wakes, reads the error, and says: "that's the frontend
+       deploy — the booking form was renamed room to roomId yesterday."
+```
+
+</Evidence>
+
+The catalogue made things *worse*. Rewrite the entry properly, and name each specific flaw.
+
+<Reveal label="Reveal the cause">
+
+**The underlying bug is trivial: a frontend field rename (`room_id` → `roomId`) means the API receives no `room_id`, and the insert violates a not-null constraint. The *lesson* is that a bad catalogue entry actively harmed the response.**
+
+**Four specific flaws, each of which cost her time:**
+
+1. **The symptom key is unmatchable.** "Checkout broken" doesn't distinguish 100%-failing from intermittent, or an error from slowness — so it matches everything and discriminates nothing. Her actual observation ("100% of POSTs fail, GETs fine, specific constraint error") should have led somewhere precise.
+2. **"Confirm: check the logs" is not a confirm step.** She *had* the logs; the error was sitting in them, in plain English, at 02:11. The entry needed to tell her to read the error text and match it against a cause — instead it sent her to a generic activity with no interpretation.
+3. **"Usually a restart fixes it" is folklore, and it did damage.** Restarting cost ten minutes and *caused a second outage* during the database restart. Worse, it's an instruction to act before diagnosing — the exact inversion the debugging method forbids. A constraint violation is in the code's contract with the data; no restart can affect it.
+4. **"Ask Dev" encodes the single point of failure the catalogue exists to remove.** The entire purpose of writing it down was so that 02:52 didn't have to happen.
+
+Note too what the evidence *already* ruled out, had the entry prompted her to look: no deploy in 6 days on the *backend*, Stripe green, GETs fine, 100% failure on one verb. That combination points at the request contract, not infrastructure.
+
+**The rewritten entry:**
+
+```text
+## All POSTs to one endpoint fail 100%, GETs on the same route fine
+First seen: 2026-11-10 (frontend field rename)
+
+**Confirm** — read the first error in the app logs; match the shape:
+  docker compose logs --since 30m app | grep -iE "error" | head -3
+  - "violates not-null constraint" / "column X does not exist"
+      → the request body no longer matches what the handler expects.
+        Compare the frontend's payload with the handler's destructuring.
+        Check FRONTEND deploys, which may be separate from the API's.
+  - "connection terminated" / pg-pool
+      → see "Intermittent 500s on one endpoint"
+  - no error logged at all, platform 502
+      → see "502 with a healthy app" (check bind interface, M1.4)
+
+**Mitigate** Roll back the most recent frontend deploy (restores service
+in ~2 min). Do NOT restart the database: a constraint violation is a
+contract mismatch; restarts cannot affect it and cause their own outage.
+
+**Fix the cause** Align the field name; add request-body validation
+(zod) at the API boundary so a mismatch returns a clear 400 instead of
+a 500; add a contract test covering the booking payload.
+
+**Escalate** Only if the first error doesn't match any shape above.
+```
+
+**What the rewrite changes:** the symptom is specific enough to match and to *exclude*; the confirm step is a command plus a decision tree keyed on real error text; mitigation is rollback (fast, reversible, correct) with an explicit warning against the harmful folklore; and escalation is a last resort with a stated condition rather than step three.
+
+**The transferable rule:** an entry without a real confirm command is worse than no entry, because it converts "I don't know" — which prompts investigation — into false confidence that prompts action. Every entry must make you *check* something before it tells you to *do* something.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Read this repository and draft failure catalogue entries for the ten most likely production failures of THIS system specifically — based on its actual dependencies, data model, scheduled jobs and third-party calls. Use four fields each: symptom as a user or monitor would observe it, likely causes ordered by probability, a specific command or query to confirm, and mitigation separated from the cause-level fix. Flag any failure that would produce no error logs."}>
+The no-error-logs flags are the valuable ones — races, lost updates, jobs that didn't run. Then **test every confirm command** against your real system while it's healthy, and record the healthy output in the entry. An untested confirm command is the flaw that cost the on-call engineer forty minutes.
+</AgentTask>
+
+<AgentTask prompt={"Here is an incident I just resolved: [symptom, what you checked, the cause, what you did]. Write it as a four-field catalogue entry in the house format. Separate mitigation from the cause-level fix, include the exact confirm command with what healthy output looks like, and note today's date and whether this is a recurrence."}>
+Run this at the end of every incident — it's a two-minute habit that compounds. Check it didn't smuggle in a "restart and see" mitigation, and that the confirm command is one you actually ran rather than one it invented. Paste the result into `FAILURES.md` yourself so you read it once more.
+</AgentTask>
+
+<AgentTask prompt={"Review my FAILURES.md: for each entry, is the symptom specific enough to match and to EXCLUDE other entries, is the confirm step an actual command with an interpretation of its output, and is mitigation separated from the cause fix? List entries that contain folklore — advice to act before diagnosing, like 'restart and see' — and rewrite the worst three."}>
+"Folklore" is the right thing to hunt: advice to act before diagnosing is what made the break-fix worse. Also ask it to flag entries whose confirm command references a table, flag or tool that no longer exists — entries rot silently, which is why the quarterly test matters.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Every entry has four fields:
+
+1. **Symptom** — as observed from outside, specific enough to exclude other entries
+2. **Likely causes** — two to four, most probable first
+3. **How to confirm** — a real command, plus what healthy and unhealthy output look like
+4. **Fix** — mitigation line *and* cause-level line, separately
+
+Practices that keep it alive:
+
+- Every incident produces or updates an entry before you close your laptop.
+- Record dates and recurrence counts — three occurrences is an argument for real engineering effort.
+- Test confirm commands quarterly, while healthy.
+- Keep it in the repo, greppable, not in a wiki.
+- Point new team members at it on day one.
+- Promote twice-executed fixes into runbooks (M14.3).
+
+What good looks like: a new on-call engineer resolves a recurring failure alone, at 2am, from the file.
+
+Red flags: "check the logs" as a confirm step; "restart and see" as a fix; "ask [person]" as a step rather than an escalation of last resort; entries with no dates.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l07"
+  questions={[
+    {
+      q: "Why is a failure catalogue keyed by symptom rather than by cause?",
+      options: [
+        "Symptoms are shorter and easier to scan",
+        "A symptom is all you have when an incident begins — you can't look up a cause you haven't diagnosed yet",
+        "Causes change over time while symptoms are stable",
+        "It mirrors how monitoring tools group alerts"
+      ],
+      answer: 1,
+      explain: "You cannot search for 'connection pool exhaustion' at the moment you need it. You can search for 'intermittent 500s on one endpoint'. That keying choice is the whole design."
+    },
+    {
+      q: "Which field distinguishes a catalogue entry from folklore?",
+      options: [
+        "The symptom description",
+        "How to confirm — a specific command and an interpretation of its output, which forces you to check rather than act on a hunch",
+        "The list of likely causes",
+        "The date it was first seen"
+      ],
+      answer: 1,
+      explain: "Without it, an entry is a guess with a confident tone. 'Confirm: check the logs' failed precisely because it named an activity with no interpretation, while the answer sat in those logs in plain English."
+    },
+    {
+      q: "Why separate the mitigation from the cause-level fix in each entry?",
+      options: [
+        "To keep entries shorter",
+        "During an incident you need service restored; afterwards you need the mechanism fixed — conflating them is how teams restore service and never fix anything",
+        "Mitigations require approval while fixes don't",
+        "Because mitigations are temporary and shouldn't be documented"
+      ],
+      answer: 1,
+      explain: "The cause-level line is the one that prevents a fourth incident. The three-times-in-five-months team only stopped recurrence once the entry named bounding the job, not just stopping it."
+    },
+    {
+      q: "In the break-fix, why was the existing entry worse than having no entry at all?",
+      options: [
+        "It was too long to read quickly at 2am",
+        "It converted 'I don't know' — which prompts investigation — into false confidence that prompted harmful action, including a database restart that caused a second outage",
+        "It pointed to the wrong team to escalate to",
+        "It was stored in a wiki rather than the repo"
+      ],
+      answer: 1,
+      explain: "'Usually a restart fixes it' is advice to act before diagnosing. A constraint violation is a contract mismatch that no restart can affect — so the entry cost ten minutes and manufactured an outage."
+    },
+    {
+      q: "Why test your confirm commands while the system is healthy?",
+      options: [
+        "To warm up caches so the commands run faster during incidents",
+        "Commands rot as schemas and tools change, and knowing the healthy output is half the value — you need to recognise abnormal",
+        "To satisfy audit requirements for documented procedures",
+        "To measure how long each command takes"
+      ],
+      answer: 1,
+      explain: "A confirm command that errors at 3am is worse than no entry. And 'connections: 3 of 10' means nothing unless you know what it usually reads."
+    }
+  ]}
+/>
+
+</Section>

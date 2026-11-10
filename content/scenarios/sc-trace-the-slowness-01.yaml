@@ -1,0 +1,45 @@
+id: sc-trace-the-slowness-01
+module: M8
+lesson: m08-l05
+title: "Getting slower every week, no errors at all"
+difficulty: realistic
+symptom: "The bookings list page has gone from 120ms to nearly 4 seconds over a month. The error tracker reports zero issues and no deploy correlates."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data
+      apply: scripts/break/missing-index-growth.sql
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js
+evidence:
+  logs: true
+  metrics: [latency.p50, latency.p95, db.seq_scan]
+  db_console: true
+  notes: "Error tracking is installed and silent; tracing is not. The learner must localise the time."
+agent:
+  context: "Error tracking shows nothing, so you believe the application is healthy."
+  bias: "suggests adding a cache in front of the endpoint rather than examining the query plan"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - bookings-endpoint-p95-under-500ms
+    - index-used-by-query            # EXPLAIN must show an index scan, not a seq scan
+  root_cause_markers:
+    - time localised to the database span before any change
+    - EXPLAIN ANALYZE read and the sequential scan identified
+    - index created concurrently and improvement measured after
+  symptom_only_markers:
+    - cache added in front of an unfixed query
+    - LIMIT reduced to make the page feel faster
+hints:
+  - "Why does the error tracker have nothing to say about this?"
+  - "What fraction of the request time is inside the database? Measure before changing anything."
+  - "Read EXPLAIN ANALYZE: how many rows are scanned to return 200?"
+  - "Reveal: a sequential scan on a grown table. Add the index the filter and sort need, then re-measure."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

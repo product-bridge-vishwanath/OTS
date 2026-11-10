@@ -1,0 +1,441 @@
+---
+id: m08-l05
+module: M8
+title: "Error tracking and tracing: Sentry and OpenTelemetry at a usable level"
+order: 5
+difficulty: 2
+depth: both
+platforms: [sentry, datadog, grafana, vercel, postgres]
+concepts: [error-tracking, traces, correlation-ids]
+prerequisites: [m08-l03]
+lab: demo-repo
+scenario_ids: [sc-trace-the-slowness-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+Two teams, two weeks apart, with the same bug: a checkout page that was slow for some users.
+
+The first team had logs. They knew requests took four seconds. They spent three days hypothesising — the database, then the payment provider, then React rendering, then the database again. They added indexes. They added a cache. They shipped five changes. The page got faster, eventually, and nobody could say which change did it or why.
+
+The second team had a trace. They opened one slow request and read it:
+
+```text
+GET /checkout                                   4,118ms
+├── auth middleware                                 6ms
+├── SELECT cart                                    14ms
+├── SELECT product  (×47)                       3,840ms   ← here
+└── render                                         61ms
+```
+
+Forty-seven near-identical queries — a classic <Term k="n-plus-1">N+1</Term>. One developer, twenty minutes, one eager-load fix, and a before-and-after measurement proving it worked.
+
+Same bug. One team guessed for three days; the other read the answer off a screen. The difference was a signal, not talent.
+
+</Section>
+
+<Section kind="already-did">
+
+If you've used Vercel or Render you've seen a crude trace: the function duration breakdown on a deployment page. If you've opened the browser's network tab and looked at the waterfall of requests, that's tracing on the client side — you already know how to read one, which is most of the skill.
+
+What you've probably never had is the equivalent for the server side: one picture showing where a request's time went across your app, your database and your third parties. And if you've been debugging errors by reading log lines, you've been doing by hand what an error tracker does automatically — including the part humans are worst at, which is noticing that the same error has happened 1,400 times since a specific deploy.
+
+</Section>
+
+<Section kind="mental-model">
+
+Two distinct products, often sold together, answering different questions.
+
+### Error tracking: "what broke, how often, since when?"
+
+An error tracker catches unhandled exceptions and gives you, automatically:
+
+| What it captures | Why it matters |
+|---|---|
+| Full <Term k="stack-trace">stack trace</Term> with source context | Debugging-method step 2, without hunting logs |
+| **First seen** timestamp | Step 3 (timeline) — free and exact |
+| Occurrence count and affected user count | Severity, instead of guessing |
+| **Release** that introduced it | Step 5 ("what changed?") answered by the tool |
+| Request context: route, method, user id, request id | Reproduction |
+| Grouping of identical errors | 1,400 occurrences as *one* issue, not 1,400 lines |
+
+That grouping plus first-seen is the thing logs genuinely cannot do for you. In logs, the same error appearing 1,400 times is 1,400 lines you have to count; in an error tracker it's one issue that says "1,400 events, first seen 14:02, release `a91f2c4`, 212 users affected". That sentence *is* most of an investigation.
+
+<Callout type="key">
+**An error tracker is the highest-leverage observability tool for a small team.** One SDK line covers debugging-method steps 2, 3 and 5 at once. If you install exactly one thing from this entire module, install this.
+</Callout>
+
+### Tracing: "where did the time go, and across which hops?"
+
+A trace is one request decomposed into nested, timed <Term k="span">spans</Term>.
+
+<svg viewBox="0 0 780 250" role="img" aria-label="A trace as nested spans: the total request duration broken into middleware, database queries, an external API call and rendering, with the external call dominating" className="diagram">
+  <text x="12" y="22" className="sub">POST /api/bookings — one trace, 318ms total</text>
+
+  <rect x="8" y="34" width="764" height="30" rx="6" />
+  <text x="20" y="54" className="sub">trace: POST /api/bookings · 318ms · request_id req_8f21a</text>
+
+  <rect x="28" y="74" width="30" height="26" rx="4" />
+  <text x="70" y="92" className="sub">auth middleware · 4ms</text>
+
+  <rect x="28" y="108" width="80" height="26" rx="4" />
+  <text x="120" y="126" className="sub">SELECT clash check · 21ms</text>
+
+  <rect x="28" y="142" width="420" height="26" rx="4" />
+  <text x="460" y="160" className="sub">fraudCheck — external HTTP · 152ms  ← half the request</text>
+
+  <rect x="28" y="176" width="70" height="26" rx="4" />
+  <text x="110" y="194" className="sub">INSERT booking · 18ms</text>
+
+  <rect x="28" y="210" width="44" height="26" rx="4" />
+  <text x="84" y="228" className="sub">INSERT event · 11ms · then render 3ms</text>
+</svg>
+
+Bar width is time. The widest bar is your answer. That's the entire reading skill, and it turns "why is this slow?" from a research project into a glance.
+
+What traces reveal that nothing else does:
+
+- **N+1 queries** — forty-seven identical spans in a row, unmistakable as a visual pattern.
+- **Which hop** owns the latency — your code, your database, or someone else's API.
+- **Serial calls that should be parallel** — three 200ms calls in sequence rather than 200ms total.
+- **Cross-service causality** — the request id ties your app's span to the worker's.
+
+### Sampling, and why traces are cheap enough to use
+
+You don't trace everything. A typical configuration keeps:
+
+- **100% of errors** and slow requests (they're what you need),
+- **1–10% of normal traffic** (enough for percentiles and patterns).
+
+That's <Term k="sampling">sampling</Term>, and it's why tracing is affordable. The one rule: make the decision at the *start* of a request and propagate it, so you never get half a trace.
+
+### How the three signals join up
+
+The payoff is navigability. An error in Sentry links to the trace of the request that caused it, which links to the logs sharing that request id. That chain exists only if one value is present everywhere — the <Term k="correlation-id">request id</Term> from L8.3. Without it you have three tools and three separate searches; with it you have one investigation.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Poor-man's tracing: where is the time, by layer? ─────────────────
+curl -s -o /dev/null -w \
+  "dns:%{time_namelookup} connect:%{time_connect} ttfb:%{time_starttransfer} total:%{time_total}\n" \
+  http://localhost:3001/api/bookings
+#   ttfb ≈ server work. total − ttfb ≈ transfer. Big dns/connect = network, not app.
+
+# ── Compare routes to isolate the slow dependency ────────────────────
+for p in /api/health /api/rooms /api/bookings; do
+  printf "%-16s" "$p"
+  for i in 1 2 3; do curl -s -o /dev/null -w "%{time_total} " "http://localhost:3001$p"; done; echo
+done
+#   /api/rooms (Redis) vs /api/bookings (Postgres) localises the cost.
+
+# ── The database's own span-level truth ──────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c '\timing' \
+  -c 'EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;'
+#   "Seq Scan" + high actual time on a big table = the missing-index story.
+
+# ── Catch N+1 by counting queries per request ────────────────────────
+before=$(docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT sum(calls) FROM pg_stat_statements WHERE query LIKE 'SELECT%';" 2>/dev/null || echo 0)
+curl -s -o /dev/null http://localhost:3001/api/bookings
+after=$(docker compose exec -T db psql -U ots -d demo -tAc \
+  "SELECT sum(calls) FROM pg_stat_statements WHERE query LIKE 'SELECT%';" 2>/dev/null || echo 0)
+echo "queries for one request: $((after - before))"
+#   (pg_stat_statements needs enabling; without it, count queries in debug logs.)
+#   More than ~10 for a list page is an N+1 smell.
+
+# ── Which statements dominate total time? (the ranked truth) ─────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT calls, round(total_exec_time::numeric,1) AS total_ms,
+         round(mean_exec_time::numeric,2) AS mean_ms, left(query,60) AS query
+    FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 5;" 2>/dev/null \
+  || echo "pg_stat_statements not enabled — add it to shared_preload_libraries"
+#   Rank by TOTAL time, not mean: a 5ms query called 10,000 times beats a 2s query called once.
+
+# ── Verify your tracing is actually propagating ──────────────────────
+curl -si -X POST localhost:3001/api/bookings -H 'Content-Type: application/json' \
+  -d '{"room_id":3,"customer_name":"trace-test","date":"2026-12-05","start_hour":9,"end_hour":10}' \
+  | grep -iE "x-request-id|traceparent"
+#   Then confirm the same id appears in the worker's lines for any work it triggered.
+```
+
+Ranking by **total** time rather than mean is the detail that catches N+1 problems from the database side: each individual query looks fast, and the sum is the outage.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | Errors | Traces | Note |
+|---|---|---|---|
+| **Sentry** | ✅ Best-in-class | ✅ Good | Start here. Generous free tier, minutes to install |
+| **Datadog APM** | ✅ | ✅ Excellent | Powerful, correlated, expensive at scale |
+| **Grafana Cloud** (Tempo + Faro) | ⚠️ Basic | ✅ | Good if already on Grafana |
+| **Honeycomb** | ⚠️ | ✅ Excellent for high-cardinality | Different, very strong, query-first model |
+| **OpenTelemetry** | — | ✅ The standard | A *specification and SDK*, not a backend |
+| Platform built-ins | ⚠️ | ⚠️ | Free; shallow but real |
+
+**OpenTelemetry is not a product.** It's the vendor-neutral standard for producing traces (and metrics and logs). You instrument with OTel once and point it at Sentry, Datadog, Grafana Tempo or Honeycomb — changing backends without reinstrumenting. That's why it's worth using even if you choose a commercial backend today.
+
+Sentry, with the parts that matter:
+
+```ts
+// instrumentation.ts (Next.js) or the top of your entry point
+import * as Sentry from "@sentry/nextjs";
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV,
+  release: process.env.GIT_SHA,        // ← makes "which deploy introduced this" work
+  tracesSampleRate: 0.1,              // 10% of transactions
+  profilesSampleRate: 0.0,
+  sendDefaultPii: false,              // ← do not ship user data by default
+  beforeSend(event) {                 // ← belt and braces on secrets
+    if (event.request?.headers) {
+      delete event.request.headers["authorization"];
+      delete event.request.headers["cookie"];
+    }
+    return event;
+  },
+});
+```
+
+Four settings carry almost all the value: `release` (otherwise "which deploy caused this" is unanswerable), `tracesSampleRate` (cost control), `sendDefaultPii: false` and `beforeSend` (your error tracker is a log destination too — L8.3's leak applies here, with the extra wrinkle that it's a third party).
+
+What good looks like: unhandled errors arrive automatically with stack traces, releases and user counts; 10% of requests are traced plus 100% of errors; every error links to a trace and both carry the request id that matches your logs.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Measure where time goes, by layer**, with the `curl -w` command from the Operator block against all three endpoints. Explain the ordering from the architecture (health → Redis → Postgres) before looking at the numbers.
+
+2. **Create a real N+1 and see it from both sides.** Add a deliberately naive loop to a scratch endpoint — fetch bookings, then query the room for each booking individually — then count the queries:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT calls, left(query,50) FROM pg_stat_statements ORDER BY calls DESC LIMIT 5;" 2>/dev/null \
+     || docker compose logs --since 1m db | grep -c "SELECT"
+   ```
+   The signature is one query shape with a very high `calls` count and a tiny `mean_ms`.
+
+3. **Grow the data and watch the same endpoint change character:**
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -f /dev/stdin < scripts/break/missing-index-growth.sql
+   docker compose exec -T db psql -U ots -d demo -c \
+     'EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM bookings WHERE date = CURRENT_DATE;'
+   ```
+   Read the plan: `Seq Scan`, rows scanned, actual time. That's the span-level truth a trace would surface as one wide bar.
+
+4. **Install Sentry on the demo app** (free account, 10 minutes):
+   - `npm i @sentry/nextjs`, add the `Sentry.init` above with `SENTRY_DSN` in `compose.yaml`.
+   - Trigger a real error: `docker compose stop db`, then load the homepage.
+   - In Sentry, confirm you can see the stack trace, first-seen time, and the release. Then `docker compose start db`.
+
+5. **Join the signals.** Make the request id from L8.3 available to Sentry (`Sentry.setTag("request_id", id)`), trigger an error, and practise the chain: Sentry issue → request id → `docker compose logs app | grep <id>`. That navigation is the whole point of the three signals together.
+
+6. **Check your own product** for the four Sentry settings that matter: is `release` set? Is `sendDefaultPii` false? Is there a `beforeSend` scrubber? Is `tracesSampleRate` deliberate rather than defaulted?
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** The bookings list page has become slow — "a few seconds" — over the past month. No deploy correlates. The team has Sentry installed (errors only, no tracing) and the platform's latency panel.
+
+<Evidence title="what they can see">
+
+```text
+Sentry → Issues: 0 new issues in 30 days. No errors at all on this route.
+Platform latency panel, /api/bookings:
+  30 days ago   p50 118ms   p95 240ms
+  today         p50 890ms   p95 3,900ms
+  (smooth climb, no step change, no deploy markers nearby)
+```
+
+</Evidence>
+
+<Evidence title="what they do next — a trace of one slow request">
+
+```text
+GET /api/bookings                                        3,812ms
+├── middleware: auth                                         5ms
+├── SELECT bookings JOIN rooms WHERE date >= …           3,676ms   ← 96%
+│     └── db.statement: SELECT b.id, r.name … ORDER BY b.date, b.start_hour LIMIT 200
+├── jsonb_array_length(notes) per row                       88ms
+└── serialise response                                      41ms
+```
+
+</Evidence>
+
+<Evidence title="the database's view">
+
+```text
+$ EXPLAIN (ANALYZE, BUFFERS) SELECT b.id, r.name FROM bookings b
+    LEFT JOIN rooms r ON r.id = b.room_id WHERE b.date >= CURRENT_DATE
+    ORDER BY b.date, b.start_hour LIMIT 200;
+
+ Limit  (cost=18244.19..18244.44 rows=200) (actual time=3671.882..3672.104 rows=200 loops=1)
+   ->  Sort  (actual time=3671.878..3671.962 rows=200 loops=1)
+         Sort Key: b.date, b.start_hour
+         Sort Method: top-N heapsort  Memory: 73kB
+         ->  Hash Left Join  (actual time=0.044..3610.102 rows=401203 loops=1)
+               ->  Seq Scan on bookings b  (actual time=0.019..2914.771 rows=401203 loops=1)
+                     Filter: (date >= CURRENT_DATE)
+                     Rows Removed by Filter: 0
+               Buffers: shared hit=1204 read=38891
+ Planning Time: 0.214 ms
+ Execution Time: 3672.401 ms
+
+$ SELECT relname, seq_scan, idx_scan, n_live_tup FROM pg_stat_user_tables
+    WHERE relname='bookings';
+ relname  | seq_scan | idx_scan | n_live_tup
+----------+----------+----------+------------
+ bookings |  1842301 |        0 |     401203
+```
+
+</Evidence>
+
+Sentry has nothing to say. Why, and what do the trace and plan together tell you?
+
+<Reveal label="Reveal the cause">
+
+**A missing index on a table that grew. Nothing is erroring — it's just getting slower, forever.**
+
+**Why Sentry is silent, and why that's correct:** an error tracker catches *failures*. Nothing here fails. Every request returns 200, just slowly. This is the signal boundary that matters: errors tell you what broke; **traces and metrics tell you what degraded.** A team with only error tracking is blind to the entire class of "working but getting worse", which is most of what growth does to a young product.
+
+**What the trace establishes in one glance:** 3,676ms of 3,812ms — 96% — is inside a single database span. That eliminates the frontend, the serialisation, the network, the notes computation and any N+1 hypothesis outright. Compare this with the first team in the story, who spent three days eliminating those same candidates by shipping changes.
+
+**What the plan adds:** `Seq Scan on bookings`, 401,203 rows actually scanned to return 200, with `read=38891` buffers (going to disk). `idx_scan = 0` and `seq_scan = 1,842,301` on `pg_stat_user_tables` confirms this table has *never* used an index — because, as the demo app's planted anti-pattern AP4 states, there are none beyond the primary key. `Rows Removed by Filter: 0` is the detail that names the real problem: the filter isn't selective at all, so every row is read and then sorted, just to return the first 200.
+
+**Why it's gradual and uncorrelated with deploys:** this is the "accumulation" shape from M0.4. At 50 rows a sequential scan is instant; at 400,000 it's 3.7 seconds. Nobody changed anything — the table grew. The smooth metric curve with no step change is the fingerprint, and it rules out a deploy as cause before you check the deploy log.
+
+**Fix, in order:**
+1. **Add the index** the query actually needs, without locking the table:
+   `CREATE INDEX CONCURRENTLY idx_bookings_date_start ON bookings (date, start_hour);`
+   It serves both the filter and the `ORDER BY`, so the sort disappears too.
+2. **Re-measure.** Run the same `EXPLAIN ANALYZE`; you want `Index Scan` and a figure in milliseconds. *Measuring after is not optional* — it's the difference between this fix and the first team's five speculative changes.
+3. **Add tracing properly** (10% sampling): this class of problem is only ever cheap to diagnose with traces, and you will meet it again on other routes.
+4. **Add a leading indicator:** alert when `seq_scan` on a large table climbs, or when p95 on any route doubles week over week. The metric was moving for a month before anyone noticed — which was a month of warning nobody had configured anything to read.
+5. Sanity-check the rest: the same table also has no foreign keys (AP3) and the notes column is a single jsonb cell (AP1) — different lessons, same table, worth knowing about.
+
+**The transferable lesson:** choose the signal that matches the question. *"Is it broken?"* → errors. *"Is it getting worse?"* → metrics. *"Where exactly is the time going?"* → traces. The team had the first and part of the second; the third turned three days of guessing into one line of SQL.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Install Sentry in this project with: DSN from env, environment, release set from the git SHA, tracesSampleRate 0.1, sendDefaultPii false, and a beforeSend that strips authorization and cookie headers plus any field named password, token or key. Then show me how to verify that a thrown error arrives with a readable stack trace and the correct release tag."}>
+Verify by throwing a real error and opening the issue — specifically check the **release** field is populated, since "which deploy introduced this" is the single most valuable thing it buys and a missing SHA silently disables it. Confirm no `authorization` header appears in the captured event (L8.3 applies to error trackers too, and this one is a third party).
+</AgentTask>
+
+<AgentTask prompt={"This endpoint is slow: [route]. Instrument it with OpenTelemetry spans around each distinct unit of work — each database query, each external HTTP call, and any heavy computation — then tell me how to read the resulting trace to find the dominant span. Do not optimise anything yet."}>
+"Do not optimise yet" is the point: you want measurement before changes, which is what the first team in the story skipped. Check the spans wrap *individual* queries rather than one blob around the handler — a single span covering everything tells you nothing you didn't know.
+</AgentTask>
+
+<AgentTask prompt={"Here is an EXPLAIN ANALYZE plan: [paste]. Tell me: which operation dominates the time, how many rows were actually scanned versus returned, whether an index is being used, and what single index would change the plan. Quote the specific lines of the plan that support each conclusion, and tell me how I verify the improvement."}>
+Insist it quotes lines — that's how you learn to read plans yourself rather than outsourcing it. Watch for `Seq Scan` on a large table, a big gap between rows scanned and rows returned, and whether a `Sort` could be served by the same index. Then run the before/after `EXPLAIN ANALYZE` yourself; the plan type changing from `Seq Scan` to `Index Scan` is the proof.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Match the question to the signal:
+
+- "What broke, how often, since when, which deploy?" → **error tracker**
+- "Is it getting worse over weeks?" → **metrics**
+- "Where exactly did this request's time go?" → **trace**
+
+Error tracking setup worth verifying:
+
+- Is `release` set from the git SHA? (Without it, "which deploy" is unanswerable.)
+- Is PII sending off, and is there a `beforeSend` scrubber?
+- Is the sample rate for traces deliberate?
+- Does the request id from your logs appear as a tag?
+
+Tracing habits:
+
+- Spans around each query and each external call, not one span per handler.
+- 100% of errors and slow requests; a small sample of normal traffic.
+- Read the widest bar first — that's the diagnosis.
+- For databases, rank statements by **total** time, not mean, so N+1 shows up.
+
+What good looks like: an error links to a trace links to logs, all joined by one request id — and "why is this slow" is answered by looking, not guessing.
+
+Red flags: error tracking as your only observability (blind to degradation); shipping performance fixes with no before-and-after measurement; `EXPLAIN` without `ANALYZE` (estimates, not reality).
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l05"
+  questions={[
+    {
+      q: "Why is an error tracker the highest-leverage first purchase, ahead of dashboards or tracing?",
+      options: [
+        "It is the cheapest observability product",
+        "One SDK line delivers stack traces, first-seen times, occurrence counts and the release that introduced each error — debugging-method steps 2, 3 and 5 at once",
+        "It replaces the need for logging entirely",
+        "It automatically fixes common error patterns"
+      ],
+      answer: 1,
+      explain: "Grouping plus first-seen plus release is what logs genuinely can't do for you: 1,400 log lines become one issue that already tells you when it started and which deploy caused it."
+    },
+    {
+      q: "In the break-fix, Sentry reported zero issues while the page took 3.8 seconds. Why?",
+      options: [
+        "The sample rate was too low to capture the slow requests",
+        "Nothing was failing — every request returned 200, just slowly. Error trackers catch failures; degradation is a metrics and tracing question",
+        "Database timeouts are not reported to Sentry by default",
+        "The errors were caught and handled by the application"
+      ],
+      answer: 1,
+      explain: "That's the signal boundary. A team with only error tracking is blind to 'working but getting worse', which is most of what growth does to a young product."
+    },
+    {
+      q: "What does a trace showing forty-seven near-identical database spans in sequence tell you?",
+      options: [
+        "The database is under-provisioned for the query volume",
+        "An N+1 query pattern — the code is querying once per item instead of fetching them in one query or batch",
+        "The connection pool is too small",
+        "A retry loop is firing repeatedly"
+      ],
+      answer: 1,
+      explain: "It's unmistakable as a visual pattern, which is exactly why traces find it in seconds. From the database side the same thing appears as one query shape with a huge `calls` count and a tiny mean time."
+    },
+    {
+      q: "Why rank database statements by total execution time rather than mean?",
+      options: [
+        "Mean time is unreliable with small sample sizes",
+        "A 5ms query called 10,000 times costs far more than a 2s query called once — total time finds N+1 patterns that mean time hides",
+        "Total time accounts for network latency",
+        "Mean time excludes planning time"
+      ],
+      answer: 1,
+      explain: "Each individual N+1 query looks perfectly healthy by mean. The sum is the outage, which is why `ORDER BY total_exec_time DESC` is the useful query."
+    },
+    {
+      q: "What does setting `release` in your error tracker buy you?",
+      options: [
+        "Separate quotas per deployment",
+        "The ability to answer 'which deploy introduced this error' automatically — debugging-method step 5, done by the tool",
+        "Automatic rollback when error rates spike",
+        "Source map upload for minified stack traces"
+      ],
+      answer: 1,
+      explain: "Without the SHA, the tracker can group and time errors but can't attribute them to a change — silently disabling the most valuable correlation it offers."
+    }
+  ]}
+/>
+
+</Section>

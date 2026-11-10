@@ -1,0 +1,45 @@
+id: sc-correlate-request-01
+module: M8
+lesson: m08-l03
+title: "Customer says they were charged twice"
+difficulty: realistic
+symptom: "A customer reports being charged twice for booking #4471 at about 2pm yesterday. You have logs from three services and no way to connect them."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: traffic
+      apply: scripts/load/webhook-replay.js
+    - type: traffic
+      apply: scripts/load/steady-browse-and-order.js   # noise, so correlation is actually needed
+evidence:
+  logs: true
+  metrics: [payments.created]
+  db_console: true
+  notes: "App, worker and webhook log lines are interleaved with unrelated traffic and carry no shared identifier."
+agent:
+  context: "You can read all three services' logs but they share no request identifier."
+  bias: "matches log lines by timestamp proximity, which is unreliable under concurrent traffic"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - duplicate-payments-prevented
+    - request-id-propagated           # one id must appear across app, worker and webhook lines
+  root_cause_markers:
+    - request/correlation id added and propagated, returned to the client
+    - duplicate charge traced to webhook redelivery
+    - idempotency enforced on provider_event_id
+  symptom_only_markers:
+    - duplicate rows deleted manually with no idempotency added
+    - timestamps used as the correlation mechanism
+hints:
+  - "Try to follow this one booking across three services. What is missing from every line?"
+  - "Under concurrent traffic, can timestamps reliably tell you which lines belong together?"
+  - "What does the payment provider's delivery log show for this event?"
+  - "Reveal: add a request id to every line and return it to clients; then enforce idempotency on the provider event id."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

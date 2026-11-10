@@ -1,0 +1,453 @@
+---
+id: m08-l02
+module: M8
+title: "Where logs live, and how to search them"
+order: 2
+difficulty: 2
+depth: both
+platforms: [vercel, render, railway, docker, kibana, grafana, datadog]
+concepts: [logs, failure-triage]
+prerequisites: [m08-l01]
+lab: demo-repo
+scenario_ids: [sc-find-the-logs-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+An engineer joined a four-person startup and was handed the on-call phone in week two. The first page came at 23:40: checkout failing.
+
+She knew exactly what to do — read the logs. It took her **nineteen minutes to find them.** The web app's logs were in Vercel's dashboard. The worker's logs were on Render, a different account she didn't have access to. The database's slow queries were in Supabase, under a tab called "Logs & Analytics" that defaulted to a different log type. The payment webhook failures were in Stripe's own dashboard. And a `console.log` the previous developer had added was writing to a file on a VPS nobody had mentioned.
+
+The error, when she finally found it, had been sitting in the Stripe dashboard the whole time, in plain English.
+
+Nineteen minutes of an outage spent on *navigation*. The fix for this is not a tool — it's a list, written down before the incident, of where each box's logs live.
+
+</Section>
+
+<Section kind="already-did">
+
+You've read logs in at least three places: your platform's log tab, your terminal during `npm run dev`, and a provider's dashboard. You may have hit the two classic walls without naming them: logs that **disappeared** (platform retention, or a container that was replaced), and logs that were **unsearchable** because everything interesting was inside a wall of text.
+
+You've also almost certainly done the thing that makes logs hard to find later: `console.log` in a `catch` block. It works beautifully in development, where you're watching. In production it goes wherever that process's stdout goes — which may be nowhere you ever look.
+
+</Section>
+
+<Section kind="mental-model">
+
+The governing rule, and nearly everything follows from it:
+
+<Callout type="key">
+**Your app should write logs to stdout and nothing else.** Not to a file, not to a log service directly. Whatever runs your process — Docker, systemd, your platform — captures stdout and routes it. An app that writes its own log files breaks in containers (the file vanishes with the container), fills disks (M1.3's break-fix), and can't be aggregated.
+</Callout>
+
+So "where are the logs?" is really "what captured stdout, and where did it put it?"
+
+<svg viewBox="0 0 780 290" role="img" aria-label="Logs flow from the application's stdout into whatever supervises the process, which routes them to a platform log tab, the systemd journal, docker logs, or an aggregator" className="diagram">
+  <defs>
+    <marker id="arrl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="8" y="110" width="170" height="64" rx="10" />
+  <text x="93" y="136" textAnchor="middle">Your app</text>
+  <text x="93" y="156" textAnchor="middle" className="sub">writes to stdout</text>
+
+  <rect x="248" y="110" width="190" height="64" rx="10" />
+  <text x="343" y="136" textAnchor="middle">Whatever runs it</text>
+  <text x="343" y="156" textAnchor="middle" className="sub">docker · systemd · platform</text>
+
+  <rect x="516" y="14" width="256" height="52" rx="10" />
+  <text x="644" y="36" textAnchor="middle" className="sub">Platform log tab</text>
+  <text x="644" y="54" textAnchor="middle" className="sub">Vercel · Render · Railway · Fly</text>
+
+  <rect x="516" y="80" width="256" height="52" rx="10" />
+  <text x="644" y="102" textAnchor="middle" className="sub">journalctl -u app</text>
+  <text x="644" y="120" textAnchor="middle" className="sub">systemd journal, on a VPS</text>
+
+  <rect x="516" y="146" width="256" height="52" rx="10" />
+  <text x="644" y="168" textAnchor="middle" className="sub">docker logs / compose logs</text>
+  <text x="644" y="186" textAnchor="middle" className="sub">gone when the container is removed</text>
+
+  <rect x="516" y="212" width="256" height="52" rx="10" />
+  <text x="644" y="234" textAnchor="middle" className="sub">Aggregator</text>
+  <text x="644" y="252" textAnchor="middle" className="sub">Loki · Axiom · Datadog · CloudWatch</text>
+
+  <path d="M 178 142 L 244 142" className="arrow" markerEnd="url(#arrl)" />
+  <path d="M 438 130 L 480 100 L 512 56" className="arrow" markerEnd="url(#arrl)" />
+  <path d="M 438 136 L 512 110" className="arrow" markerEnd="url(#arrl)" />
+  <path d="M 438 148 L 512 170" className="arrow" markerEnd="url(#arrl)" />
+  <path d="M 438 154 L 480 190 L 512 234" className="arrow" markerEnd="url(#arrl)" />
+  <text x="12" y="212" className="sub">One rule: never write log files</text>
+  <text x="12" y="232" className="sub">from your app. stdout only —</text>
+  <text x="12" y="252" className="sub">the runtime decides where it goes.</text>
+</svg>
+
+### The six places logs hide
+
+| Where | How to read it | Retention | The gotcha |
+|---|---|---|---|
+| Platform log tab | Dashboard, or `vercel logs` / `railway logs` | Hours to days | **Short.** Last week may be gone forever |
+| `docker logs` | `docker compose logs -f app` | Until the container is removed | `docker compose down` **deletes them** |
+| systemd journal | `journalctl -u app --since "1 hour ago"` | Disk-limited, often weeks | Needs `--no-pager` in scripts |
+| A file on a server | `tail -f /var/log/app/app.log` | Until the disk fills | The anti-pattern; fills disks |
+| Provider dashboards | Stripe, Supabase, Resend, Anthropic each have their own | Varies, often generous | **The forgotten one** — where the story's answer was |
+| Aggregator | Query language (KQL, LogQL, Datadog search) | What you pay for | Setup cost; cost scales with volume |
+
+The row people miss is **provider dashboards**. When a third-party call fails, *their* logs usually explain it better than yours: Stripe tells you exactly why a charge was declined; Resend shows you the bounce reason; Anthropic shows you the rate-limit window. Your log line says "request failed".
+
+### Retention is the constraint that decides what you can learn
+
+A log you can't read is a log you don't have. Three failure modes:
+
+1. **Expired** — platform retention is often 1–7 days. Monday's incident is unanswerable by Friday.
+2. **Destroyed** — `docker compose down`, a container replacement, or a redeploy can take logs with them.
+3. **Unsearchable** — present but unstructured, so finding anything requires reading rather than querying (L8.3 fixes this).
+
+The practical response: during an incident, **save the evidence before you fix anything.** The fix often destroys the logs — a restart replaces the container, a redeploy rolls the platform's log window. Copy what you need to a file first; it costs five seconds and is routinely the difference between a postmortem and a shrug.
+
+### How to search, in four moves
+
+The same four work in `grep`, Kibana, Loki and Datadog — only the syntax changes.
+
+| Move | `grep` | Kibana / Loki / Datadog |
+|---|---|---|
+| Narrow by **time** first | `--since 30m` | time picker — always set this first |
+| Filter by **field** | `grep 'status=500'` | `status:500` |
+| Find the **first** occurrence | `… \| head -5` | sort ascending |
+| Get **context** around a hit | `grep -B3 -A10` | "surrounding documents" / `| context` |
+
+Time first, then field, then first-occurrence, then context. Searching a whole retention window for the word "error" is how you end up reading eleven thousand lines, as in M1.3's story.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Follow live (deploys, reproducing a bug) ──────────────────────────
+docker compose logs -f app
+docker compose logs -f --tail 20 app worker          # several services, interleaved
+#   Platform / VPS equivalents:
+vercel logs --follow ; railway logs ; flyctl logs
+journalctl -u riverside -f
+
+# ── Time window first, ALWAYS ────────────────────────────────────────
+docker compose logs --since 30m --timestamps app
+docker compose logs --since 2026-11-07T14:00:00 --until 2026-11-07T14:10:00 app
+journalctl -u riverside -S "14:00" -U "14:10" --no-pager
+
+# ── Then filter, then find the FIRST occurrence ──────────────────────
+docker compose logs --since 1h app 2>&1 | grep -iE "error|fatal" | head -5
+docker compose logs --since 1h app 2>&1 | grep -c -iE "error"      # how many?
+
+# ── Context around a hit (a stack trace lives below its first line) ──
+docker compose logs --since 1h app 2>&1 | grep -A12 -B2 "Error:" | head -40
+
+# ── Several services: who saw the request? (correlation by hand) ─────
+docker compose logs --since 10m app worker 2>&1 | grep "booking.created"
+#   This is painful without request ids — which is exactly L8.3's point.
+
+# ── SAVE EVIDENCE BEFORE FIXING (the fix destroys the logs) ──────────
+mkdir -p /tmp/incident-$(date +%F)
+docker compose logs --since 2h --timestamps app  > /tmp/incident-$(date +%F)/app.log
+docker compose logs --since 2h --timestamps worker > /tmp/incident-$(date +%F)/worker.log
+docker compose ps > /tmp/incident-$(date +%F)/containers.txt
+docker compose exec -T db psql -U ots -d demo -c \
+  "SELECT * FROM pg_stat_activity WHERE datname='demo';" \
+  > /tmp/incident-$(date +%F)/db-activity.txt
+#   Now you can restart freely.
+
+# ── Provider-side logs (the forgotten source) ────────────────────────
+#   No CLI needed — bookmark these, one per third-party box on your map:
+#     Stripe    → Developers → Events / Logs   (why a charge failed)
+#     Supabase  → Logs & Analytics → Postgres  (slow queries, errors)
+#     Resend    → Emails → Logs                (bounce reasons)
+#     Anthropic → Console → Usage/Logs         (rate limits, spend)
+
+# ── Database logs: the ones nobody checks ────────────────────────────
+docker compose logs --since 30m db 2>&1 | grep -iE "error|fatal|deadlock|slow" | head
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT query, state, now() - query_start AS running_for
+    FROM pg_stat_activity
+   WHERE datname='demo' AND state <> 'idle' ORDER BY query_start LIMIT 5;"
+```
+
+The `--timestamps` flag matters more than it looks: without it, `docker logs` output has no time information at all, which makes timeline reconstruction (debugging-method step 3) impossible.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | Query style | When it's the right call |
+|---|---|---|
+| Platform log tab | Text search, basic filters | Always your first stop; zero setup |
+| `journalctl` | Flags (`-u`, `-S`, `-p`) | On a VPS; genuinely good once you know four flags |
+| `docker compose logs` | Flags + pipe to `grep` | Local and single-host container work |
+| **Axiom / Better Stack** | Structured query | Small teams wanting real search cheaply |
+| **Grafana Loki** | LogQL — `{app="web"} |= "error"` | You already run Grafana for metrics |
+| **Datadog / New Relic** | Rich query + correlation | Funded teams, many services; expensive at volume |
+| **CloudWatch Logs** | Logs Insights SQL-ish | You're on AWS and it's already there |
+| Kibana / OpenSearch | KQL — `status:500 and route:"/api/bookings"` | Self-hosted ELK, or inherited one |
+
+Enough KQL and LogQL to be dangerous, since these two cover most inherited setups:
+
+```text
+# Kibana (KQL)
+status:500 and route:"/api/bookings" and not user_agent:*bot*
+@timestamp >= "2026-11-07T14:00:00" and level:error
+
+# Loki (LogQL)
+{service="app"} |= "error" | json | status >= 500
+sum(rate({service="app"} |= "error" [5m]))     # a metric, derived from logs
+```
+
+What good looks like: **a written list, one line per box on your L0.3 map, of where its logs live and how far back they go.** Four lines for a small product. That list is the nineteen minutes the engineer in the story lost, recovered.
+
+| Box | Where | Retention |
+|---|---|---|
+| Web app | Vercel → project → Logs (`vercel logs`) | 1 day (Hobby) |
+| Worker | Render → service → Logs | 7 days |
+| Postgres | Supabase → Logs & Analytics → Postgres | 1 day |
+| Payments | Stripe → Developers → Events | 30+ days |
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &
+```
+
+1. **Follow live, then reproduce a failure while watching.** In one terminal `docker compose logs -f app`; in another `docker compose stop db`. Watch the failure appear in real time, then `docker compose start db`.
+2. **Practise time-first searching:**
+   ```bash
+   docker compose logs --since 5m --timestamps app | tail -20
+   docker compose logs --since 5m app 2>&1 | grep -iE "error" | head -3
+   ```
+3. **Get context around a stack trace** — note that the useful lines are *below* the match:
+   ```bash
+   docker compose logs app 2>&1 | grep -A10 "Error:" | head -24
+   ```
+4. **Read a log source you probably never check** — the database's own:
+   ```bash
+   docker compose logs --since 10m db 2>&1 | tail -20
+   ```
+5. **Prove that logs are destroyed by routine operations.** Count lines, recreate the container, count again:
+   ```bash
+   docker compose logs app 2>&1 | wc -l
+   docker compose up -d --force-recreate app
+   docker compose logs app 2>&1 | wc -l        # the history is gone
+   ```
+   This is why evidence capture comes *before* the fix.
+6. **Do the evidence-capture drill.** Trigger a real failure, save everything, *then* fix:
+   ```bash
+   node scripts/break/connection-hungry-backfill.js 15 2 &
+   sleep 25
+   mkdir -p /tmp/ots-incident
+   docker compose logs --since 5m --timestamps app > /tmp/ots-incident/app.log
+   docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT count(*), state FROM pg_stat_activity WHERE datname='demo' GROUP BY state;" \
+     > /tmp/ots-incident/db.txt
+   kill %2 2>/dev/null; head -5 /tmp/ots-incident/app.log; cat /tmp/ots-incident/db.txt
+   ```
+7. **Write your own log-location table** for your real product, using the four-column format above. This is the deliverable of the lesson.
+
+```bash
+kill %1 2>/dev/null
+```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** Customers report that booking confirmation emails stopped arriving this morning. Bookings themselves work fine — rows appear in the database. The team's app logs show nothing unusual.
+
+<Evidence title="app logs (the only place they looked)">
+
+```text
+$ docker compose logs --since 3h app 2>&1 | grep -iE "email|mail|resend" | head
+(no output)
+
+$ docker compose logs --since 3h app 2>&1 | grep -iE "error|fatal" | head
+(no output)
+
+$ docker compose logs --since 3h app 2>&1 | tail -4
+booking.created id=5841 room=1 2026-11-09 10-13
+GET /api/bookings 200 194ms
+booking.created id=5842 room=3 2026-11-09 14-16
+GET /api/rooms 200 5ms (cache: hit)
+```
+
+</Evidence>
+
+<Evidence title="what the worker's logs show">
+
+```text
+$ docker compose logs --since 3h worker 2>&1 | tail -6
+[worker] report run starting at 2026-11-09T09:00:04.113Z
+[worker] report written: Bookings today: 12. Projected revenue: $2,840.00.
+[worker] email batch: 12 queued
+[worker] email batch: sending via provider
+[worker] email batch: done
+[worker] report run starting at 2026-11-09T09:10:03.981Z
+```
+
+</Evidence>
+
+<Evidence title="the provider's dashboard (checked 40 minutes later)">
+
+```text
+Resend → Emails → Logs, last 3 hours:
+  Delivered:  0
+  Bounced:    0
+  Failed:     47
+  Status detail on each: "403 — domain riverside-studios.example is not verified.
+                          Verification record (TXT _resend) was removed from DNS."
+
+Resend → Domains:
+  riverside-studios.example   ⚠ Not verified   (verified until 2026-11-09 08:52)
+```
+
+</Evidence>
+
+<Evidence title="change log">
+
+```text
+$ Cloudflare DNS audit log:
+  2026-11-09 08:51  TXT  _resend  DELETED  by asha@…
+  2026-11-09 08:50  TXT  _dmarc   UPDATED  by asha@…
+  (ticket: "clean up unused DNS records")
+```
+
+</Evidence>
+
+The app logged nothing wrong, and it was telling the truth. Where was the answer, and what does that teach about log sources?
+
+<Reveal label="Reveal the cause">
+
+**A DNS cleanup removed Resend's domain-verification TXT record, so the provider began rejecting every send with a 403. The answer was in the *provider's* logs — a source the team never opened.**
+
+**Why their own logs were blameless and useless.** The worker's log says `email batch: done`, which is honest: it successfully handed 12 messages to the provider's API. If the code only checks for a transport-level failure (or ignores the response entirely), a per-message `403` in the provider's response body never becomes an error in their system. Their logs correctly record "we sent them"; only Resend knows they were refused. This is the forgotten-source row of the table, and it's where third-party failures almost always live.
+
+**Reading the evidence in the right order:**
+1. The symptom is in a third-party box (email), so the cheapest check is that provider's dashboard — and it gives the cause *in plain English*, including the exact record name.
+2. The DNS audit log supplies the event: `TXT _resend DELETED` at 08:51, minutes before the first failure. "Clean up unused DNS records" removed a record that looked unused and was load-bearing.
+3. Verification expiring at 08:52 matches the timeline precisely.
+
+**Fix, in order:**
+1. **Restore the TXT record** in Cloudflare and re-verify the domain in Resend. Deliverability returns within the record's propagation window.
+2. **Resend the 47 failures** — deliberately and once, checking for duplicates, because some may have been retried already (M7.7's idempotency question).
+3. **Fix the blind spot, which is the real cause.** The worker must inspect the provider's per-message response and log a *distinguishable* error on rejection:
+   `email.failed to=… provider_status=403 reason="domain not verified"`. Then add an alert on `email.failed > 0`, and a metric for delivered-vs-attempted.
+4. **Add provider dashboards to the log-location list** from this lesson, one line per third-party box — Stripe, Resend, Anthropic. Bookmark them in one folder so the cheapest check is also the easiest.
+5. Separately: a DNS record deletion that breaks a verification is an argument for naming such records in a comment, or for noting them on the architecture map as load-bearing.
+
+**The transferable lesson:** "our logs show nothing" does not mean "nothing is wrong" — it frequently means **you are reading the wrong system's logs.** Every arrow on your map that leaves your infrastructure has a log on the other side, and that log usually explains the failure better than yours ever could.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"List every place this system's logs could end up: the web app, every worker or scheduled job, the database, and each third-party provider we call. For each, give the exact command or dashboard path to read them and the default retention. Identify any code that writes logs to a file instead of stdout, with file:line."}>
+This produces the log-location table, which is the lesson's deliverable. Verify two or three paths by actually opening them — an agent will guess dashboard navigation. Any file-writing logger it finds is a bug to fix (it breaks in containers and fills disks, per M1.3).
+</AgentTask>
+
+<AgentTask prompt={"Our emails/payments/AI calls to [provider] are failing but our own logs show nothing unusual. Explain what our code is likely not inspecting in the provider's response, then add logging that records the provider's status code and error reason on every non-success, as a single structured line. Show me the before and after for one call site."}>
+This is the break-fix turned into a fix. Check it logs the provider's *reason*, not just "failed" — the useful line names the status and message. Then verify by forcing a failure (use an invalid key in a scratch environment) and confirming one clear line appears.
+</AgentTask>
+
+<AgentTask prompt={"Write me an incident evidence-capture script: it should save the last 2 hours of logs from every service with timestamps, container/process status, database active queries and connection counts, and recent deploy history, into a timestamped directory. It must be read-only and safe to run during an incident, and must redact anything matching a secret pattern."}>
+Run it now, while nothing is broken, and read what it produced — a capture script you first use during an outage is a capture script that fails during an outage. Confirm it's genuinely read-only, and that the redaction actually fires by planting a fake `sk-test-…` string in a log line.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+The questions that make logs findable:
+
+- Where does each box's stdout actually go? (Write the table: box → location → retention.)
+- How far back can I search, per source? Which incidents are already unanswerable?
+- Does any of my code write log files instead of stdout?
+- Do I have the provider dashboards bookmarked for every third-party box on my map?
+- Do I capture evidence *before* restarting or redeploying?
+- Are timestamps included in my log output? (`--timestamps` for Docker; many formats omit them.)
+
+The search method, in order: **time window → field filter → first occurrence → context around it.**
+
+What good looks like: anyone on the team can find any box's logs in under a minute, from a written list, at 3am.
+
+Red flags: nineteen minutes of an incident spent navigating; "our logs show nothing" accepted as "nothing is wrong"; `docker compose down` run during an incident (it deletes the evidence); an app writing its own log files.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l02"
+  questions={[
+    {
+      q: "Why should an application write logs to stdout rather than to its own log file?",
+      options: [
+        "stdout is faster than file I/O",
+        "Whatever runs the process captures stdout and routes it — while app-written files vanish with containers, fill disks, and can't be aggregated",
+        "Log files cannot be searched with grep",
+        "stdout is automatically encrypted in transit"
+      ],
+      answer: 1,
+      explain: "It's the one rule the lesson hangs on: the runtime owns log routing. App-managed files produced M1.3's 26GB disk-full outage and disappear entirely in container environments."
+    },
+    {
+      q: "Your emails are failing but your app logs show nothing unusual. What's the most likely explanation?",
+      options: [
+        "The log level is too high to show email errors",
+        "The failure is recorded in the provider's logs, and your code isn't inspecting the provider's per-message response",
+        "The logs have already expired",
+        "The email code runs in a worker whose logs are separate"
+      ],
+      answer: 1,
+      explain: "Exactly the break-fix: the worker honestly logged 'done' for messages the provider rejected with 403. Every arrow leaving your infrastructure has a log on the other side, and it usually explains the failure better than yours."
+    },
+    {
+      q: "What is the correct order of moves when searching logs?",
+      options: [
+        "Search for 'error' across all retention, then narrow down",
+        "Narrow the time window first, then filter by field, then find the first occurrence, then read context around it",
+        "Read the most recent lines, then page backwards",
+        "Filter by severity, then by service, then by time"
+      ],
+      answer: 1,
+      explain: "Time first is what stops you reading eleven thousand lines. First-occurrence (not latest) connects to the debugging method; context matters because a stack trace lives below its first line."
+    },
+    {
+      q: "Why capture log evidence before applying a fix?",
+      options: [
+        "Fixes often require a restart or redeploy, which can replace containers or roll the platform's log window — destroying the evidence",
+        "Log capture is faster before the system is under load",
+        "Compliance requires an audit trail of all incidents",
+        "It prevents the logs from being written to disk"
+      ],
+      answer: 0,
+      explain: "The hands-on proves it: `--force-recreate` wipes a container's log history. Five seconds of capture is routinely the difference between a real postmortem and a shrug."
+    },
+    {
+      q: "Your platform retains logs for 24 hours. A customer reports a problem from last Monday. What's true?",
+      options: [
+        "You can request historical logs from the platform's support team",
+        "Those logs are gone permanently — which is why metrics (cheap to retain for months) and an error tracker are what answer questions about the past",
+        "The logs are archived automatically to object storage",
+        "You can reconstruct them from the database write-ahead log"
+      ],
+      answer: 1,
+      explain: "A log you can't read is a log you don't have. Short retention is exactly why L8.1 put 'when did this start' in the metrics column and recommended an error tracker first."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,437 @@
+---
+id: m08-l04
+module: M8
+title: "Metrics and dashboards: the four golden signals"
+order: 4
+difficulty: 2
+depth: both
+platforms: [grafana, datadog, postgres, redis, vercel]
+concepts: [metrics, golden-signals, latency-percentiles]
+prerequisites: [m08-l01]
+lab: demo-repo
+scenario_ids: [sc-golden-signals-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A team's dashboard had forty-one panels. It was beautiful. It had been built over a year by whoever happened to be curious about something: CPU per container, event-loop lag, Redis keyspace hits, a pie chart of HTTP methods, GC pause time, three different views of memory.
+
+During their worst outage of the year — checkout down for fifty minutes — nobody looked at it. Afterwards, in the postmortem, someone asked why. The honest answer: *"I didn't know which panel would have told me."*
+
+They rebuilt it with four panels: request rate, error rate, p95 latency, and database connections in use. The next incident was diagnosed in four minutes, because the error-rate panel went vertical at 14:04 and the connections panel was flat against its ceiling right next to it.
+
+Forty-one panels was not ten times more observability than four. It was *less*, because none of them had been chosen to answer a question.
+
+</Section>
+
+<Section kind="already-did">
+
+You've looked at metrics without calling them that: the invocation and duration graphs on your platform's dashboard, your database provider's connection and CPU charts, the request count on a Cloudflare overview page. You've probably also looked at one during an incident and not known whether what you were seeing was *normal* — which is the problem this lesson solves.
+
+You may also have seen an average response time of 180ms and concluded things were fine, while a tenth of your users were waiting four seconds. Averages do that. The fix is percentiles, and it's the single most useful idea here.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The four golden signals
+
+Almost any service's health is described by four numbers. They come from Google's SRE practice and they've earned their status: if you graph only four things, graph these.
+
+<svg viewBox="0 0 780 300" role="img" aria-label="The four golden signals: traffic as request rate, errors as failure rate, latency as percentiles, and saturation as how full the limiting resource is" className="diagram">
+  <rect x="8" y="20" width="372" height="120" rx="10" />
+  <text x="194" y="46" textAnchor="middle">TRAFFIC</text>
+  <text x="194" y="68" textAnchor="middle" className="sub">how much is being asked of us</text>
+  <text x="194" y="90" textAnchor="middle" className="sub">requests/sec · jobs/min · by route</text>
+  <text x="194" y="114" textAnchor="middle" className="sub">context for every other signal:</text>
+  <text x="194" y="132" textAnchor="middle" className="sub">errors at 10x traffic ≠ errors at 1x</text>
+
+  <rect x="400" y="20" width="372" height="120" rx="10" />
+  <text x="586" y="46" textAnchor="middle">ERRORS</text>
+  <text x="586" y="68" textAnchor="middle" className="sub">what fraction is failing</text>
+  <text x="586" y="90" textAnchor="middle" className="sub">5xx rate · failed jobs · as a RATIO</text>
+  <text x="586" y="114" textAnchor="middle" className="sub">a count is meaningless without</text>
+  <text x="586" y="132" textAnchor="middle" className="sub">traffic; a ratio is comparable</text>
+
+  <rect x="8" y="158" width="372" height="120" rx="10" />
+  <text x="194" y="184" textAnchor="middle">LATENCY</text>
+  <text x="194" y="206" textAnchor="middle" className="sub">how long it takes</text>
+  <text x="194" y="228" textAnchor="middle" className="sub">p50 · p95 · p99 — never the mean</text>
+  <text x="194" y="252" textAnchor="middle" className="sub">split successful from failed:</text>
+  <text x="194" y="270" textAnchor="middle" className="sub">fast failures flatter your graph</text>
+
+  <rect x="400" y="158" width="372" height="120" rx="10" />
+  <text x="586" y="184" textAnchor="middle">SATURATION</text>
+  <text x="586" y="206" textAnchor="middle" className="sub">how full the limiting resource is</text>
+  <text x="586" y="228" textAnchor="middle" className="sub">DB connections · memory · queue depth</text>
+  <text x="586" y="252" textAnchor="middle" className="sub">the only LEADING indicator —</text>
+  <text x="586" y="270" textAnchor="middle" className="sub">it moves before users notice</text>
+</svg>
+
+| Signal | Question | For the demo app |
+|---|---|---|
+| **Traffic** | How much work is arriving? | requests/min by route; bookings created/min |
+| **Errors** | What fraction fails? | 5xx ÷ total, by route |
+| **Latency** | How long does it take? | <Term k="p95">p95</Term> and p99 per route, successes only |
+| **Saturation** | How close to a limit? | Postgres connections ÷ 10, heap used ÷ limit, queue depth |
+
+**Saturation is the one people omit and the one that pays.** Traffic, errors and latency tell you something is wrong *now*; saturation tells you something will be wrong soon. Connections climbing from 4 to 9 of 10 is a problem you can fix before any user sees an error — which is exactly the connection-starvation incident from L8.6 and M0.4, caught twelve minutes earlier.
+
+### Why averages lie, and percentiles don't
+
+Ten requests: nine take 100ms, one takes 5,000ms.
+
+- **Mean:** 590ms — describes nobody. No request took 590ms.
+- **p50 (median):** 100ms — the typical experience.
+- **p95:** ~5,000ms — what your unluckiest users actually get.
+
+<Callout type="key">
+A mean can hide any amount of pain, because one fast path dilutes any number of slow ones. Always read p50 *and* p95 (or p99): p50 is the typical experience, p95 is the experience that generates support tickets. If p50 is flat and p95 is climbing, something is slow for a *subset* — a user with more data, one bad shard, one cold cache. That divergence is itself a diagnosis.
+</Callout>
+
+One subtlety that bites: **percentiles don't average.** You cannot take the p95 of each instance and average them to get the fleet p95 — that number is meaningless. Aggregate the underlying distribution (that's what histograms are for), or read p95 per instance separately.
+
+### Counters, gauges, histograms
+
+| Type | Behaviour | Example | Read it as |
+|---|---|---|---|
+| **Counter** | Only increases | total requests, total errors | a **rate** — `rate(errors[5m])` |
+| **Gauge** | Up and down | connections in use, queue depth, memory | the current value |
+| **Histogram** | Distribution of values in buckets | request duration | percentiles |
+
+The common mistake is graphing a counter raw: "total requests: 48,211,903" is a line that only goes up and tells you nothing. Counters must be differentiated into rates before they mean anything.
+
+### Dashboard design: four panels, one question each
+
+Rules that keep a dashboard usable at 3am:
+
+1. **One screen, no scrolling.** If you must scroll, you'll miss the correlation that explains the incident.
+2. **Four to six panels.** Traffic, errors, latency, saturation — then at most two things specific to your product.
+3. **Same time range across all panels**, so corners line up visually. That alignment *is* the diagnosis: error rate going vertical next to connections hitting a ceiling tells the story without a word.
+4. **Label axes and state the unit.** "4.2" is not a measurement.
+5. **Mark deploys on the time axis.** Half of all incidents correlate with a deploy, and this answers debugging-method step 5 instantly.
+6. **Every panel must answer a question you'd actually ask.** If nobody can say what action a panel's movement would trigger, delete it. That's the forty-one-panel lesson.
+
+<Operator>
+
+You can get all four signals from the demo app with no new infrastructure — the database and your logs already hold them.
+
+```bash
+cd demo-app
+node scripts/load/steady-browse-and-order.js &
+
+# ── TRAFFIC: requests per route, last 5 minutes ──────────────────────
+docker compose logs --since 5m app 2>&1 \
+  | grep -oE "(GET|POST|PATCH) /api/[a-z-]*" | sort | uniq -c | sort -rn
+
+# ── ERRORS: as a RATIO, not a count ──────────────────────────────────
+total=$(docker compose logs --since 5m app 2>&1 | grep -cE " (2|4|5)[0-9]{2} ")
+errs=$(docker compose logs --since 5m app 2>&1  | grep -cE " 5[0-9]{2} ")
+echo "error rate: $errs / $total"
+
+# ── LATENCY: percentiles from logged durations ───────────────────────
+docker compose logs --since 5m app 2>&1 | grep -oE "[0-9]+ms" | tr -d 'ms' | sort -n \
+  | awk '{a[NR]=$1} END {
+      printf "n=%d p50=%dms p95=%dms p99=%dms max=%dms\n",
+      NR, a[int(NR*0.50)], a[int(NR*0.95)], a[int(NR*0.99)], a[NR]}'
+#   Compare that p95 with the mean to see the lie for yourself:
+docker compose logs --since 5m app 2>&1 | grep -oE "[0-9]+ms" | tr -d 'ms' \
+  | awk '{s+=$1; n++} END {printf "mean=%.0fms over %d requests\n", s/n, n}'
+
+# ── SATURATION: the leading indicator ────────────────────────────────
+docker compose exec -T db psql -U ots -d demo -tAc "
+  SELECT count(*) || ' / ' || current_setting('max_connections') AS connections
+    FROM pg_stat_activity WHERE datname='demo';"
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT numbackends, xact_rollback, blks_hit, blks_read,
+         round(100.0*blks_hit/nullif(blks_hit+blks_read,0),1) AS cache_hit_pct
+    FROM pg_stat_database WHERE datname='demo';"
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
+docker compose exec -T cache redis-cli info memory | grep -E "used_memory_human|maxmemory_human"
+
+# ── Postgres metrics worth a panel each ──────────────────────────────
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT relname, seq_scan, idx_scan, n_live_tup
+    FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 5;"
+#   seq_scan rising on a growing table predicts the missing-index incident.
+
+# ── Watch saturation move BEFORE errors appear ───────────────────────
+node scripts/break/connection-hungry-backfill.js 12 2 &
+for i in $(seq 1 10); do
+  c=$(docker compose exec -T db psql -U ots -d demo -tAc \
+      "SELECT count(*) FROM pg_stat_activity WHERE datname='demo';")
+  e=$(docker compose logs --since 20s app 2>&1 | grep -cE " 5[0-9]{2} ")
+  echo "t=${i}0s connections=$c errors_last_20s=$e"
+  sleep 10
+done
+kill %2 2>/dev/null
+```
+
+That last loop is the whole argument for saturation metrics: watch the connection count climb for a minute or more while the error count is still zero. That gap is your warning window.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Tool | Model | Good for | Watch out |
+|---|---|---|---|
+| **Platform metrics** (Vercel/Render/Railway) | Pre-built | Free, instant, covers traffic/errors/latency | No custom metrics; short history on cheap tiers |
+| **Prometheus + Grafana** | Pull from `/metrics` | The standard; self-hosted; powerful | You run it; PromQL has a learning curve |
+| **Grafana Cloud** | Hosted Prometheus | Same without running it | Free tier is generous, then not |
+| **Datadog / New Relic** | Agent-based | Everything, correlated, fast setup | Cost scales alarmingly with hosts and custom metrics |
+| **Database built-ins** (`pg_stat_*`) | SQL queries | Saturation and query metrics for free | You must scrape them into something |
+| **Sentry** | Error-first + performance | Error rate and slow transactions without a dashboard | Not a general metrics store |
+
+Minimum viable metrics for a small product, in order:
+
+1. **Your platform's built-in traffic/error/latency panels.** Free, already there.
+2. **One saturation number scraped on a schedule** — database connections in use is almost always the right one. A cron writing it to a table beats not having it by a wide margin.
+3. **Deploy markers** on your graphs, however crude.
+4. **Prometheus/Grafana or Grafana Cloud** when you need custom business metrics (bookings/min) and real history.
+
+A `/metrics` endpoint, if you go the Prometheus route — note the label discipline:
+
+```ts
+import { Registry, Counter, Histogram, Gauge } from "prom-client";
+export const registry = new Registry();
+
+export const httpRequests = new Counter({
+  name: "http_requests_total",
+  help: "HTTP requests",
+  labelNames: ["route", "method", "status"],   // route PATTERN, bounded values
+  registers: [registry],
+});
+
+export const httpDuration = new Histogram({
+  name: "http_request_duration_seconds",
+  help: "Request duration",
+  labelNames: ["route", "method"],
+  buckets: [0.01, 0.05, 0.1, 0.3, 1, 3, 10],   // choose around your SLO
+  registers: [registry],
+});
+
+export const dbConnectionsInUse = new Gauge({
+  name: "db_connections_in_use",
+  help: "Pool connections currently checked out",
+  registers: [registry],
+});
+```
+
+Label rules, since this is where real money is lost: **route patterns, not raw URLs** (`/api/bookings/:id`), and never `user_id`, `request_id`, `email` or a timestamp. Each distinct combination is a stored time series; unbounded labels mean an unbounded bill and a dashboard that times out (L8.1's <Term k="cardinality">cardinality</Term> trap).
+
+What good looks like: one screen, four to six panels, all four golden signals, aligned time ranges, deploy markers, and labelled units — openable by anyone on the team during an incident without a guided tour.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &
+```
+
+1. **Prove the average lies.** Run both latency commands from the Operator block and compare `mean` with `p95`. Then make the tail worse and re-measure — load the bookings endpoint after growing the table:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -f /dev/stdin < scripts/break/missing-index-growth.sql
+   for i in $(seq 1 20); do curl -s -o /dev/null -w "%{time_total}\n" localhost:3001/api/bookings; done \
+     | sort -n | awk '{a[NR]=$1} END {printf "p50=%.3fs p95=%.3fs max=%.3fs\n", a[int(NR*0.5)], a[int(NR*0.95)], a[NR]}'
+   ```
+2. **Compute all four signals** for a 5-minute window using the Operator commands. Write the four numbers down — that's your baseline, and a baseline is the thing the team in L8.1's break-fix didn't have.
+3. **Watch saturation lead errors.** Run the 10-iteration loop from the Operator block while the backfill script runs. Record how many seconds pass between "connections start climbing" and "first error appears". That number is the warning window an alert on saturation would have bought you.
+4. **Find a leading indicator for a *different* failure.** Run the concurrent-editors drill and watch for a metric that moves:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT pg_size_pretty(pg_column_size(notes)::bigint) AS notes_cell FROM bookings WHERE id=1;"
+   node scripts/load/concurrent-editors.js 1 >/dev/null
+   docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT pg_size_pretty(pg_column_size(notes)::bigint) AS notes_cell FROM bookings WHERE id=1;"
+   ```
+   Row size growing is a saturation-style metric for the single-cell anti-pattern — and note that *no* error-rate or latency panel would have shown you this one.
+5. **Design the four-panel dashboard** for your own product on paper: name each panel, its unit, its metric source, and the action you'd take if it moved. Delete any panel that fails the action test.
+
+```bash
+kill %1 2>/dev/null
+```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** Monday 09:00, the start of the week's traffic. The team's dashboard is green on every panel. Support is receiving a steady trickle of "the page won't load" reports — perhaps one in twenty users. Nobody can reproduce it.
+
+<Evidence title="the dashboard, as configured">
+
+```text
+Panel 1  "Avg response time"        → 212 ms     (flat, normal)
+Panel 2  "Total requests (today)"   → 48,211     (rising line, as every day)
+Panel 3  "Errors (count, 1h)"       → 38         (was 31 last Monday — "normal-ish")
+Panel 4  "CPU %"                    → 23%        (flat)
+Panel 5  "Memory %"                 → 61%        (flat)
+Panel 6  "HTTP methods (pie)"       → 71% GET    (unchanged)
+```
+
+</Evidence>
+
+<Evidence title="what the raw data shows when someone finally computes it">
+
+```text
+$ latency percentiles, last 15 min, /api/bookings only
+  n=2,214  p50=104ms  p95=4,870ms  p99=30,012ms  max=30,041ms
+
+$ error ratio by route, last 15 min
+  /api/rooms     0 / 1,602   (0.0%)
+  /api/bookings  38 / 612    (6.2%)
+
+$ saturation (not on any panel)
+  SELECT count(*) FROM pg_stat_activity WHERE datname='demo';  →  10
+  SHOW max_connections;                                        →  10
+  pool.waiting (from app logs)                                 →  sawtooth 3–9
+
+$ first error timestamp: 08:58:41    (traffic ramp begins ~08:50)
+```
+
+</Evidence>
+
+Every panel is green and 6.2% of the key endpoint is failing. Which panel designs caused the blindness, and what are the four replacements?
+
+<Reveal label="Reveal the cause">
+
+**The underlying fault is connection-pool saturation under Monday's traffic ramp — but the lesson here is that every one of the six panels was designed in a way that cannot show it.**
+
+**Panel by panel, the design errors:**
+
+1. **"Avg response time" — 212ms, flat.** The mean is diluted by 1,602 fast cached `/api/rooms` hits. The real distribution is p50 104ms / **p99 30 seconds** — a third of a minute, i.e. requests dying at the pool timeout. The average literally cannot show a tail. *Replace with p50 + p95 + p99.*
+2. **"Total requests (today)" — a raw counter.** It only ever goes up, so it looks identical on a healthy and an unhealthy day. *Replace with a rate (requests/min), which makes the 08:50 ramp visible.*
+3. **"Errors (count, 1h)" — 38 vs 31 last week.** A count without traffic context is uninterpretable: 38 errors spread across 2,214 requests reads as noise, while 38 across the 612 requests to *one* route is 6.2% — an outage for that endpoint. Aggregating all routes together hid it completely. *Replace with error ratio, broken down by route.*
+4. **CPU and memory — flat and irrelevant.** Waiting for a database connection consumes neither. These are the classic "saturation metrics of the wrong resource": they measure the host, while the limiting resource is the connection pool. *Replace with saturation of the actual constraint — connections in use ÷ max, and pool waiters.*
+5. **The HTTP-methods pie chart** answers no question anyone would ask during an incident. *Delete.*
+
+**What the four panels would have shown:** error ratio for `/api/bookings` jumping to 6.2% at 08:58, p99 pinned at the 30-second timeout, request rate ramping from 08:50, and connections flat against 10 — with the corners vertically aligned. That's a four-minute diagnosis, as in the story.
+
+**And the fix the metrics point to:** `max_connections = 10` with a pool of the same size is simply too small for Monday's concurrency — so some requests always wait, and under ramp they wait past the timeout. Raise the limit *and* add a pooler (M6.2), with an alert on connections > 80% so the warning arrives before the errors.
+
+**The transferable rules, stated plainly:**
+- **Percentiles, never means.** A mean cannot represent a tail, and the tail is what users feel.
+- **Ratios, never counts.** An error count is uninterpretable without traffic.
+- **Break down by route.** A healthy aggregate routinely hides one broken endpoint.
+- **Measure the saturation of the *limiting* resource**, which is rarely CPU in a web app — it's connections, memory, queue depth or a provider's rate limit.
+- **Delete panels that answer no question.** They don't just waste space; they create the false confidence that made this team ignore their own dashboard.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Design the minimum dashboard for this app covering the four golden signals. For each panel: the exact metric or query, the unit, the visualisation, and the specific action I should take if it moves. Identify what the limiting resource is for THIS app and how to measure its saturation. Then list any panel I currently have that answers no actionable question."}>
+The limiting-resource answer is the test of whether it understood your app: for most web apps it's database connections or a provider rate limit, not CPU. Check every panel has a stated action — that's the filter that killed thirty-seven of forty-one panels in the story.
+</AgentTask>
+
+<AgentTask prompt={"Add a /metrics endpoint with prom-client: a counter for requests by route pattern, method and status; a histogram for request duration with buckets suited to a 500ms target; and a gauge for database pool connections in use. Use route PATTERNS not raw URLs, and list explicitly which labels you deliberately did not add and why."}>
+The "did not add" list should name `user_id`, `request_id`, raw URLs and timestamps — all cardinality bombs. Verify by hitting `/metrics` and counting series: if a few hundred requests produced hundreds of series, a label is unbounded. Check histogram buckets bracket your actual target rather than being library defaults.
+</AgentTask>
+
+<AgentTask prompt={"Here are my latency numbers: p50 104ms, p95 4870ms, p99 30012ms, mean 212ms, for 2214 requests across two routes. Interpret this: what does the gap between p50 and p99 tell you, what does the mean hide, and what are the two or three most likely mechanisms? Do not propose fixes — tell me which metric or query would distinguish between your hypotheses."}>
+A good answer notes that a p99 sitting exactly at a round number (30s) suggests a timeout rather than gradual slowness, and that the p50/p99 gap means a *subset* is affected. Make it name the distinguishing query — that's layer isolation (M8.6) applied to metrics.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every service, know these four:
+
+- **Traffic** — requests per minute, by route
+- **Errors** — error *ratio*, by route
+- **Latency** — p50 and p95 (or p99), successes separated from failures
+- **Saturation** — the limiting resource as a fraction of its limit
+
+Dashboard review questions:
+
+- Does it fit on one screen without scrolling?
+- Do all panels share a time range so corners align?
+- Are deploys marked on the time axis?
+- Does every panel have a stated action if it moves? (If not, delete it.)
+- Is any panel showing a mean where a percentile belongs?
+- Is any panel showing a count where a ratio belongs?
+- Is the saturation panel measuring the resource that actually limits you?
+
+Metric hygiene:
+
+- Counters read as rates, never raw.
+- Route patterns as labels, never raw URLs or user ids.
+- Histogram buckets chosen around your target, not library defaults.
+
+What good looks like: four to six panels, aligned, labelled, each with an action — and a saturation alert that fires before users notice.
+
+Red flags: forty-one panels nobody opens; average response time as the headline; error counts without traffic; CPU as your only saturation metric.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l04"
+  questions={[
+    {
+      q: "Nine requests take 100ms and one takes 5,000ms. Why is the 590ms mean misleading?",
+      options: [
+        "It should be weighted by request size",
+        "No request took 590ms — it describes nobody, while p50 (100ms) shows the typical experience and p95 (~5,000ms) shows what the unluckiest users get",
+        "Means require at least 100 samples to be valid",
+        "The outlier should be excluded as measurement error"
+      ],
+      answer: 1,
+      explain: "A mean can hide any amount of pain because fast paths dilute slow ones. Read p50 for typical and p95/p99 for the experience that generates support tickets."
+    },
+    {
+      q: "Which golden signal is a leading indicator, and why does that matter?",
+      options: [
+        "Errors — they appear as soon as something breaks",
+        "Saturation — it moves before users are affected, giving you a window to act before any error occurs",
+        "Traffic — it predicts load increases",
+        "Latency — it degrades gradually before failures"
+      ],
+      answer: 1,
+      explain: "Connections climbing from 4 to 9 of 10 is fixable before anyone sees a 500. The hands-on measures that gap directly: saturation moves, then errors appear a minute or more later."
+    },
+    {
+      q: "Why is \"38 errors in the last hour\" a poor panel?",
+      options: [
+        "One hour is too short a window to be meaningful",
+        "A count without traffic context is uninterpretable — 38 across all routes looks like noise, but 38 across one route's 612 requests is a 6.2% outage",
+        "Error counts should be logged, not graphed",
+        "It should be shown per instance rather than in aggregate"
+      ],
+      answer: 1,
+      explain: "That's the break-fix. Ratios are comparable across time and traffic levels; counts aren't. And aggregating all routes together hid a single broken endpoint entirely."
+    },
+    {
+      q: "Why were the CPU and memory panels useless during the connection-pool incident?",
+      options: [
+        "They were sampled too infrequently",
+        "They measure the host, while the limiting resource was the connection pool — waiting for a connection consumes neither CPU nor memory",
+        "The container limits were set incorrectly",
+        "CPU and memory are lagging indicators"
+      ],
+      answer: 1,
+      explain: "Saturation must measure the resource that actually constrains you. For most web apps that's connections, queue depth, or a provider rate limit — rarely CPU."
+    },
+    {
+      q: "Why must you never use `user_id` as a metric label?",
+      options: [
+        "Metrics only support numeric label values",
+        "Each distinct label combination is a stored time series, so a per-user label means unbounded series — a huge bill and dashboards that time out",
+        "It would violate data protection regulations",
+        "Labels are limited to eight characters"
+      ],
+      answer: 1,
+      explain: "Metrics are cheap because they aggregate; high-cardinality labels destroy that. Per-user detail belongs in logs and traces, where you filter by request id instead."
+    }
+  ]}
+/>
+
+</Section>

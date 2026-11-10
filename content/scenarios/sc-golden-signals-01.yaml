@@ -1,0 +1,45 @@
+id: sc-golden-signals-01
+module: M8
+lesson: m08-l04
+title: "Green dashboard, one endpoint failing"
+difficulty: realistic
+symptom: "Every dashboard panel is green. Support is getting a trickle of 'the page won't load' reports — roughly one user in twenty."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: config
+      apply: scripts/break/undersized-connection-pool.sh   # pool and max_connections too small for ramp
+    - type: traffic
+      apply: scripts/load/monday-ramp.js                   # rising concurrency
+evidence:
+  logs: true
+  metrics: [http.requests, http.5xx, latency.mean, cpu.pct, memory.pct, db.connections]
+  db_console: true
+  notes: "The provided dashboard deliberately shows mean latency, raw request counts, error counts and host CPU/memory — not percentiles, ratios or pool saturation."
+agent:
+  context: "You have the existing dashboard and believe the system is healthy."
+  bias: "trusts the green panels and suggests the reports are client-side issues"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - error-ratio-under-1-pct-under-ramp
+    - saturation-panel-exists
+  root_cause_markers:
+    - learner computes percentiles and per-route error ratio rather than trusting the mean
+    - saturation of the limiting resource identified and measured
+    - pool sizing corrected or pooler introduced with rationale
+  symptom_only_markers:
+    - dashboard thresholds adjusted so panels stay green
+    - CPU/memory treated as the saturation signal
+hints:
+  - "The mean is 212ms. What would p95 and p99 be if some requests were timing out?"
+  - "An error count across all routes hides what, exactly?"
+  - "Which resource actually limits this app? It is not CPU."
+  - "Reveal: percentiles and per-route ratios reveal a 6% failure on one endpoint; the pool is saturated. Measure the limiting resource."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

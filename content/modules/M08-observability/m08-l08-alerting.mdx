@@ -1,0 +1,409 @@
+---
+id: m08-l08
+module: M8
+title: "Alerting without alert fatigue"
+order: 8
+difficulty: 2
+depth: both
+platforms: [grafana, datadog, sentry, postgres]
+concepts: [alerts, golden-signals, slo]
+prerequisites: [m08-l04]
+lab: demo-repo
+scenario_ids: [sc-alert-design-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A four-person team set up monitoring properly, they thought. CPU above 80%. Memory above 80%. Any 500. Disk above 70%. Response time over one second. Each one paged the on-call phone.
+
+In the first month they received 340 alerts. By week three, the team had muted the channel on their phones overnight "just while we tune it".
+
+In week six, the database filled its disk at 04:00. The alert fired exactly as designed — into a muted channel. They found out at 09:20 from a customer, five hours later.
+
+The monitoring didn't fail. **The monitoring worked and was ignored**, which is a worse state than having none, because it came with the belief that they were covered. Every one of those 340 alerts was technically true; almost none of them required a human to do anything at 4am. Teaching people to ignore alerts is the most expensive thing a monitoring setup can do.
+
+</Section>
+
+<Section kind="already-did">
+
+You've been on the receiving end of this. Uptime-robot emails for a blip that resolved itself in forty seconds. A "high memory" warning that was just a normal cache warming up. A provider's status email about a region you don't use. Perhaps a Slack channel somewhere in your workspace that fills with red messages nobody reads.
+
+And you've probably also had the opposite: finding out about something genuinely broken from a customer. Both failures come from the same root — alerts chosen by *what's measurable* rather than by *what requires a human*.
+
+</Section>
+
+<Section kind="mental-model">
+
+### One question decides everything
+
+<Callout type="key">
+For every alert: **"If this fires at 3am, is there something a human must do right now?"**
+
+- **Yes** → page someone.
+- **No, but someone should look tomorrow** → a dashboard, or a daily digest. Not a page.
+- **No, nothing** → delete the alert. Not mute it. Delete it.
+</Callout>
+
+That question eliminates most alerts people set up. CPU at 85% with healthy latency and no errors? Nothing to do — it's a dashboard line. One 500 out of 40,000 requests? Nothing to do at 3am; it's an error-tracker issue for the morning.
+
+### Alert on symptoms, not causes
+
+This is the single most useful principle in alerting.
+
+| Cause-based alert (noisy) | Symptom-based alert (useful) |
+|---|---|
+| CPU > 80% | p95 latency > 2s for 5 minutes |
+| Memory > 80% | Error ratio > 2% for 5 minutes |
+| Disk > 70% | Disk will be full in < 4 hours (projected) |
+| A 500 occurred | Error ratio > 2%, or checkout success rate dropped |
+| Connections > 5 | Connections > 80% of max for 3 minutes |
+
+Why: **users don't experience CPU.** They experience slowness and errors. High CPU with fine latency needs no action; fine CPU with terrible latency absolutely does. Alerting on causes means alerting on things that are often harmless, and missing the ones that aren't.
+
+The deliberate exception is <Term k="slo">saturation</Term> on a resource with a hard ceiling, where you *want* a leading indicator: connections at 80% of max, or a disk projected to fill. These are "act before users notice" alerts, and they earn their place because the window is short and the action is clear.
+
+### The four properties of an alert that won't be ignored
+
+1. **A duration** — "for 5 minutes", not "right now". A 20-second blip is not an incident, and instantaneous thresholds are the main source of noise.
+2. **A ratio, not a count** — "error ratio > 2%", not "10 errors". Counts fire on traffic growth alone (L8.4).
+3. **A stated action** — the alert text names the first thing to do, or links to the `FAILURES.md` entry (L8.7). An alert that doesn't tell a sleepy person what to do wastes the hardest minutes of the night.
+4. **A severity, honestly assigned** — page vs ticket vs dashboard.
+
+### Severity, by consequence
+
+| Level | Means | Route to | Examples |
+|---|---|---|---|
+| **Page** | Users are affected now; a human must act | Phone, 24/7 | Site down, checkout failing, error ratio > 5%, disk full imminent |
+| **Ticket** | Real, not urgent; fix in hours | Slack channel, issue | Error ratio 1–2%, a job failed but will retry, cert expires in 14 days |
+| **Dashboard** | Context, not a decision | A graph you look at | CPU, memory, traffic, cache hit rate |
+
+The discipline: **a page must be rare enough that it's always credible.** A useful target for a small team is at most one or two pages a week, and every page gets a response. If you're getting more, you're not under-staffed — you're over-alerting.
+
+### Monitoring absence
+
+Threshold alerts catch things that happen. They are structurally blind to things that *don't*:
+
+- A cron job that didn't run (M0.3's nine silent days)
+- A queue with no consumer
+- A webhook that stopped arriving
+- A deploy pipeline that silently stopped running
+
+These need a <Term k="dead-mans-switch">dead man's switch</Term>: the job pings a monitor on each success, and the **monitor** alerts when pings stop. It's the only construction that detects silence, and it belongs on every scheduled job you have.
+
+### SLOs, lightly
+
+An <Term k="slo">SLO</Term> is a target ("99.9% of booking requests succeed"), and its <Term k="error-budget">error budget</Term> is the failure it permits — 99.9% allows about 43 minutes a month. The useful idea for a small team isn't the formality; it's **alerting on budget burn rate**: a slow burn is a ticket, a fast burn (you'll exhaust the month's budget in an hour) is a page. That one reframing converts "any error" noise into a signal proportional to actual harm.
+
+<Operator>
+
+You can build genuinely useful alerting on the demo app with a handful of threshold queries plus one external switch.
+
+```bash
+cd demo-app
+
+# ── SATURATION alert, with a duration (not instantaneous) ─────────────
+#   Fire only if connections stay above 80% of max for 3 consecutive checks.
+breaches=0
+for i in 1 2 3; do
+  pct=$(docker compose exec -T db psql -U ots -d demo -tAc "
+    SELECT round(100.0*count(*)/current_setting('max_connections')::int)
+      FROM pg_stat_activity WHERE datname='demo';")
+  echo "check $i: ${pct}% of max_connections"
+  [ "$pct" -ge 80 ] && breaches=$((breaches+1))
+  sleep 20
+done
+[ "$breaches" -ge 3 ] \
+  && echo "PAGE: db connections >=80% for 60s → see FAILURES.md 'intermittent 500s'" \
+  || echo "ok"
+
+# ── ERROR RATIO alert (a ratio, never a count) ───────────────────────
+total=$(docker compose logs --since 5m app 2>&1 | grep -cE " (2|4|5)[0-9]{2} ")
+errs=$(docker compose logs --since 5m app 2>&1  | grep -cE " 5[0-9]{2} ")
+if [ "$total" -gt 50 ]; then                     # don't alert on tiny samples
+  ratio=$((100 * errs / total))
+  echo "error ratio ${ratio}% (${errs}/${total})"
+  [ "$ratio" -ge 5 ] && echo "PAGE: error ratio ${ratio}%"
+  [ "$ratio" -ge 1 ] && [ "$ratio" -lt 5 ] && echo "TICKET: error ratio ${ratio}%"
+fi
+
+# ── DISK: project time-to-full rather than alerting on a level ───────
+used=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
+echo "disk ${used}%"
+#   Better: record daily and alert when the trend predicts full in < 4h.
+
+# ── DEAD MAN'S SWITCH: the only way to detect silence ────────────────
+#   In the job, after success (Healthchecks.io, Cronitor, or your own):
+#     curl -fsS -m 10 --retry 3 https://hc-ping.com/<uuid> > /dev/null
+#   Verify the switch itself works by NOT pinging and confirming you get alerted.
+#   Check the demo app's worker heartbeat the same way:
+docker compose exec -T db psql -U ots -d demo -c "
+  SELECT max(generated_at) AS last_report,
+         now() - max(generated_at) AS age FROM reports;"
+#   age > 2× the schedule interval ⇒ the job has silently stopped.
+
+# ── Audit your existing alerts against the 3am question ──────────────
+#   For each alert you have configured, write one line:
+#     name | fires how often | action required at 3am? | page/ticket/dashboard
+#   Anything with "no action" becomes a dashboard panel or gets deleted.
+
+# ── Count your real alert volume before tuning anything ──────────────
+#   (In Slack: open the alerts channel and count last month's messages.)
+#   > 2 pages/week ⇒ you have an alerting problem, not a reliability problem.
+```
+
+The item people skip: **test the dead man's switch by deliberately not pinging it.** An untested switch is a belief, not a control — and it fails in exactly the direction you won't notice.
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool | Note |
+|---|---|---|
+| Uptime from outside | Better Stack, Pingdom, UptimeRobot | Checks what users see, not what your app believes |
+| **Job ran at all** | **Healthchecks.io, Cronitor** | Dead man's switch — the only detector of silence |
+| Error-rate alerts | Sentry alert rules | Alert on *new* issues and on rate spikes, not on every event |
+| Metric thresholds | Grafana alerting, Datadog monitors, platform alerts | Where duration and ratio conditions live |
+| Paging and escalation | PagerDuty, Opsgenie, Better Stack | Rotation, escalation, acknowledgement |
+| Status page | Statuspage, Better Stack | Reduces inbound tickets during an incident (M14.5) |
+
+For a small product, the **five alerts that cover most real risk**:
+
+1. **Site down from outside** (external uptime check, 2 consecutive failures) → page
+2. **Error ratio > 5% for 5 minutes** → page
+3. **p95 latency > 3s for 10 minutes** → page (or ticket, depending on product)
+4. **Saturation > 80% for 5 minutes** on your limiting resource — connections, disk, memory → page
+5. **Dead man's switch on every scheduled job** → page if the job matters, ticket otherwise
+
+Then two that aren't pages but are worth having: new-issue notifications from your error tracker (ticket), and a certificate-expiry check at 14 days (ticket).
+
+What good looks like: one to two pages a week, every one actioned, every alert text naming a first action, and a tested dead man's switch on every job.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &
+```
+
+1. **Audit alerts you already have** (your real product): list each one with how often it fired last month and whether it required action at 3am. Sort by firing frequency. The top of that list is your fatigue source.
+
+2. **Apply the 3am question** to each. Move every "no action" alert to a dashboard or delete it. Be ruthless — this step is the lesson.
+
+3. **Build a symptom-based alert and watch it behave correctly.** Run the saturation loop from the Operator block while triggering real pressure:
+   ```bash
+   node scripts/break/connection-hungry-backfill.js 12 3 &
+   # then run the connections loop — it should fire after 3 consecutive breaches
+   ```
+   Note that it fires *before* any user-visible error, which is the point of saturation alerting.
+
+4. **Prove that a duration condition kills noise.** Cause a brief blip and confirm a sustained-condition alert correctly stays silent:
+   ```bash
+   docker compose restart app     # ~2s of failures
+   # error-ratio-over-5-minutes: should NOT fire. An instantaneous rule would have.
+   ```
+
+5. **Build and then *test* a dead man's switch** for the demo app's worker:
+   ```bash
+   docker compose exec -T db psql -U ots -d demo -c \
+     "SELECT max(generated_at), now() - max(generated_at) AS age FROM reports;"
+   docker compose stop worker          # simulate silent death
+   # wait past the interval, re-run the query: age now exceeds the schedule
+   docker compose start worker
+   ```
+   Then set up a real switch (Healthchecks.io free tier) for one job in your own product, and **verify it by not pinging it.**
+
+6. **Write the alert text for one page-level alert.** It must name the symptom, the threshold, and the first action with a link to the `FAILURES.md` entry. Read it as if you'd just been woken; if it doesn't tell you what to do, rewrite it.
+
+```bash
+kill %1 2>/dev/null
+```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team is reviewing a bad month. They had two real incidents and found out about both from customers — despite having 14 configured alerts.
+
+<Evidence title="their alert configuration and last month's volume">
+
+```text
+#   Alert                                    Fired  Paged  Action taken
+1   CPU > 80%                                  118   yes   none (always normal)
+2   Memory > 75%                                94   yes   none (cache warming)
+3   Any HTTP 500                                61   yes   none (background noise)
+4   Response time > 1s (instantaneous)          48   yes   none (occasional slow query)
+5   Disk > 70%                                  12   yes   none ("it's been 71% for a year")
+6   Redis memory > 60%                           7   yes   none
+7   Deploy succeeded                            22   no    none (informational)
+8   Deploy failed                                1   no    investigated ✓
+9   Stripe webhook received                   1,840  no    none (why is this an alert?)
+10  SSL expires in 7 days                        0   yes   —
+11  Health check failed                          3   yes   2 blips, 1 real ✓
+12  Error ratio > 5% for 5 min                   0   yes   —
+13  Postgres connections > 90% for 5 min         0   yes   —
+14  New Sentry issue                            31   no    4 investigated ✓
+
+Total alerts delivered: 2,437.  Pages: 575.
+Slack #alerts channel: muted by 3 of 4 engineers since week 2.
+```
+
+</Evidence>
+
+<Evidence title="the two incidents they missed">
+
+```text
+Incident A (Nov 3, 04:10 – 09:20):
+  Nightly report job stopped running after a dependency bump.
+  No alert exists for "a job did not run". Noticed when a customer
+  asked for their weekly summary. 5 days of missing reports.
+
+Incident B (Nov 18, 14:02 – 14:51):
+  Bookings endpoint returning 500 for 100% of POSTs after a frontend
+  field rename. Alert 3 ("Any HTTP 500") fired 61 times that month and
+  was ignored; alert 12 (error ratio > 5%) did not fire because the
+  ratio across ALL routes was 3.1% — POSTs are a minority of traffic.
+  Noticed when a customer emailed.
+```
+
+</Evidence>
+
+They had alerts 12 and 13 configured correctly and still missed both incidents. Diagnose the alerting system.
+
+<Reveal label="Reveal the cause">
+
+**Two distinct failures: 575 pages trained everyone to ignore the channel, and the two alerts that would have caught real problems didn't exist or weren't scoped correctly.**
+
+**Failure 1 — fatigue, manufactured by cause-based alerts.** Alerts 1–6 produced 300 pages and resulted in **zero actions all month**. Every one is cause-based: CPU, memory, disk level, Redis memory, instantaneous latency, and "any 500". Apply the 3am question and all six fail it. Alert 9 is the clearest absurdity: 1,840 notifications for *successful* webhooks — an event log masquerading as an alert. By week two, three of four engineers had muted the channel, so the correctly-designed alerts (11, 12, 13) were delivered into a void. **The good alerts were destroyed by the bad ones**, which is the mechanism worth internalising: alert quality is a shared resource.
+
+**Failure 2a — Incident A: nothing can detect absence.** All 14 alerts are threshold alerts on things that happen. A job that *doesn't run* produces no metric, no error, no log line — there is no threshold to cross. This isn't a tuning error; it's a structural gap that only a dead man's switch closes. Five days of missing reports, discovered by a customer, is precisely M0.3's story recurring because the countermeasure was never installed.
+
+**Failure 2b — Incident B: the right alert, scoped too broadly.** Alert 12 (error ratio > 5% for 5 min) was well designed and *should* have caught a 100%-failing endpoint. It didn't, because it measured the ratio across **all routes aggregated**: POSTs to `/api/bookings` are a small share of traffic, so total failure of that endpoint moved the global ratio only to 3.1% — under the threshold. Meanwhile alert 3 ("any 500") *did* fire, correctly, and was ignored because it had cried wolf 61 times. Both halves of the alerting system failed on the same incident, for opposite reasons.
+
+**The fix:**
+
+1. **Delete alerts 1, 2, 3, 4, 6, 7, 9** (→ dashboard panels where useful). That removes ~2,100 notifications and ~300 pages per month at zero loss of signal.
+2. **Convert alert 5** from a level to a projection: "disk will be full within 4 hours at the current rate". 71% for a year is not news; filling fast is.
+3. **Scope error-ratio alerts per route**: `error_ratio{route} > 5% for 5m, where route traffic > 20 req/5m`. This is the change that catches Incident B. Add a business-level alert too — booking success rate dropping below its weekly baseline — since that's the symptom users actually feel.
+4. **Add a dead man's switch to every scheduled job**, and verify each by not pinging it. This closes Incident A and the whole class it belongs to.
+5. **Keep 8, 10, 11, 12 (re-scoped), 13, 14** and add alert text naming the first action plus the `FAILURES.md` link (L8.7).
+6. **Un-mute the channel** — which is only safe once step 1 is done, and is the step that makes everything else real.
+
+Expected volume after: roughly 5–10 notifications a month, one or two pages, each actionable.
+
+**The transferable lesson:** **alerting is a budget, not a feature.** Every low-value alert spends attention that the high-value ones need, and the currency is credibility. Adding an alert without deleting a noisy one makes your monitoring *worse*, however correct the new alert is.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Here are my current alerts with how often each fired last month and whether anyone acted: [paste the list]. For each, apply the test 'if this fires at 3am, must a human do something now?' and classify it page / ticket / dashboard / delete. Then tell me which failure modes of my system have NO alert at all, especially anything that fails by not happening."}>
+The "no alert at all" list matters more than the reclassification, and the "fails by not happening" clause is what surfaces the dead-man's-switch gap. Be willing to actually delete — reclassifying everything to "ticket" keeps the noise and just moves it. Count your expected volume afterwards; if it isn't dramatically lower, you haven't finished.
+</AgentTask>
+
+<AgentTask prompt={"Design five alerts for this app covering: outside-in availability, error ratio per route, latency, saturation of the limiting resource, and scheduled-job liveness. For each give the exact condition including a duration and a minimum-traffic guard, the severity, and the alert text a woken engineer would read — naming the first action. Explain why each is symptom-based rather than cause-based."}>
+Check every condition has a duration and a minimum-traffic guard — those two clauses prevent most false pages, and the traffic guard is what stops a 1-in-3-request sample from paging you. Verify the per-route scoping on the error-ratio alert; a global ratio is what missed Incident B.
+</AgentTask>
+
+<AgentTask prompt={"Add a dead man's switch to every scheduled job in this repository: ping a monitoring URL only on successful completion, with a timeout and retries, and never ping on failure. List each job with its schedule and the grace period the monitor should use. Then tell me how to verify each switch actually alerts when the job doesn't run."}>
+The verification step is the deliverable — **test by not pinging**. An untested switch is a belief, and it fails silently in the one direction you won't notice. Also confirm it pings only on *success*: a switch that pings in a `finally` block reports healthy while the job fails every night.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For every alert, in order:
+
+1. **If this fires at 3am, must a human act now?** No → dashboard or delete.
+2. Is it a **symptom** (latency, errors, success rate) rather than a **cause** (CPU, memory)?
+3. Does it have a **duration** ("for 5 minutes")?
+4. Is it a **ratio** with a **minimum-traffic guard**, not a count?
+5. Is it **scoped** narrowly enough to catch one broken endpoint?
+6. Does the alert text name a **first action** and link to the catalogue entry?
+7. Is the **severity** honest — page, ticket, or dashboard?
+
+System-level checks:
+
+- How many pages did you get last month? How many were actioned? (Target: 1–2/week, all actioned.)
+- Is anyone on the team muting the alert channel? (That's your real alerting metric.)
+- Does every scheduled job have a **tested** dead man's switch?
+- Is there an alert for the business outcome (checkout/booking success rate), not just technical signals?
+- Does anything alert you to a certificate expiring?
+
+What good looks like: pages are rare and always credible; every alert names an action; absence is monitored; nobody has muted anything.
+
+Red flags: a muted alert channel; alerts on CPU or memory paging anyone; "any error" alerts; adding an alert without deleting a noisy one; an untested dead man's switch.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l08"
+  questions={[
+    {
+      q: "What single question should decide whether something becomes a page?",
+      options: [
+        "Is the metric outside its normal range?",
+        "If this fires at 3am, is there something a human must do right now? No action means dashboard or delete",
+        "Could this eventually affect customers?",
+        "Is this metric covered by our SLO?"
+      ],
+      answer: 1,
+      explain: "It eliminates most alerts people configure. CPU at 85% with healthy latency needs no action — it's a dashboard line, and paging on it spends credibility the real alerts need."
+    },
+    {
+      q: "Why alert on symptoms (latency, error ratio) rather than causes (CPU, memory)?",
+      options: [
+        "Symptom metrics are cheaper to collect",
+        "Users experience slowness and errors, not CPU — high CPU with fine latency needs no action, while fine CPU with terrible latency definitely does",
+        "Cause metrics are less accurate",
+        "Symptom alerts fire sooner"
+      ],
+      answer: 1,
+      explain: "Cause-based alerts fire on harmless conditions and miss harmful ones. The deliberate exception is saturation on a hard ceiling (connections, disk), where you want a leading indicator with a clear action."
+    },
+    {
+      q: "A team had a well-designed \"error ratio > 5% for 5 minutes\" alert, yet missed an endpoint failing 100% of requests. Why?",
+      options: [
+        "The duration was too long for the incident",
+        "It measured the ratio across all routes aggregated — total failure of a low-traffic endpoint only moved the global ratio to 3.1%",
+        "The alert was muted along with the others",
+        "POST requests were excluded from the metric"
+      ],
+      answer: 1,
+      explain: "Scope per route, with a minimum-traffic guard. A healthy aggregate routinely hides one completely broken endpoint — the same lesson as the dashboard panels in L8.4."
+    },
+    {
+      q: "Why can no threshold alert detect a cron job that didn't run?",
+      options: [
+        "Cron jobs run outside the monitored network",
+        "A job that doesn't run produces no metric, error or log line — there's no threshold to cross, so you need a dead man's switch where the monitor alerts when pings stop",
+        "Scheduled jobs are excluded from most alerting tools",
+        "The job's metrics are only recorded on completion"
+      ],
+      answer: 1,
+      explain: "Absence produces no signal. Inverting it — the job pings on success and something external notices silence — is the only construction that works, and it must be tested by deliberately not pinging."
+    },
+    {
+      q: "Why does adding a well-designed alert without deleting noisy ones make monitoring worse?",
+      options: [
+        "It increases the monitoring bill",
+        "Attention is a shared budget — noisy alerts train people to ignore the channel, so the new alert gets delivered into a void",
+        "More alerts increase the chance of configuration errors",
+        "Alert rules degrade each other's evaluation performance"
+      ],
+      answer: 1,
+      explain: "575 pages with zero actions got the channel muted, and the three correctly-designed alerts were then useless. Alert quality is a shared resource and credibility is the currency."
+    }
+  ]}
+/>
+
+</Section>

@@ -8,13 +8,22 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 
 ## Status
 
-Phase 1, build-order steps 1–3 complete:
+Phase 1, build-order steps 1–4 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
-- **One complete template lesson** — `M8.6 The debugging method` at `/lessons/m08-l06` —
-  with all 9 anatomy sections (story, what-you-already-did, mental model + SVG diagram,
-  tools, hands-on, break-fix with evidence + reveal, ask-your-agent with verification,
-  checklist, 5-question quiz).
+- **Content wave 1: 18 lessons across M0, M1 and M8**, each with all 9 anatomy sections
+  (story, what-you-already-did, mental model + theme-aware SVG diagram, tools, hands-on
+  against the demo app, break-fix with evidence + reveal, three ask-your-agent prompts
+  with verification steps, checklist, 5-question quiz):
+  - **M0 Map your own product** — request journey (7 hops), boxes-and-arrows vocabulary,
+    draw-your-own-product exercise, per-box failure tour with the three triage questions.
+  - **M1 The server is just a computer** — PaaS/serverless/VPS and the process-vs-function
+    shape, SSH and lockout prevention, commands taught by question, processes/ports/
+    permissions, environment variables and precedence, supervision and crash loops.
+  - **M8 Observability and the debugging method** — four signals, where logs live,
+    structured logging and request IDs, golden signals and dashboards, error tracking and
+    tracing, **the debugging method** (`/lessons/m08-l06`, the template lesson), building a
+    failure catalogue, alerting without fatigue.
 - `overview` / `operator` depth toggle (persisted), glossary hover terms, copyable code
   blocks, localStorage progress + quiz scores.
 - **Reference layer, fully written** (content as YAML in `/content/reference`, each page
@@ -31,10 +40,14 @@ Phase 1, build-order steps 1–3 complete:
   plus `scripts/break/*` and `scripts/load/*` to trigger each one — see
   `demo-app/README.md` for the full map. These are drill material for the lessons and
   Phase 2 scenarios.
-- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, `/content/scenarios/*.yaml` rendered
-  read-only at `/scenarios`, Drizzle schema includes `scenario_attempts`.
-- Content lint: `npm run lint:content` (frontmatter schema, controlled vocabularies,
-  prerequisite/scenario link integrity, 9-section completeness).
+- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **19 scenario definitions** in
+  `/content/scenarios/*.yaml` rendered read-only at `/scenarios` (one per break-fix,
+  each with breakage, agent bias, probes, root-cause vs symptom-only markers, hint
+  ladder and scoring), Drizzle schema includes `scenario_attempts`.
+- Content lint: `npm run lint:content` — frontmatter schema, controlled vocabularies,
+  prerequisite/scenario link integrity, 9-section completeness, glossary term
+  resolution, unknown components, unknown section kinds, quiz-id binding, and nested
+  code fences (which break MDX parsing and only surface at build time).
 
 Not wired yet (deliberately): auth + server-side persistence (schema is ready in `/db`;
 progress lives in localStorage until a Postgres instance is chosen — see PLAN §7 open
@@ -78,5 +91,8 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-4. Content wave 1: M0, M1, rest of M8.
-5. Content wave 2: M7, M6, M4, M5, M2.
+5. Content wave 2: M7 (concurrency — the demo app's planted races are waiting for it),
+   M6, M4, M5, M2.
+6. Content wave 3: M11 (decision pages), M9, M10, M13, M14.
+7. Content wave 4: M3, M12.
+8. Personal map editor and decision records; then auth + server-side progress.

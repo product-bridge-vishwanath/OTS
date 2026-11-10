@@ -104,6 +104,24 @@ for (const l of lessons) {
     }
   }
 
+  // A fenced block opened with a language while already inside a fence means
+  // a nested fence: the inner one silently closes the outer, and the rest of
+  // the file is parsed as MDX (it fails at build with a confusing tag error).
+  let inFence = false;
+  l.content.split("\n").forEach((line, i) => {
+    const fence = line.match(/^\s*```(\S*)/);
+    if (!fence) return;
+    const hasLang = fence[1].length > 0;
+    if (inFence && hasLang) {
+      errors.push(
+        `${l.id}: line ${i + 1}: fence \`\`\`${fence[1]} opened inside another code fence — ` +
+          `nested fences break MDX parsing (indent the inner block instead)`
+      );
+    }
+    inFence = !inFence;
+  });
+  if (inFence) errors.push(`${l.id}: unclosed code fence`);
+
   // Every Section must declare a kind the renderer knows.
   for (const m of l.content.matchAll(/<Section\s+kind="([^"]+)"/g)) {
     if (!REQUIRED_SECTIONS.includes(m[1])) {

@@ -1,0 +1,50 @@
+id: sc-alert-design-01
+module: M8
+lesson: m08-l08
+title: "Fourteen alerts, two missed incidents"
+difficulty: realistic
+symptom: "Last month produced 575 pages and zero actions from six of the alerts. Two real incidents were both reported by customers first."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: monitoring
+      apply: scripts/break/noisy-alert-config.sh     # cause-based alerts, global error ratio, no job liveness
+    - type: job
+      apply: scripts/break/remove-cron-service.sh    # the silent failure no threshold can catch
+    - type: contract
+      apply: scripts/break/frontend-field-rename.patch
+evidence:
+  logs: true
+  metrics: [http.5xx, latency.p95, db.connections, cpu.pct, memory.pct]
+  db_console: true
+  notes: "Alert history with fire counts and actions-taken is provided, as is the muted-channel state."
+agent:
+  context: "You configured the current alerts and consider the coverage thorough."
+  bias: "proposes adding more alerts rather than deleting noisy ones"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - alert-volume-reduced            # expected pages per month must fall substantially
+    - failing-route-alerts            # a 100%-failing endpoint must now page
+    - job-liveness-alert-tested       # dead man's switch exists AND was verified by not pinging
+  root_cause_markers:
+    - cause-based alerts deleted or demoted to dashboards
+    - error-ratio alert scoped per route with a minimum-traffic guard
+    - dead man's switch added to every scheduled job and verified
+    - alert text names a first action
+  symptom_only_markers:
+    - thresholds raised so existing alerts fire less often
+    - alerts reclassified to a ticket channel without deletion
+    - new alerts added with none removed
+hints:
+  - "For each alert ask: if this fires at 3am, must a human act now?"
+  - "Why did the well-designed error-ratio alert miss a 100%-failing endpoint?"
+  - "Which of the two incidents could no threshold alert ever catch?"
+  - "Reveal: delete the cause-based alerts, scope error ratio per route, and add tested dead man's switches."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 50
+  stability: 20
+  agent_verification: 30

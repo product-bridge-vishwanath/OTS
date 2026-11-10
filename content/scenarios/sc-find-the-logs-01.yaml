@@ -1,0 +1,43 @@
+id: sc-find-the-logs-01
+module: M8
+lesson: m08-l02
+title: "Confirmation emails stopped, our logs show nothing"
+difficulty: realistic
+symptom: "Booking confirmation emails stopped arriving this morning. Bookings still work and the app logs no errors."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: provider
+      apply: scripts/break/email-domain-unverified.sh   # provider rejects every send with 403
+evidence:
+  logs: true
+  metrics: [email.attempted, email.delivered]
+  db_console: true
+  notes: "A simulated provider dashboard with per-message rejection reasons is available, plus a DNS audit log."
+agent:
+  context: "You can read the application's logs but have not opened the email provider's dashboard."
+  bias: "searches application code for a bug in the email-sending path"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - emails-delivered
+    - provider-failures-logged         # rejections must now be visible in our own logs
+  root_cause_markers:
+    - learner consults the provider's logs rather than only their own
+    - DNS verification record restored
+    - per-message provider status inspected and logged on failure
+  symptom_only_markers:
+    - retry loop added around the send call
+    - provider swapped without identifying the rejection reason
+hints:
+  - "Your logs say the send succeeded. What does 'succeeded' actually mean there?"
+  - "Which box on your map owns this failure, and where are its logs?"
+  - "Check the DNS change log against the time the failures began."
+  - "Reveal: a DNS cleanup removed the provider's verification record. Restore it, then log provider status per message."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

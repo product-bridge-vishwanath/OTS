@@ -1,0 +1,453 @@
+---
+id: m08-l03
+module: M8
+title: "Structured logging, levels and request IDs"
+order: 3
+difficulty: 2
+depth: both
+platforms: [sentry, grafana, datadog, kibana, vercel]
+concepts: [structured-logging, correlation-ids, logs]
+prerequisites: [m08-l02]
+lab: demo-repo
+scenario_ids: [sc-correlate-request-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A customer emailed: *"I was charged twice for booking #4471, at about 2pm yesterday."*
+
+The team had logs. Lots of logs. What they didn't have was any way to follow **one customer's one action** through them. The web app logged `Booking created`. The worker logged `Processing payment`. The webhook handler logged `Payment received`. None of the three lines contained the booking id, the user id, or anything connecting them to each other or to the customer's 2pm.
+
+Reconstructing what happened took two engineers most of a day: matching timestamps by eye across three log streams, guessing which `Processing payment` belonged to which `Booking created`, and eventually resorting to the database to infer the sequence.
+
+The fix — which they shipped the following week — was eleven lines of code: give every request an id, pass it along, and log it on every line. The next time a customer reported a double charge, the investigation took ninety seconds.
+
+</Section>
+
+<Section kind="already-did">
+
+Your logs are almost certainly prose today, because that's what `console.log` encourages:
+
+```text
+console.log(`Booking created for ${name}`)
+console.log("Payment failed!", error)
+```
+
+That's fine in development, where you're watching one request at a time. In production, with concurrent users and multiple services, prose logs have a specific, fatal property: **you can read them but you cannot query them.** "How many bookings failed for room 2 in the last hour?" requires regex archaeology rather than a filter.
+
+You may also have done the thing that turns a log into a liability: logged an entire request body or error object that happened to contain an API key, a password, or a customer's personal data — into a system your whole team, and your log vendor, can read.
+
+</Section>
+
+<Section kind="mental-model">
+
+Three ideas, each independently valuable, and they compose into logs you can actually use.
+
+### 1. Structured logging: key–value, not prose
+
+Emit one JSON object per event instead of a sentence:
+
+```text
+Prose:      Booking created for Mara & The Tides in Studio A at 10:00
+Structured: {"level":"info","msg":"booking.created","booking_id":5841,
+             "room_id":1,"duration_ms":318,"request_id":"req_8f21a"}
+```
+
+The structured version can be filtered (`booking_id:5841`), counted (`by room_id`), graphed (`avg duration_ms`), and alerted on. The prose version can only be read by a human who already knows what they're looking for.
+
+Two rules make structured logs good rather than merely structured:
+
+- **A stable event name.** `msg: "booking.created"` is a constant you can count. `msg: "Booking created for Mara & The Tides"` is unique per booking and countable only by accident.
+- **Variable data in fields, never in the message.** Everything that changes goes in a key.
+
+### 2. Log levels: the volume dial
+
+<Term k="log-level">Levels</Term> let you keep detail *available* without drowning in it.
+
+| Level | Means | Example | In production |
+|---|---|---|---|
+| `error` | Something failed and needs attention | Payment rejected, DB unreachable | Always on, and alertable |
+| `warn` | Suspicious but handled | Retry succeeded, cache miss storm, deprecated path | Always on |
+| `info` | A significant business event happened | `booking.created`, `report.written` | Always on — this is your audit trail |
+| `debug` | Developer detail | Cache lookups, query text, loop internals | **Off** by default, on temporarily |
+
+<Callout type="warn">
+`debug` in production is how M1.3's 26GB disk-full outage happened: a few extra lines per request becomes 48 million lines in eleven days. Set the level via `LOG_LEVEL` so you can raise it *temporarily* during an incident — and make sure something reminds you to lower it again.
+</Callout>
+
+The single most common level mistake is logging an error at `info` ("Payment failed!" as a plain log) — it then can't be alerted on or counted as an error. Levels are not decoration; they're the input to your alerting.
+
+### 3. Request IDs: the thread that ties it together
+
+A <Term k="correlation-id">correlation ID</Term> (request ID) is a unique value created when a request arrives and attached to **every** log line it causes, across every service it touches.
+
+<svg viewBox="0 0 780 250" role="img" aria-label="A request id generated at the edge is attached to every log line in the app, passed to the worker through the queue, and propagated to external calls, so all lines for one request can be filtered together" className="diagram">
+  <defs>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+
+  <rect x="8" y="20" width="150" height="54" rx="10" />
+  <text x="83" y="42" textAnchor="middle" className="sub">Request arrives</text>
+  <text x="83" y="62" textAnchor="middle" className="sub">generate req_8f21a</text>
+
+  <rect x="196" y="20" width="150" height="54" rx="10" />
+  <text x="271" y="42" textAnchor="middle" className="sub">App</text>
+  <text x="271" y="62" textAnchor="middle" className="sub">logs with req_8f21a</text>
+
+  <rect x="384" y="20" width="150" height="54" rx="10" />
+  <text x="459" y="42" textAnchor="middle" className="sub">Queue / job</text>
+  <text x="459" y="62" textAnchor="middle" className="sub">carries req_8f21a</text>
+
+  <rect x="572" y="20" width="200" height="54" rx="10" />
+  <text x="672" y="42" textAnchor="middle" className="sub">Worker · external API</text>
+  <text x="672" y="62" textAnchor="middle" className="sub">logs with req_8f21a</text>
+
+  <path d="M 158 47 L 192 47" className="arrow" markerEnd="url(#arrr)" />
+  <path d="M 346 47 L 380 47" className="arrow" markerEnd="url(#arrr)" />
+  <path d="M 534 47 L 568 47" className="arrow" markerEnd="url(#arrr)" />
+
+  <rect x="8" y="108" width="764" height="124" rx="10" />
+  <text x="390" y="134" textAnchor="middle">One filter reconstructs the whole story</text>
+  <text x="28" y="160" className="sub">request_id:&quot;req_8f21a&quot;</text>
+  <text x="28" y="182" className="sub">10:02:11 app    booking.created   booking_id=5841 duration_ms=318</text>
+  <text x="28" y="200" className="sub">10:02:11 app    payment.queued    booking_id=5841</text>
+  <text x="28" y="218" className="sub">10:02:14 worker payment.failed    booking_id=5841 provider_status=402</text>
+</svg>
+
+Also return it to the client in a response header (`X-Request-Id`) and show it on error pages. Then a support ticket reading "error id req_8f21a" turns a day of archaeology into one filter — which is exactly the ninety seconds in the story.
+
+### 4. What must never be logged
+
+Logs are read by your whole team, stored by a vendor, and retained for weeks. Treat a log line as semi-public.
+
+| Never log | Why | Log instead |
+|---|---|---|
+| Passwords, even hashed | Obvious, and it still happens via request-body logging | nothing |
+| API keys, tokens, session cookies | A log leak becomes an account breach | `key_id`, or last 4 chars |
+| Full card numbers, CVV | Compliance violation | Stripe's `payment_intent` id |
+| Personal data in bulk (emails, addresses, health, messages) | Privacy obligations; breach exposure | `user_id` |
+| Whole request bodies / error objects | The usual accidental route for all of the above | explicit named fields |
+
+The practical defence is a **redaction list in your logger** plus never logging whole objects. `logger.error({ err })` on a library error object commonly includes the full request config — headers, auth token and all.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Today: the demo app logs prose. See the limitation yourself ───────
+docker compose logs app 2>&1 | grep "booking.created" | tail -3
+#   Now try to answer "how many bookings per room this hour?" from that.
+#   Possible with regex gymnastics; trivial with fields.
+
+# ── With structured JSON logs, the same questions become one-liners ───
+#   (after the hands-on changes below)
+docker compose logs app 2>&1 | grep -o '{.*}' | jq -r 'select(.msg=="booking.created") | .room_id' \
+  | sort | uniq -c | sort -rn
+docker compose logs app 2>&1 | grep -o '{.*}' | jq -r 'select(.level=="error") | "\(.msg) \(.request_id)"'
+docker compose logs app 2>&1 | grep -o '{.*}' | jq -s 'map(select(.duration_ms)) | map(.duration_ms) | add/length'
+
+# ── Follow ONE request across services ───────────────────────────────
+RID=req_8f21a
+docker compose logs app worker 2>&1 | grep "$RID"
+#   In an aggregator: request_id:"req_8f21a"  (Kibana) or
+#   {service=~"app|worker"} | json | request_id="req_8f21a"   (Loki)
+
+# ── Raise the log level temporarily during an incident, then LOWER it ─
+docker compose exec app printenv LOG_LEVEL
+#   set LOG_LEVEL=debug in compose.yaml, then:
+docker compose up -d app
+#   …investigate…
+#   then put it back. Leave a reminder; this is how disks fill.
+
+# ── Audit for secrets already in your logs (do this today) ───────────
+docker compose logs app 2>&1 \
+  | grep -niE "sk-[a-z0-9]|bearer |password|authorization|secret|api[_-]?key" | head
+#   Any hit is an incident: rotate the exposed credential (M4.1), then fix the log line.
+
+# ── Audit for whole-object logging in the code ────────────────────────
+grep -rnE "console\.(log|error)\((req|request|err|error|body|headers)\)" \
+  --include="*.ts" --include="*.js" app/ lib/ 2>/dev/null
+grep -rnE "JSON\.stringify\((req|body|headers|config)" --include="*.ts" app/ lib/ 2>/dev/null
+#   These are the lines that leak keys by accident.
+
+# ── Check your error level discipline ────────────────────────────────
+grep -rnE "console\.log\(.*(fail|error|denied|reject)" --include="*.ts" app/ lib/ 2>/dev/null
+#   Failures logged at info can't be alerted on or counted.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Language | Logger | Why |
+|---|---|---|
+| Node / TypeScript | **pino** | Fast, JSON by default, redaction built in (`redact: ["req.headers.authorization"]`) |
+| Node | winston | More configurable, heavier |
+| Python | **structlog**, or stdlib `logging` + `python-json-logger` | Context binding |
+| Go | `log/slog` (stdlib) | Structured, no dependency |
+| Ruby | semantic_logger | — |
+
+A pino setup with the parts that matter:
+
+```ts
+import pino from "pino";
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? "info",
+  redact: {
+    paths: [
+      "req.headers.authorization", "req.headers.cookie",
+      "*.password", "*.token", "*.apiKey", "*.secret",
+    ],
+    censor: "[redacted]",
+  },
+  base: { service: process.env.SERVICE_NAME ?? "app" },
+});
+
+// Per-request child logger: request_id is then on every line for free.
+export function reqLogger(requestId: string) {
+  return logger.child({ request_id: requestId });
+}
+```
+
+Two details worth copying: `redact` is a safety net *in addition* to not logging whole objects, and `logger.child({ request_id })` means every line inside a request carries the id without anyone remembering to add it.
+
+Where request IDs come from, if you'd rather not generate your own: Vercel sets `x-vercel-id`, Cloudflare sets `cf-ray`, AWS ALB sets `x-amzn-trace-id`. Prefer an inbound `x-request-id` if present (so a client or upstream proxy can correlate too), and generate one otherwise.
+
+What good looks like: every log line is JSON with `level`, `msg` as a stable event name, `service` and `request_id`; `debug` is off in production but switchable; secrets are redacted by configuration *and* absent by construction; and the request id is visible to customers on error pages.
+
+</Section>
+
+<Section kind="hands-on">
+
+The demo app logs prose on purpose, so you can feel the difference by fixing it.
+
+```bash
+cd demo-app && docker compose up -d --build
+node scripts/load/steady-browse-and-order.js &
+```
+
+1. **Feel the limitation.** Try to answer "how many bookings per room in the last ten minutes, and what was the average request duration?" using only the current logs:
+   ```bash
+   docker compose logs --since 10m app 2>&1 | grep "booking.created" | wc -l
+   docker compose logs --since 10m app 2>&1 | grep "booking.created" | head -3
+   ```
+   The room is in the line but not in a field; duration isn't logged at all. Note how much regex you'd need.
+
+2. **Add structured logging.** Install pino (`npm i pino`), create `lib/logger.ts` with the config above, and convert three call sites in `app/api/bookings/route.ts`:
+   - the success path → `log.info({ msg: "booking.created", booking_id, room_id, duration_ms })`
+   - the 409 clash path → `log.warn({ msg: "booking.rejected", reason: "slot_taken", room_id })`
+   - any thrown error → `log.error({ msg: "booking.failed", err_message: e.message })`
+
+   Note the last one logs `e.message`, **not** `{ err }` — that's the whole-object trap.
+
+3. **Add a request ID.** Generate one per request (`crypto.randomUUID()`, or reuse an inbound `x-request-id`), create a child logger with it, return it as an `X-Request-Id` response header, and include it in error responses.
+
+4. **Now answer the question that was hard in step 1:**
+   ```bash
+   docker compose logs --since 5m app 2>&1 | grep -o '{.*}' \
+     | jq -r 'select(.msg=="booking.created") | .room_id' | sort | uniq -c
+   docker compose logs --since 5m app 2>&1 | grep -o '{.*}' \
+     | jq -s 'map(select(.duration_ms)) | (map(.duration_ms) | add / length)'
+   ```
+
+5. **Follow one request end to end.** Make a booking, note the `X-Request-Id` from the response headers (`curl -i`), then filter every log line for it:
+   ```bash
+   curl -si -X POST localhost:3001/api/bookings -H 'Content-Type: application/json' \
+     -d '{"room_id":2,"customer_name":"log-test","date":"2026-12-01","start_hour":11,"end_hour":12}' \
+     | grep -i x-request-id
+   docker compose logs app 2>&1 | grep "<that id>"
+   ```
+
+6. **Run the secret audit** on the demo app and on your own product:
+   ```bash
+   docker compose logs app 2>&1 | grep -niE "sk-[a-z0-9]|bearer |password|api[_-]?key" | head
+   ```
+
+```bash
+kill %1 2>/dev/null
+```
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** During a routine review, an engineer notices the team's log search contains API keys. The logs are in a third-party aggregator, retained 30 days, readable by all seven employees and two contractors.
+
+<Evidence title="what's in the logs">
+
+```text
+$ search: "sk-ant"
+2026-11-09T14:02:11Z app error Assistant call failed
+  {"err":{"status":401,"message":"invalid x-api-key",
+   "config":{"url":"https://api.anthropic.com/v1/messages",
+     "headers":{"x-api-key":"sk-ant-api03-R7hQ…full key…9bXc",
+                "content-type":"application/json"},
+     "data":"{\"model\":\"claude-opus-5-5\",\"messages\":[{\"role\":\"user\",
+              \"content\":\"ROOMS:…UPCOMING BOOKINGS:- 2026-11-10 Studio A:
+              Mara Chen, mara.chen@example.com, +44 7700 900123…\"}]}"}}}
+
+$ search: "authorization"
+2026-11-09T09:14:02Z app debug outbound request
+  {"headers":{"authorization":"Bearer sk_live_51Hx…","idempotency-key":"bk_5841"}}
+
+Occurrences, last 30 days: 1,284 lines containing a key pattern
+                              312 lines containing customer emails/phones
+```
+
+</Evidence>
+
+<Evidence title="the code that produced it">
+
+```text
+app/api/assistant/route.ts
+   } catch (error) {
+-    console.error("Assistant call failed", { err: error })
+   }
+
+lib/http.ts
+-  logger.debug({ msg: "outbound request", headers })
+```
+
+</Evidence>
+
+What's the actual severity here, and what's the correct order of response?
+
+<Reveal label="Reveal the cause">
+
+**Two credentials and a quantity of personal data have been exposed to everyone with log access for up to 30 days. This is a security incident, not a logging bug — and the order of response matters more than the fix.**
+
+**How it happened — two separate instances of one mistake: logging whole objects.**
+1. `console.error("…", { err: error })` on an HTTP library error. Error objects from HTTP clients carry a `config` property containing the full outbound request — **headers, including the API key, and the request body**. The developer intended to log a message; they logged the entire request.
+2. `logger.debug({ msg: "outbound request", headers })` logs a headers object wholesale, which always includes `authorization`.
+
+And because the assistant's prompt embeds the booking table, the error object also captured **customer names, emails and phone numbers** — so this is a personal-data exposure as well as a credential one.
+
+**Response, in this order — containment before cleanup:**
+
+1. **Rotate both credentials now.** The Anthropic key and the Stripe live key must be reissued and the old ones revoked. Assume exposed means compromised: the logs sit in a vendor system, in browser caches, possibly in Slack pastes and screenshots. Deleting log lines does not un-expose a key. (M4.1: rotate first, always.)
+2. **Check for misuse** while rotating: Anthropic console usage for unexpected spend, Stripe logs for unrecognised API calls. This determines whether you have a second, larger incident.
+3. **Stop the bleeding in code** — fix both call sites to log named fields only:
+   `logger.error({ msg: "assistant.failed", provider_status: error.status, err_message: error.message })`. Never the error object, never a headers object.
+4. **Add redaction as a safety net** (pino `redact` on `*.authorization`, `*.x-api-key`, `*.password`, `req.headers.cookie`). A net, not the primary control — redaction only catches paths you anticipated, which is why step 3 comes first.
+5. **Purge or shorten retention** on the affected index if your vendor supports it, and note that it's a best-effort mitigation, not a remedy.
+6. **Handle the personal-data exposure** on its own track: scope it (312 lines, which customers), check your obligations (GDPR/DPDP — M10.7), and decide on notification with whoever owns that call. Reconsider whether the assistant needs real emails and phone numbers in its prompt at all; it almost certainly doesn't (minimise the data you hand to the model).
+7. **Prevent recurrence:** a CI grep for secret patterns in logged output, a lint rule or code-review checklist item banning `{ err }` and whole-object logging, and the audit command from this lesson run periodically.
+
+**The transferable rule:** **log named fields, never objects you didn't construct.** Any object handed to you by a library — an error, a request, a config, a response — may contain credentials and personal data, and will happily serialise all of it. The mistake is invisible in code review precisely because `{ err: error }` looks like the responsible thing to do.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Convert this app's logging to structured JSON with pino: stable event names in msg, variable data in fields, a level per call site (failures must be error or warn, never info), a service field, and a child logger carrying request_id. Add a redact config for authorization headers, cookies, passwords, tokens and api keys. Show me one converted call site of each level."}>
+Check the event names are stable constants (`booking.created`), not interpolated strings — interpolation is what makes logs uncountable. Verify failures are not at `info`, since that's what makes them unalertable. Then confirm with `jq` that you can filter by level and count by field.
+</AgentTask>
+
+<AgentTask prompt={"Add request ID propagation: generate an id per request (or reuse an inbound x-request-id), attach it to every log line via a child logger, return it as an X-Request-Id response header, include it in error responses shown to users, and pass it through to any background job or outbound call. Show me how to follow one request across the app and the worker."}>
+Test it end to end: `curl -i`, grab the id, and grep both services' logs for it. The job-propagation half is the part agents usually skip — check the worker's lines carry the originating request's id, or cross-service correlation still doesn't work.
+</AgentTask>
+
+<AgentTask prompt={"Audit this codebase for logging that could leak secrets or personal data: any call logging a whole error, request, response, headers or config object; any JSON.stringify of a request or body; and any log of fields named password, token, key, secret, email, phone or address. Give file:line and a safe replacement for each."}>
+Then run the log-side audit too — `grep -niE "sk-|bearer |password"` over your actual log output. A hit there is an incident with an order of operations: **rotate the credential first**, then fix the code, then worry about purging lines. Don't let the agent's tidy diff distract you from the rotation.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Per log line:
+
+- Is it JSON (or otherwise parseable), not prose?
+- Is `msg` a **stable event name** you could count?
+- Is every variable value in its own **field**?
+- Is the **level** right — failures at `error`/`warn`, never `info`?
+- Does it carry `service` and `request_id`?
+- Does it contain **no** object you didn't construct yourself?
+
+Per system:
+
+- Is `LOG_LEVEL` configurable, with `debug` off in production?
+- Is there a redaction config as a safety net?
+- Is the request id returned to clients and shown on error pages?
+- Do background jobs carry the originating request id?
+- Have you actually grepped your logs for key patterns and personal data?
+
+What good looks like: "follow this one customer's action across every service" is one filter, and a support ticket with an error id becomes a ninety-second investigation.
+
+Red flags: `console.log` with interpolated values as your logging strategy; `{ err }` or `{ headers }` anywhere; failures logged at `info`; `debug` left on in production; no request id in sight.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m08-l03"
+  questions={[
+    {
+      q: "Why is `msg: \"booking.created\"` with a `room_id` field better than `msg: \"Booking created for Studio A\"`?",
+      options: [
+        "It uses fewer bytes of storage",
+        "The event name is a stable constant you can count and alert on, while the variable data sits in a field you can filter and group by",
+        "JSON is required by most log aggregators",
+        "It avoids logging customer-identifying information"
+      ],
+      answer: 1,
+      explain: "Interpolating variables into the message makes every line unique, so it's countable only by accident. Stable name plus fields is what makes logs queryable rather than merely readable."
+    },
+    {
+      q: "What is a request ID for, concretely?",
+      options: [
+        "Deduplicating retried requests",
+        "Tying together every log line caused by one request, across every service — so one filter reconstructs the whole story",
+        "Authenticating the client making the request",
+        "Measuring request latency accurately"
+      ],
+      answer: 1,
+      explain: "That's the two-engineers-for-a-day problem in the story, solved by eleven lines. Returning it to the client as a header also turns support tickets into single filters. (Deduplication is idempotency keys — M7.7.)"
+    },
+    {
+      q: "Why is `logger.error({ err: error })` on an HTTP library error dangerous?",
+      options: [
+        "Error objects are too large and increase log costs",
+        "Such error objects carry the full outbound request — headers including API keys, and the request body — so the log line leaks credentials and any personal data in the payload",
+        "The error object cannot be serialised to JSON reliably",
+        "It logs at the wrong level"
+      ],
+      answer: 1,
+      explain: "It's the break-fix, and it's invisible in review because it looks responsible. The rule: log named fields you constructed, never an object handed to you by a library."
+    },
+    {
+      q: "You discover a live API key in 30 days of retained logs. What's the first action?",
+      options: [
+        "Delete the offending log lines from the aggregator",
+        "Rotate the credential — issue a new key and revoke the old one — because exposed must be treated as compromised",
+        "Fix the code that logged it and redeploy",
+        "Reduce the log retention period"
+      ],
+      answer: 1,
+      explain: "Deleting lines doesn't un-expose a key that has been readable by many people and systems, and may sit in caches, screenshots and pastes. Rotate first, then check for misuse, then fix the code."
+    },
+    {
+      q: "Why keep `debug` off in production rather than just ignoring those lines?",
+      options: [
+        "Debug logging slows the application significantly",
+        "A few extra lines per request becomes tens of millions of lines over days — the mechanism behind the 26GB disk-full outage — and it inflates log costs",
+        "Debug lines are not retained by aggregators",
+        "Debug level bypasses redaction configuration"
+      ],
+      answer: 1,
+      explain: "M1.3's break-fix exactly: debug level plus no rotation filled a 39GB disk in 11 days. Make the level configurable so you can raise it briefly during an incident — and remember to lower it."
+    }
+  ]}
+/>
+
+</Section>

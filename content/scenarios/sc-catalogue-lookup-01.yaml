@@ -1,0 +1,44 @@
+id: sc-catalogue-lookup-01
+module: M8
+lesson: m08-l07
+title: "On call alone, with a bad runbook"
+difficulty: hard
+symptom: "02:14. Every POST to the bookings endpoint returns 500; GETs are fine. The catalogue entry you find says 'usually a restart fixes it. If not, ask Dev.'"
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: contract
+      apply: scripts/break/frontend-field-rename.patch   # payload field renamed; insert violates not-null
+evidence:
+  logs: true
+  metrics: [http.5xx]
+  db_console: true
+  notes: "A deliberately poor FAILURES.md is provided. Restarting is available and will not help; a database restart causes a brief outage, which is recorded."
+agent:
+  context: "You wrote the existing catalogue entry and trust it."
+  bias: "follows the entry's advice to restart before reading the error"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - bookings-post-succeeds
+    - no-unnecessary-restarts         # restarting the database counts against stability
+    - catalogue-entry-improved        # the entry must be rewritten with a real confirm step
+  root_cause_markers:
+    - first error read and the constraint violation identified
+    - request contract realigned, with validation at the API boundary
+    - catalogue entry rewritten with symptom, confirm command and separated mitigation/fix
+  symptom_only_markers:
+    - services restarted repeatedly
+    - not-null constraint dropped to make the insert succeed
+hints:
+  - "Read the first error in the logs before following any advice."
+  - "GETs work and POSTs fail 100%. What does that tell you about infrastructure versus the request?"
+  - "Could a restart possibly affect a constraint violation?"
+  - "Reveal: a renamed payload field means room_id is absent. Fix the contract, add validation, and rewrite the entry with a real confirm step."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 50
+  stability: 20
+  agent_verification: 30
