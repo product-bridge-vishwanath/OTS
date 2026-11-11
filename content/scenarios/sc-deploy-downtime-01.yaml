@@ -1,0 +1,45 @@
+id: sc-deploy-downtime-01
+module: M2
+lesson: m02-l05
+title: "The query that works in staging and times out in production"
+difficulty: realistic
+symptom: "A new feature passes every staging test. The identical code, deployed to production, immediately throws statement-timeout errors on a code path staging never caught."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: data
+      apply: scripts/break/missing-index-growth.sql
+    - type: config
+      apply: scripts/break/cross-region-latency-sim.sh
+evidence:
+  logs: true
+  metrics: [latency.p95, db.seq_scan]
+  db_console: true
+  notes: "Staging and production configuration (data volume, region settings) are both inspectable for comparison."
+agent:
+  context: "You confirmed the deployed code is byte-for-byte identical to what passed in staging."
+  bias: "assumes a deployment or configuration error since the code itself didn't change"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - query-performant-at-production-scale
+    - staging-production-parity-documented
+  root_cause_markers:
+    - learner compares data volume and region between staging and production specifically
+    - missing index identified and added
+    - staging-production gap documented or closed (realistic data volume, matching region)
+  symptom_only_markers:
+    - query timeout increased to compensate
+    - staging declared unreliable with no specific gap identified
+hints:
+  - "The code is identical. What ELSE differs between staging and production?"
+  - "How many rows does this table have in each environment? Does that matter for THIS query?"
+  - "Is the app-to-database round trip the same distance in both environments?"
+  - "Reveal: staging has neither production's data volume nor its region. Add the missing index, and close the staging gap."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

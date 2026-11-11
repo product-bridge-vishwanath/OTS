@@ -1,0 +1,43 @@
+id: sc-rollback-migration-01
+module: M2
+lesson: m02-l06
+title: "Rolled back successfully, bug still there"
+difficulty: hard
+symptom: "A deploy causes a visible bug. The platform confirms a rollback to the previous code version completed within 30 seconds. The bug persists identically."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: cache
+      apply: scripts/break/stale-price-cache.sh   # the real cause is a stale cache, independent of which code version runs
+evidence:
+  logs: true
+  metrics: [cache.age_seconds, deploy.current_version]
+  db_console: true
+  notes: "The deployed commit hash and the cached value's age are both directly inspectable, independent of each other."
+agent:
+  context: "You confirmed via the platform dashboard that the rollback completed and the previous version is live."
+  bias: "assumes the rollback itself failed or needs to go back further, rather than questioning whether this deploy was the actual cause"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - bug-resolved
+    - cause-correctly-attributed
+  root_cause_markers:
+    - learner verifies the deployed version directly rather than trusting the platform message alone
+    - learner checks the cache independent of code version
+    - learner recognizes the deploy was not the actual cause once the cache is identified
+  symptom_only_markers:
+    - rolled back further to additional previous versions with no effect
+    - cache invalidated by coincidence while still believing the code version was the cause
+hints:
+  - "The rollback is confirmed. Does 'confirmed deployed' mean the SAME THING as 'fixed the symptom'? Check both independently."
+  - "What does the unchanged column actually hold right now? Is the data itself wrong, or is something ELSE serving a stale value?"
+  - "Check the cache's age. Does it predate or postdate the rollback?"
+  - "Reveal: a stale cache is serving a price independent of which code version runs. Neither code version ever computes a fresh value while it's served from cache."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 55
+  stability: 20
+  agent_verification: 25

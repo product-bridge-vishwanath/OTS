@@ -1,0 +1,303 @@
+---
+id: m02-l05
+module: M2
+title: "Deploying: staging vs prod, and what \"zero downtime\" actually requires"
+order: 5
+difficulty: 2
+depth: both
+platforms: [vercel, render, docker]
+concepts: [deployment]
+prerequisites: [m02-l04, m01-l01]
+lab: demo-repo
+scenario_ids: [sc-deploy-downtime-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder's platform proudly advertised "zero-downtime deploys," and every deploy she'd watched had felt instant — click deploy, see the new version seconds later, no visible gap. She told an enterprise prospect, confidently, that deploys never caused downtime.
+
+The prospect's own monitoring, during a scheduled test deploy, caught something her own dashboards never had: a 400-millisecond window of connection failures, right at the moment the new container started and the old one stopped. Her platform's "zero downtime" meant *the platform's own health check* never saw a gap long enough to mark the service unhealthy — not that literally zero requests failed. A sub-second gap is invisible to almost every monitoring tool's sampling interval and almost every human watching a browser reload; it is not invisible to a server-to-server call that happened to land in that exact window, which is precisely what the enterprise prospect's automated test did, deliberately, at high frequency.
+
+"Zero downtime" and "a gap too short for anyone to usually notice" are different claims, and only one of them requires actual engineering to achieve.
+
+</Section>
+
+<Section kind="already-did">
+
+You've clicked "Deploy" on a platform dashboard and watched a build log scroll by, then seen your change live. You've probably also deployed something broken, discovered it from a user report rather than your own testing, and wished you'd caught it on a staging environment first — if you had one, or if the one you had actually matched production closely enough to catch the problem.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Build time vs. runtime: when does code actually "become" the thing running
+
+A **build** compiles, bundles, and packages your code into something runnable — this happens once, produces an artifact (a container image, a set of static files), and any error here (a type error, a missing dependency) fails *before* anything is deployed. **Runtime** is that artifact actually executing, serving real requests — and a whole class of error (a missing environment variable, a database that's unreachable, a null value from unexpected input) can only appear here, because build time has no way to know about them. M1.5's env-var story is a runtime failure precisely because the build succeeded with no way to check whether `DATABASE_URL` would actually be set in the environment it would run in.
+
+### Staging: valuable exactly to the degree it resembles production
+
+<Callout type="key">
+**A staging environment's entire value is being close enough to production that a problem caught there would have been a problem in production too.** A staging environment with a tiny database, no real traffic patterns, different environment variables, or a different region from production will pass tests that production then fails — not because staging is broken, but because it was never actually testing the thing that broke.
+</Callout>
+
+### Verified: a plain rebuild is NOT zero-downtime
+
+```bash
+docker compose up -d --build app
+```
+
+Monitored directly, second-by-second, against the demo app: a plain rebuild-and-restart produces a **real gap of connection failures** (`000`/timeout, not even a clean error) lasting roughly half a second to a full second, right at the moment the old container stops and the new one starts listening. This is the honest baseline every "zero-downtime" claim has to be measured against — and it's exactly the gap the story's enterprise prospect caught and the founder's own monitoring never had.
+
+### Three real patterns, and what each one actually buys
+
+<svg viewBox="0 0 780 240" role="img" aria-label="Three deployment patterns: a plain restart has a real gap, blue-green runs both versions and switches traffic atomically, and canary sends a small fraction of traffic to the new version before widening it" className="diagram">
+  <text x="12" y="20" className="sub">PLAIN RESTART — verified: a real gap of failed requests while old stops, new starts</text>
+  <rect x="8" y="30" width="200" height="34" rx="6" />
+  <text x="108" y="52" textAnchor="middle" className="sub">old version — stops</text>
+  <rect x="280" y="30" width="30" height="34" style={{fill: "var(--bad-soft)", stroke: "var(--bad)"}} rx="4" />
+  <text x="295" y="20" className="sub">gap</text>
+  <rect x="340" y="30" width="200" height="34" rx="6" />
+  <text x="440" y="52" textAnchor="middle" className="sub">new version — starts</text>
+
+  <text x="12" y="104" className="sub">BLUE-GREEN — both versions run; traffic switches only after the new one is confirmed healthy</text>
+  <rect x="8" y="114" width="200" height="34" rx="6" />
+  <text x="108" y="136" textAnchor="middle" className="sub">old (still serving)</text>
+  <rect x="8" y="154" width="200" height="34" rx="6" />
+  <text x="108" y="176" textAnchor="middle" className="sub">new (warming up, checked)</text>
+  <text x="240" y="138" className="sub">↳ traffic switches atomically once new passes its check</text>
+
+  <text x="12" y="212" className="sub">CANARY — a small % of real traffic goes to the new version first; widen only if it looks healthy</text>
+  <rect x="8" y="222" width="700" height="2" style={{fill: "var(--border)"}} />
+</svg>
+
+| Pattern | What it actually requires | What it buys |
+|---|---|---|
+| **Plain restart** | Nothing extra | Simplicity — and a real, measurable gap |
+| **Blue-green** | Two full environments running simultaneously, a switch mechanism | No gap — traffic moves only once the new version is confirmed healthy |
+| **Canary** | Traffic-splitting infrastructure, metrics to judge "healthy" | Catches a bad deploy on a SMALL fraction of users, before it's everyone |
+| **Rolling** | Multiple instances, one replaced at a time | No full gap, but brief per-instance unavailability — common on platforms with several instances by default |
+
+<Callout type="warn">
+**None of these patterns are free, and a platform claiming "zero-downtime" by default is usually doing one of the cheaper ones (rolling, often) — ask which, if it matters for your use case.** The founder's platform likely does something between plain-restart and rolling; genuine blue-green (fully duplicated environments) costs roughly double the running infrastructure during every deploy, which is why it's not everyone's default.
+</Callout>
+
+### Feature flags: decoupling "deployed" from "live"
+
+A flag lets code ship to production, inert, and be switched on independently of any deploy — which is the entire mechanism behind M14.2's kill-switch pattern and M4.5's env-var-vs-flag distinction. The deploy risk and the feature-launch risk become two separate, smaller risks instead of one combined one.
+
+<Operator>
+
+```bash
+cd demo-app
+
+# ── Verify the real downtime gap yourself ──────────────────────────────
+#   In one terminal, hammer the health endpoint and log every result:
+while true; do
+  t=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 http://localhost:3001/api/health 2>/dev/null)
+  printf "%s " "${t:-ERR}"; sleep 0.2
+done
+#   In another: force a real rebuild (touch a file so the image actually changes)
+echo "// $(date +%s)" >> app/api/health/route.ts
+docker compose up -d --build app
+#   Verified: a run of "000"/ERR appears for roughly 0.5-1s during the swap.
+git checkout -- app/api/health/route.ts    # revert the cache-busting edit
+
+# ── See build-time vs runtime failure, concretely ─────────────────────
+#   Build-time failure: a real syntax error, caught before anything deploys
+echo "this is not valid typescript {{{" >> app/api/health/route.ts
+docker compose up -d --build app 2>&1 | tail -15    # fails during BUILD
+git checkout -- app/api/health/route.ts
+#   Runtime failure: point DATABASE_URL at a nonexistent database name
+#   in compose.yaml, rebuild. Verified: the BUILD succeeds (it never
+#   touches the database at all) and the container starts — only
+#   `curl localhost:3001/api/health` reveals the actual failure, at
+#   request time. (M1.5 covers this build-vs-runtime gap in depth.)
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Blue-green / canary without building it yourself | Most modern PaaS (Vercel, Render) offer some version — check which, specifically |
+| Feature flags | LaunchDarkly, a database-backed flag table (M4.5's pattern), or a simple env-var-driven flag for low-stakes cases |
+| Staging that actually resembles production | Same infrastructure provider, same region, a recent production data snapshot (anonymized if needed) |
+| Measure a real deploy gap | A tight polling loop against your health endpoint, exactly as verified above — don't trust a platform's claim without measuring |
+
+What good looks like: you know, specifically, what deployment pattern your platform actually uses by default, and have measured (not assumed) whether a real gap exists; staging catches problems because it's genuinely close to production, not despite being different from it.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd demo-app && docker compose up -d --build
+```
+
+1. **Measure the real gap** using the Operator block's polling loop plus a forced rebuild. Write down the approximate duration you observe.
+
+2. **Trigger a build-time failure** deliberately (invalid syntax) and read exactly where in the process it fails — confirm nothing is ever deployed.
+
+3. **Trigger a runtime-only failure.** In `compose.yaml`, change the app's `DATABASE_URL` database name to something that doesn't exist (e.g. `.../nonexistent_db`), rebuild, and watch: the **build succeeds and the container starts** — then `curl localhost:3001/api/health` reports the actual failure (`database "nonexistent_db" does not exist`) only once the app tries to use the connection. Verified exactly this way: the Docker build never touches the database at all, so it has no way to catch this; only running the app does. Restore the original value and rebuild.
+
+4. **Design, on paper, what a real blue-green setup would need** for this specific demo app: two full copies of which services, a health check definition, and the exact moment traffic would switch. Compare the infrastructure cost to the plain-restart baseline you measured in step 1.
+
+5. **Restore everything** — revert any file changes, rebuild cleanly, confirm `/api/health` is back to normal.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A team's staging environment passes every test for a new feature. The exact same code, deployed to production, immediately throws errors on a code path staging never exercised.
+
+<Evidence title="staging vs production, compared">
+
+```text
+Staging database:    ~200 rows in the `orders` table, seeded manually
+Production database: ~2.1 million rows in the `orders` table
+
+Staging DATABASE_URL: points at a db in the SAME region as the app
+Production DATABASE_URL: app in us-east-1, database in eu-west-1
+  (set up 8 months ago during an early migration; never revisited)
+
+Staging ANTHROPIC_API_KEY: a shared team test key, no rate limit ever hit
+Production ANTHROPIC_API_KEY: the real key, under real traffic
+```
+
+</Evidence>
+
+<Evidence title="the actual production error">
+
+```text
+Error: statement timeout
+  at Pool.query (pg-pool/index.js)
+  Query: SELECT * FROM orders WHERE customer_id = $1 ORDER BY created_at DESC
+```
+
+</Evidence>
+
+Why would a query that works instantly in staging time out in production, when it's the identical SQL?
+
+<Reveal label="Reveal the cause">
+
+**Staging never tests the one variable that actually matters here: scale.** The query lacks an index on `(customer_id, created_at)` — fine, even instant, against 200 rows; a genuine sequential-scan-plus-sort problem (M6.1's exact lesson) against 2.1 million rows, made worse by a cross-region round trip (app in `us-east-1`, database in `eu-west-1`) that staging's same-region setup never exercised either, so even the per-query latency floor was different by an order of magnitude before the query's own inefficiency compounded it.
+
+**This is the mental model's warning realized exactly:** staging's value is proportional to how closely it resembles production, and this staging environment differed from production in at least three load-bearing ways — data volume, region, and (less relevant to this specific bug, but a real gap nonetheless) API rate-limit exposure. Each individual difference might seem like a reasonable cost-saving shortcut (a smaller staging database costs less; nobody revisited the region after an early migration); together, they mean staging was never actually testing "will this query perform acceptably at real scale, over a real network distance" — the two things that broke in production.
+
+**The fix for this specific incident:** add the index (M6.1), and separately, investigate whether co-locating the app and database (M5's region lesson, M9's scaling module) is overdue regardless of this one query.
+
+**The fix for the underlying staging gap, which matters more:**
+1. **Seed staging with a realistic, anonymized snapshot of production data volume** — not full production data for privacy/compliance reasons, but a copy *at scale*, even if the data itself is synthetic or scrubbed.
+2. **Put staging in the same region as production**, or explicitly accept and document that cross-region latency is untested there.
+3. **Periodically audit what's actually different between staging and production** — config, region, data volume, rate limits — as a standing practice, not a one-time setup checklist, because gaps accumulate exactly as this one did (a region decision made 8 months ago and never revisited).
+
+**The transferable rule:** a staging environment that passes every test and still lets a bug through isn't lying to you — it's telling you the truth about *itself*, which happens not to be close enough to the truth about production. The fix is never "staging is broken"; it's "staging and production have diverged in a way nobody is tracking," and finding that divergence is the actual debugging task.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Compare our staging and production environments across: data volume in key tables, region/latency between app and database, environment variable differences, and any rate limits or quotas that differ. For each gap found, tell me what KIND of bug it could hide — a bug that only appears at scale, under latency, or under a specific config that staging doesn't match."}>
+The 'what kind of bug it could hide' framing matters — a region difference specifically hides latency-related bugs; a data-volume difference specifically hides N+1/missing-index bugs (M6.1, M8.5). Verify it names the SPECIFIC bug class per gap rather than a generic 'staging should match production' statement.
+</AgentTask>
+
+<AgentTask prompt={"Measure the actual downtime, if any, during a deploy of this specific service [describe the platform/setup]. Give me a script that polls the health endpoint at high frequency during a deploy and reports the longest gap of failures observed, so I have a real number instead of relying on the platform's marketing claim about zero-downtime deploys."}>
+This directly tests the story's claim — verify the measurement methodology actually polls frequently enough (sub-second interval) to catch a sub-second gap, since a 5-second polling interval would miss exactly the kind of gap that matters here.
+</AgentTask>
+
+<AgentTask prompt={"For this specific feature [describe it], should it be deployed behind a feature flag rather than going live the moment it's deployed? Consider: is this a change that might need to be reverted quickly without a full redeploy, and does it make sense to roll it out to a small percentage of users first?"}>
+A good answer separates the deploy-risk question (did the code ship correctly) from the feature-risk question (should everyone see it immediately) — these are genuinely different risks, and a flag is specifically the tool for decoupling them, per this lesson's mental model.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before trusting a "zero-downtime" claim:
+
+- Have you actually MEASURED a deploy gap with a tight polling loop, or are you trusting a platform's description?
+- Which specific pattern (plain restart, rolling, blue-green, canary) does your platform actually use by default?
+
+For staging specifically:
+
+- Does it have production-scale data, or a toy amount?
+- Is it in the same region as production?
+- Are its environment variables/config a deliberate match to production, or whatever was convenient at setup time?
+- Has anyone audited staging-vs-production drift recently, or only at initial setup?
+
+What good looks like: deploy-gap claims are measured, not assumed; staging catches real bugs because it's genuinely close to production in the dimensions that matter (scale, region, config) — not just in having the same codebase deployed.
+
+Red flags: "staging passed" treated as equivalent to "this will work in production" without checking what staging actually resembles; a "zero-downtime" claim nobody has verified with an actual measurement.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l05"
+  questions={[
+    {
+      q: "What's the practical difference between a build-time failure and a runtime failure?",
+      options: [
+        "Build-time failures are always syntax errors; runtime failures are always logic errors",
+        "A build-time failure (a type error, a missing dependency) is caught before anything is deployed; a runtime failure (a missing env var, an unreachable database) can only appear once the artifact is actually running, because build time has no way to check it",
+        "Runtime failures only happen in production, never in development",
+        "Build-time failures are always the deploy platform's fault"
+      ],
+      answer: 1,
+      explain: "This is M1.5's env-var story restated: the build can succeed completely while a runtime-only dependency (a value the environment needs to actually supply) is missing — the two failure classes need different diagnosis approaches entirely."
+    },
+    {
+      q: "Verified directly on the demo app: what happens during a plain `docker compose up --build` restart?",
+      options: [
+        "Nothing — Docker guarantees zero downtime for any restart",
+        "A real, measurable gap of failed requests (roughly half a second to a second) occurs while the old container stops and the new one starts listening",
+        "The old container keeps serving requests until the new one is fully ready",
+        "Requests are automatically queued and replayed once the new container starts"
+      ],
+      answer: 1,
+      explain: "This is the honest baseline every 'zero-downtime' claim should be measured against. True gap-free deploys require blue-green or similar — running both versions simultaneously and switching traffic only after the new one is confirmed healthy."
+    },
+    {
+      q: "Why did the founder's \"zero-downtime\" platform still have a real gap that an enterprise prospect's monitoring caught?",
+      options: [
+        "The platform was lying about its capabilities",
+        "\"Zero downtime\" meant the platform's own health check never saw a gap long enough to mark the service unhealthy — a sub-second gap is invisible to most monitoring's sampling interval but not to a high-frequency automated test that happens to land in that exact window",
+        "The prospect's test was measuring an unrelated service",
+        "The platform's claim only applied to certain regions"
+      ],
+      answer: 1,
+      explain: "This is the gap between 'no monitoring tool noticed' and 'literally zero requests failed' — different claims, and most platforms' default deploy pattern only guarantees the weaker one."
+    },
+    {
+      q: "In the break-fix, why did a query that worked instantly in staging time out in production despite being identical SQL?",
+      options: [
+        "Production used a different database engine than staging",
+        "Staging had ~200 rows and same-region latency, while production had 2.1 million rows with no supporting index AND a cross-region round trip — staging never exercised either of the two things that actually broke",
+        "The production database had a corrupted index",
+        "Staging and production were running different versions of the application code"
+      ],
+      answer: 1,
+      explain: "Staging's value is proportional to how closely it resembles production. Here it diverged in data volume and region — both load-bearing for exactly this bug — so staging was never actually testing the conditions that broke in production."
+    },
+    {
+      q: "What does a feature flag let you decouple that a plain deploy doesn't?",
+      options: [
+        "The build process from the deploy process",
+        "Whether code has been DEPLOYED from whether it's actually LIVE for users — the deploy risk and the feature-launch risk become two separate, smaller risks instead of one combined one",
+        "The staging environment from the production environment",
+        "Database migrations from application code deploys"
+      ],
+      answer: 1,
+      explain: "This is the mechanism behind M14.2's kill-switch pattern — shipping inert code and switching it on independently means a bad feature can be turned off without a full redeploy, and a risky deploy can ship with the feature still off."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,296 @@
+---
+id: m02-l06
+module: M2
+title: "Rollback: why it's the first fix, and what it can't undo"
+order: 6
+difficulty: 2
+depth: both
+platforms: [vercel, render, github-actions]
+concepts: [rollback]
+prerequisites: [m02-l05, m06-l03]
+lab: demo-repo
+scenario_ids: [sc-rollback-migration-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A deploy went out at 2pm with a subtle bug in the checkout flow. By 2:15, support tickets were arriving. The on-call engineer spent the next forty minutes **debugging the bug** — reading the diff, reproducing it locally, forming a theory, writing a fix, testing the fix — while checkout stayed broken for every real customer the entire time.
+
+The fix, once found, was three lines. The forty minutes of debugging happened entirely *before* rolling back, because nobody had made rolling back the reflexive first move — it felt like "giving up" on understanding the problem, or like it would somehow make the problem harder to diagnose afterward. Neither is true: the previous version was working an hour earlier, reverting to it takes roughly as long as the original deploy did, and *none* of the forty minutes of live debugging needed to happen while customers were affected — it could have happened just as effectively against the now-restored, working production, with the broken version sitting safely in a branch for exactly as long as the investigation required.
+
+The three-line fix was correct. The decision to debug live, for forty minutes, before restoring service, was the actual incident.
+
+</Section>
+
+<Section kind="already-did">
+
+You've had a deploy go wrong and felt the pull to understand it before doing anything else — it's a completely natural instinct, and it's backwards for almost every production incident. M14.2 will give you the full incident-response version of this; this lesson is the git-and-deploy mechanics underneath it, including the part most people learn the hard way: not everything that goes out in a deploy *can* actually be rolled back, no matter how fast you click the button.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Rollback first, debug second — and why that ordering is correct, not just faster
+
+<Callout type="key">
+**Rolling back restores service without requiring you to understand the cause first.** Debugging *while broken* costs every minute of that debugging to your actual users; debugging *after* restoring service costs nothing extra to them — the investigation takes exactly as long either way, but only one ordering has customers suffering through it. This is the entire argument, and it holds regardless of how confident you feel that you'll find the fix quickly — you often won't be as fast as you expect, and the story's forty minutes is the typical case, not the exception.
+</Callout>
+
+### What's actually reversible, and what fundamentally isn't
+
+<svg viewBox="0 0 780 220" role="img" aria-label="Code deploys are cleanly reversible by redeploying the previous version, but database migrations and anything that already triggered an external side effect are not symmetrically reversible" className="diagram">
+  <rect x="8" y="16" width="372" height="90" rx="10" />
+  <text x="194" y="42" textAnchor="middle">REVERSIBLE</text>
+  <text x="194" y="64" textAnchor="middle" className="sub">application code — redeploy the</text>
+  <text x="194" y="82" textAnchor="middle" className="sub">previous version, cleanly, symmetrically</text>
+
+  <rect x="400" y="16" width="372" height="90" rx="10" />
+  <text x="586" y="42" textAnchor="middle">NOT SYMMETRICALLY REVERSIBLE</text>
+  <text x="586" y="64" textAnchor="middle" className="sub">schema migrations already applied;</text>
+  <text x="586" y="82" textAnchor="middle" className="sub">emails/charges/webhooks already sent</text>
+
+  <text x="12" y="140" className="sub">Rolling back CODE while a migration has already run means the OLD code is now running</text>
+  <text x="12" y="162" className="sub">against the NEW schema — which may be exactly the wrong combination, not automatically safer.</text>
+  <text x="12" y="192" className="sub">This is why M6.3 insists migrations are forward-only in practice: "rollback" means something</text>
+  <text x="12" y="214" className="sub">different and much harder for data than it means for code.</text>
+</svg>
+
+**Code** is symmetric: the previous version was a known-good artifact, and redeploying it is exactly as safe as that version already was. **Database schema changes** are not: if a migration has already run and new rows have been written under the new schema, rolling back the *code* to a version that expects the *old* schema doesn't undo the migration — it creates a mismatch, potentially a worse one than the original bug. **Anything with an external side effect** — a sent email, a captured payment, a published webhook — cannot be rolled back by any deploy mechanism at all; it already happened in the world, and "rollback" there means a *new*, separate action (a refund, a correction email), not an undo.
+
+### How rollback actually works, per platform
+
+| Platform | Mechanism |
+|---|---|
+| Vercel/Render/similar | "Redeploy" or "promote" a previous build — usually seconds, because the artifact already exists |
+| Raw Docker/VPS | Re-run the deploy with the previous image tag |
+| This project's demo app | `git revert`, then rebuild (verified below) |
+| Kubernetes | Roll back to the previous ReplicaSet/revision |
+
+The universal mechanism underneath all of them: **the previous version's build artifact already exists somewhere, and rollback is "point traffic at that instead" — which is fast precisely because nothing needs to be rebuilt from scratch.** This is also why keeping a few recent build artifacts around (most platforms do this automatically) matters — a rollback that requires rebuilding from an old commit is slower and riskier than one that just re-promotes an artifact that's already sitting there.
+
+<Operator>
+
+```bash
+cd /Users/vishwanathsingh/Downloads/Project/OTS
+
+# ── A real, safe rollback drill on THIS project's own history ─────────
+git log --oneline -5
+#   Pick the most recent commit as a stand-in for "the bad deploy":
+git revert --no-edit HEAD
+#   Verified: creates a NEW commit undoing the last one. History
+#   preserved — both the "bad" commit and the revert are visible:
+git log --oneline -3
+#   This IS what a code rollback looks like, mechanically — it's
+#   exactly M2.1's git revert, deployed.
+
+# ── Undo the drill (this was a rehearsal, not a real need) ─────────────
+git revert --no-edit HEAD    # revert the revert — back to where we started
+git log --oneline -4
+```
+
+```bash
+cd demo-app
+
+# ── Feel why a migration breaks the clean "just redeploy old code" story ─
+#   Simulate: a migration already ran, adding a column the NEW code reads.
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE bookings ADD COLUMN source text;"
+#   Now imagine rolling back to OLD code that never heard of this column —
+#   that's fine, old code ignoring an extra column is usually harmless.
+#   But the REVERSE is the real danger: if old code is rolled back to
+#   AFTER a migration that the old code doesn't expect to be missing
+#   something it relies on — M6.3's exact "expand before contract" lesson.
+docker compose exec -T db psql -U ots -d demo -c \
+  "ALTER TABLE bookings DROP COLUMN source;"    # clean up the drill
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Code rollback | Your platform's redeploy/promote feature, or `git revert` + redeploy |
+| See what's different between current and previous | `git diff <previous-tag> <current-tag>` before deciding what a rollback would actually change |
+| Avoid migration-vs-code rollback mismatches | M6.3's expand/contract pattern — designed specifically so a code rollback is always safe regardless of migration state |
+| Feature-level rollback without a deploy | A feature flag (M2.5) — flip it off instead of redeploying at all |
+
+What good looks like: rollback is the reflexive first response to "something just broke after a deploy," not a last resort reached for after debugging fails; and the team knows, for their actual migration practices, whether a code rollback is always safe or sometimes isn't.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd /Users/vishwanathsingh/Downloads/Project/OTS
+```
+
+1. **Run the real revert drill** from the Operator block, on this project's own git history (or any repo you have). Confirm both the original commit and the revert commit are visible in `git log` afterward.
+
+2. **Time it.** How long did `git revert --no-edit HEAD` actually take? Compare that to how long you'd estimate debugging a subtle bug would take, even optimistically.
+
+3. **Run the migration drill** in the demo app and write down, in your own words, why "roll back the code" and "roll back the database" are different operations with different safety properties — specifically, which direction (new code on old schema, vs. old code on new schema) is usually safer and why.
+
+4. **Audit your own product's deploy history** (or this project's): for the last several deploys, which included a database migration alongside code changes? For each, would a pure code-only rollback have been safe, or would it have left code and schema mismatched?
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A deploy causes a visible bug. The on-call engineer rolls back the code immediately — the platform confirms the previous version is live within 30 seconds. The bug *persists* anyway, identically, even though the "old" code is now running.
+
+<Evidence title="the deploy that caused the bug">
+
+```text
+Deploy included:
+  1. A migration: ALTER TABLE products ADD COLUMN display_price_cents integer;
+     + a backfill: UPDATE products SET display_price_cents = price * 100;
+  2. New code: reads product.display_price_cents, no longer reads product.price
+```
+
+</Evidence>
+
+<Evidence title="what rollback actually did">
+
+```text
+$ git log --oneline -2
+a1b2c3d (rolled back TO this)  previous: reads product.price
+e4f5678 (rolled back FROM this) new: reads product.display_price_cents
+
+Rollback completed: previous code (a1b2c3d) is now deployed and running.
+
+$ SELECT price, display_price_cents FROM products LIMIT 3;
+ price | display_price_cents
+-------+---------------------
+ 19.99 |                 1999
+ 24.50 |                 2450
+ (migration already ran — this data is fine)
+```
+
+</Evidence>
+
+<Evidence title="the actual bug, still present after rollback">
+
+```text
+Products page still shows: "Price: $0.00" for every product
+```
+
+</Evidence>
+
+The old code is confirmed running. The migration's data looks correct. Why does the bug persist?
+
+<Reveal label="Reveal the cause">
+
+**The rollback restored the OLD code, which reads `product.price` — but the actual bug was never in the new code's column choice; it was somewhere else entirely (the real cause is deliberately not shown here, because the point of this break-fix is what the evidence should make you question, not a single specific root cause), and the rollback's success at restoring old code doesn't guarantee old code was ever the problem to begin with.**
+
+Re-read what actually happened: rollback restored `a1b2c3d`, which reads `product.price`. The `price` column was never touched by the migration — it's still there, unchanged, holding `19.99`, `24.50`, and so on. If the bug persists with the old code reading an unchanged column holding correct values, **the bug is not, and was never, a code-version problem at all.** Something else — a cache serving a stale or corrupted value (M6.5), a separate service that computes displayed price independently, or a frontend build that didn't actually get rolled back alongside the backend — is the real cause, and rolling back the backend code addressed a hypothesis that the evidence doesn't actually support once you check it carefully.
+
+**The transferable lesson, which matters more than any single specific cause here:** **a rollback "working" (the platform confirms the old version is live) and a rollback "fixing the symptom" are different claims, and conflating them wastes exactly the time rollback was supposed to save.** If you roll back and the bug persists, the correct next move is not "roll back further" or "the rollback must have failed somehow" — it's **recognizing that the deploy you rolled back might not have been the actual cause**, and now you need the debugging method (M8.6) to find out what *is*, with the one advantage that you're no longer debugging live — you've already restored a confirmed-old, confirmed-working-before code version, so whatever is still broken is broken independent of this specific deploy, and the investigation can proceed calmly.
+
+**What this specific evidence actually rules in, worth practicing the reasoning on:** check the cache (M6.5) first — a cached "price" computed before the migration even started, with a TTL long enough to still be serving stale data, would produce exactly this symptom regardless of which code version is running, because neither code version ever gets a chance to compute a fresh value while the cache is being served. That's the layer-isolation habit from M8.6, applied to a deploy-rollback scenario instead of a live-incident one.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"We just rolled back a deploy and the bug is still happening. Before assuming the rollback failed or trying to roll back further, help me verify: is the previous version ACTUALLY running (check the deployed commit/version directly, don't just trust the platform's confirmation message), and could anything else (a cache, a separate service, a CDN) be serving a result that's independent of which code version is deployed?"}>
+This directly targets the break-fix's lesson — verify it treats 'rollback confirmed by the platform' and 'rollback actually fixed the symptom' as separate claims to check independently, rather than assuming the second follows automatically from the first.
+</AgentTask>
+
+<AgentTask prompt={"Before our next deploy that includes a database migration, tell me: if we needed to roll back the CODE only (not the migration) immediately after this deploys, would the old code still work correctly against the new schema? Walk through exactly what the old code expects versus what the schema will actually look like."}>
+This is the preventive check that M6.3's expand/contract pattern exists to make unnecessary — a migration designed that way makes this question's answer always 'yes, safely.' Verify it actually traces through the OLD code's expectations against the NEW schema specifically, not just confirming the migration itself succeeded.
+</AgentTask>
+
+<AgentTask prompt={"I'm debugging a production incident right now. Before you help me find the root cause, confirm: have we already rolled back to the last known-good deploy? If not, that should happen FIRST, and we can debug calmly against the restored, working version afterward — not while customers are still affected by the broken one."}>
+This is the standing instruction worth giving at the START of every incident, not something to remember mid-crisis. Verify the agent actually treats this as a gate — refusing to dive deep into root-cause analysis until rollback (or an explicit, deliberate decision not to roll back) has happened first.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+When something breaks right after a deploy:
+
+- Has rollback happened FIRST, before any live debugging? If not, why not — is there a specific, deliberate reason, or is it just not the reflexive first move yet?
+- Once rolled back: is the previous version ACTUALLY confirmed running (checked directly), separate from trusting a platform's success message?
+- Does the bug persist after a confirmed rollback? If so, stop assuming the rollback failed — consider that this deploy might never have been the actual cause.
+
+For any deploy that includes a migration:
+
+- If we needed to roll back the code only, immediately, would the old code still work against the new schema? (M6.3's expand/contract pattern is what makes this always "yes.")
+
+What good looks like: rollback is the reflexive first response, taking roughly as long as the original deploy; the team can state clearly which of their changes are cleanly reversible (code) and which aren't (migrations, sent side effects) before an incident, not during one.
+
+Red flags: debugging live, for an extended period, before restoring service; assuming a rollback that didn't fix the symptom means the rollback failed, rather than questioning whether the deploy was the actual cause; a migration shipped in the same deploy as code that depends on it, with no plan for a code-only rollback.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l06"
+  questions={[
+    {
+      q: "Why is rolling back BEFORE debugging the correct default, rather than \"giving up\" on understanding the problem?",
+      options: [
+        "Rollback is always faster than any possible fix",
+        "Debugging while broken costs every minute to real users; debugging after restoring service costs the same investigation time but with nobody affected while it happens — the understanding isn't lost, only the ORDER changes",
+        "Debugging after a rollback is technically easier because logs are clearer",
+        "Most bugs can't actually be found through debugging anyway"
+      ],
+      answer: 1,
+      explain: "The story's forty minutes of live debugging could have happened just as effectively against restored, working production, with the broken version safely sitting in a branch. Only the ORDERING was the actual incident."
+    },
+    {
+      q: "Why are database migrations fundamentally different from code deploys when it comes to rollback?",
+      options: [
+        "Migrations take longer to execute than code deploys",
+        "Code rollback is symmetric — the previous version was already known-good; a migration that already ran and has new data written under the new schema can't be symmetrically undone by rolling back code, which may create old-code-on-new-schema mismatches",
+        "Migrations can only be rolled back by a database administrator",
+        "Code deploys don't require a working previous version to exist"
+      ],
+      answer: 1,
+      explain: "This is M6.3's forward-only lesson restated from the rollback side. A code rollback's safety depends on whether the old code can tolerate whatever schema state a migration already left behind."
+    },
+    {
+      q: "In the break-fix, why did a confirmed-successful rollback fail to fix the visible bug?",
+      options: [
+        "The platform's rollback confirmation was lying",
+        "The rollback correctly restored old code, but the old code's dependency (product.price) was never touched by the migration and held correct data all along — meaning this specific deploy was likely never the actual cause of the bug in the first place",
+        "The migration needed to be rolled back separately and wasn't",
+        "The old code version had a different, unrelated bug"
+      ],
+      answer: 1,
+      explain: "'The rollback worked' (platform confirms old code is running) and 'the rollback fixed the symptom' are different claims. When they diverge, the correct response is questioning whether the deploy was ever the cause — not assuming the rollback itself failed."
+    },
+    {
+      q: "What does M6.3's expand/contract migration pattern specifically protect against, from a rollback perspective?",
+      options: [
+        "It makes migrations run faster",
+        "It ensures that if code needs to be rolled back immediately after a migration deploys, the OLD code still works correctly against the NEW schema — because the schema change and the code's dependency on it are deployed as separate, sequenced steps",
+        "It prevents migrations from ever failing",
+        "It eliminates the need for database backups"
+      ],
+      answer: 1,
+      explain: "This is the direct link between M6.3 and this lesson: expand/contract is what makes 'can I safely roll back the code alone' always answer yes, by never shipping code that depends on a schema change in the same deploy as that change."
+    },
+    {
+      q: "Why does rollback speed depend on the previous version's build artifact already existing?",
+      options: [
+        "Build artifacts are always instant to create regardless of complexity",
+        "Rollback is fundamentally \"point traffic at an artifact that already exists\" rather than rebuilding from scratch — which is why most platforms automatically retain recent build artifacts, and why a rollback requiring a rebuild from an old commit is slower and riskier",
+        "Rollback doesn't actually require any build artifact at all",
+        "Previous versions are always smaller in size than the current version"
+      ],
+      answer: 1,
+      explain: "This is the universal mechanism underneath every platform's 'redeploy previous version' button — it's fast because it's promoting something already built, not recompiling history."
+    }
+  ]}
+/>
+
+</Section>

@@ -1,0 +1,311 @@
+---
+id: m02-l02
+module: M2
+title: "Merge, rebase, and bisect: git as a debugging tool, not just storage"
+order: 2
+difficulty: 2
+depth: both
+platforms: [github-actions]
+concepts: [git-model]
+prerequisites: [m02-l01]
+lab: self
+scenario_ids: [sc-bisect-regression-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A team's checkout page started silently failing to apply discount codes — no error, codes just stopped working — sometime in the last two weeks, across roughly forty deploys from three different people and an AI agent making small, independent fixes. Nobody could say which deploy caused it; nobody had written down which deploy *introduced the bug* versus which deploys came after and merely inherited it.
+
+The instinct was to read every diff from the last two weeks, in order, looking for anything discount-related. That's roughly forty commits to review by eye, several of which touched the discount code path for unrelated reasons, and the actual bug wasn't obviously discount-related at all — it was a change to how prices were rounded, three services away from the discount logic, that only broke discounts because of how the two interacted.
+
+`git bisect` found it in six steps. Not six *educated guesses* — six, because that's `log₂(40)` rounded up: the exact number of times you can cut forty candidates in half. Each step, the team ran one script that said "is the bug present here? yes or no," and git did the rest. The commit it landed on was nobody's prime suspect.
+
+</Section>
+
+<Section kind="already-did">
+
+You've resolved a merge conflict by following an agent's suggested resolution without fully reading both sides of what you were choosing between — most people have, at least once. You've probably never run `git bisect`, because nobody showed you that it exists, and "which of these forty commits broke this" is a genuinely common question with a genuinely mechanical answer that most people solve by reading diffs instead.
+
+</Section>
+
+<Section kind="mental-model">
+
+### Merge vs. rebase: two honest answers to "combine these histories"
+
+**Merge** creates a new commit with two parents — both histories are preserved exactly as they happened, including the fact that they diverged and came back together. **Rebase** rewrites one branch's commits to appear as if they'd been written starting from the other branch's current tip — a cleaner, linear-looking history, achieved by actually creating new commits (new hashes) that replay the same changes on a different base.
+
+<Callout type="key">
+**Rebase rewrites commit hashes. Never rebase commits that have already been pushed and that anyone else might have based work on** — their copy and your rewritten copy are now different objects with the same conceptual content but different hashes, and reconciling that is exactly the kind of mess M2.1's "don't reset --hard shared history" warning was about, in a different costume. Merge is always safe on shared branches; rebase is a tool for cleaning up your *own*, not-yet-shared work before it becomes shared.
+</Callout>
+
+### Reading a real conflict
+
+```text
+<<<<<<< HEAD
+branch A's version
+=======
+branch B's version
+>>>>>>> branch-b
+```
+
+Everything between `<<<<<<< HEAD` and `=======` is **your current branch's version**; everything between `=======` and `>>>>>>> branch-b` is **the branch being merged in**. Resolving means deleting the markers and keeping, combining, or rewriting what's left — git has no opinion on which is "right"; it only knows it can't choose for you.
+
+### `git bisect`: binary search applied to history
+
+The entire mechanism, stated plainly: tell git a commit where the bug definitely exists (`bad`) and one where it definitely doesn't (`good`). Git checks out the midpoint. You test it and report `good` or `bad`. Git halves the remaining range and repeats. For 40 commits, that's about 6 rounds — `log₂(40) ≈ 5.3` — rather than reading all 40.
+
+<svg viewBox="0 0 780 200" role="img" aria-label="Bisect narrows a range of commits by half with each test, finding the exact breaking commit in log base 2 of the total steps rather than checking every commit" className="diagram">
+  <text x="12" y="20" className="sub">40 commits, one of them broke it. Bisect doesn't scan — it cuts the range in half, repeatedly.</text>
+  <rect x="8" y="40" width="760" height="30" rx="4" />
+  <text x="390" y="60" textAnchor="middle" className="sub">40 commits — test the midpoint</text>
+  <rect x="8" y="90" width="380" height="26" rx="4" />
+  <text x="198" y="108" textAnchor="middle" className="sub">bad half — 20 left — test ITS midpoint</text>
+  <rect x="8" y="136" width="190" height="24" rx="4" />
+  <text x="103" y="153" textAnchor="middle" className="sub">10 left</text>
+  <rect x="8" y="176" width="95" height="20" rx="4" />
+  <text x="55" y="191" textAnchor="middle" className="sub">5 → 2 → 1: found it</text>
+  <text x="430" y="150" className="sub">~6 tests total find the ONE exact commit, out of 40 — not 40 tests, not a guess.</text>
+</svg>
+
+<Callout type="warn">
+**`git bisect run` automates the whole thing, if you can express "is the bug present" as a script that exits 0 (good) or non-zero (bad).** Verified directly: a trivial test (`grep -q BROKEN file.txt`) let `git bisect run` find a deliberately-planted bad commit among 8, in exactly 3 automated steps, with no human judgment calls in the loop at all. For anything with an automated test or even a one-line reproduction command, this is strictly faster and more reliable than eyeballing diffs.
+</Callout>
+
+### `git log`, `git blame`, and reading history as evidence
+
+| Tool | Answers |
+|---|---|
+| `git log -p -- path/to/file` | What changed in this file, over time, in order |
+| `git log -S"search term"` | Which commits introduced or removed a specific string (M4.1's leaked-key search uses exactly this) |
+| `git blame -L start,end file` | Which commit last touched each of these specific lines |
+| `git bisect` | Which commit, among a range, is the FIRST one where a condition becomes true |
+
+`blame` and `bisect` answer different questions, often confused: `blame` tells you who *last touched a line*, which is not the same as who *introduced a bug* — a line can be touched by an unrelated formatting commit long after the actual bug-introducing change. `bisect` answers the causal question directly, by testing behavior, not by reading diffs.
+
+<Operator>
+
+```bash
+cd /tmp && mkdir -p bisect-practice && cd bisect-practice && git init -q \
+  && git config user.email "you@example.com" && git config user.name "You"
+
+# ── Build a history with a planted bug, like the story's 40 commits ───
+for i in 1 2 3 4 5; do echo "line $i: fine" >> file.txt; git add . \
+  && git commit -q -m "commit $i: fine"; done
+echo "line 6: BROKEN" >> file.txt && git add . && git commit -q -m "commit 6: the bug"
+for i in 7 8; do echo "line $i: fine too" >> file.txt; git add . \
+  && git commit -q -m "commit $i: fine"; done
+git log --oneline
+
+# ── Bisect it, automatically, with a one-line test ─────────────────────
+git bisect start HEAD $(git log --oneline | tail -1 | cut -d' ' -f1)
+git bisect run sh -c 'grep -q BROKEN file.txt && exit 1 || exit 0'
+#   Verified: finds the exact commit in 3 steps, out of 8 — log2(8)=3.
+git bisect reset
+
+# ── Create and resolve a real merge conflict ───────────────────────────
+git checkout -q -b branch-a HEAD~2
+echo "branch A's change" > shared.txt && git add . && git commit -q -m "A changes shared.txt"
+git checkout -q -b branch-b HEAD~3
+echo "branch B's change" > shared.txt && git add . && git commit -q -m "B changes shared.txt"
+git checkout -q branch-a
+git merge branch-b                          # expect: CONFLICT
+cat shared.txt                              # read the real markers
+#   Resolve by hand, then:
+git add shared.txt && git commit -q -m "merge: resolved"
+git merge --abort 2>/dev/null; cd /tmp && rm -rf bisect-practice   # clean up this scratch repo
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Find which commit broke something, mechanically | `git bisect` (manual or `run` with a script) |
+| See a file's history over time | `git log -p -- file` |
+| Find who/what last touched specific lines | `git blame -L start,end file` |
+| Search history for when a string appeared/disappeared | `git log -S"string"` |
+| Visualize branch divergence before merging | `git log --graph --oneline --all` |
+
+What good looks like: "which commit introduced this" is answered with `bisect` and a reproducible test, not by reading every diff in the suspect window; merge conflicts are read as two real alternatives to choose between, not resolved by pattern-matching an agent's suggestion without reading both sides.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd /tmp && mkdir -p m02-practice && cd m02-practice && git init -q \
+  && git config user.email "you@example.com" && git config user.name "You"
+```
+
+1. **Run the full bisect drill** from the Operator block. Note the exact number of steps it took and confirm it matches `log₂(8) ≈ 3`.
+
+2. **Create and resolve a real conflict.** Build two branches that both modify the same line of the same file, merge one into the other, and read the actual conflict markers before resolving — don't let an editor's "accept incoming" button hide what you're choosing between.
+
+3. **Try rebasing instead of merging** on your two scratch branches, and compare the resulting `git log --graph` output — merge shows the divergence and reunion explicitly; rebase shows a single, rewritten, linear line. Note that the rebased commits have *different hashes* than their originals (`git log --oneline` on each won't match).
+
+4. **Delete the scratch repo** when done (`cd /tmp && rm -rf m02-practice`) — this was all throwaway.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A checkout page's discount codes silently stop applying sometime in a two-week window containing about 40 deploys from three developers and an AI agent. No error is logged; codes just compute to $0 off. Nobody can identify a suspect commit by description alone — several commits mention "discount" for unrelated reasons (copy changes, a new discount *type* that works fine).
+
+<Evidence title="what's available">
+
+```text
+40 commits in the suspect range, by description:
+  "fix typo in discount banner", "add Black Friday discount type",
+  "update pricing display rounding", "refactor checkout summary",
+  "bump dependency versions", ... (36 more, none obviously the cause)
+
+A reliable manual reproduction exists:
+  1. Apply code "SAVE10" to a $50 cart
+  2. Expected: $45. Bug: $50 (no discount applied)
+```
+
+</Evidence>
+
+<Evidence title="the team's first approach, abandoned after an hour">
+
+```text
+Reading diffs in order, starting from the oldest suspect commit.
+Three reviewers, roughly 13 commits each, cross-referencing discount
+code paths. No clear culprit found after an hour; "update pricing
+display rounding" was read and dismissed as unrelated — it only
+touched a currency-FORMATTING function, nothing about discount logic.
+```
+
+</Evidence>
+
+Manual diff review, done carefully, by multiple people, missed it. What's the faster, more reliable approach, and does it explain why the rounding commit was wrongly dismissed?
+
+<Reveal label="Reveal the cause">
+
+**`git bisect`, with the manual reproduction as the test, finds the exact commit in about 6 steps — and it is, in fact, the pricing display rounding commit, dismissed earlier because its description accurately described what it touched (currency formatting) without hinting at the actual causal chain to discount logic.**
+
+**Why manual review missed it, specifically:** the rounding commit genuinely only changed a currency-formatting function — rounding a display value to two decimal places before rendering it. The bug is that this formatting function was *also* being called, elsewhere, on the raw percentage used in the discount calculation itself — not a display path at all, a shared utility reused in a place its author never anticipated. Reading the commit's diff in isolation, with its accurate, narrowly-scoped description, gives no reason to suspect a connection to discounts three function-calls away. This is exactly why `blame`-style "what commit touched the discount code" reasoning fails here: **no commit in the suspect window directly touched discount logic at all.**
+
+**Why bisect finds it regardless:** bisect doesn't reason about *what a commit says it does* — it tests *actual behavior* at each candidate commit, mechanically, with no assumption about where the bug "should" be. It doesn't need a theory about which commits are suspicious; it only needs a reliable test and a range.
+
+```bash
+git bisect start HEAD <40-commits-ago-hash>
+git bisect run sh -c '
+  # reproduces the manual steps as a script:
+  # apply SAVE10 to a $50 cart via the checkout API, check the result
+  result=$(curl -s -X POST localhost:3000/api/checkout/apply-discount \
+    -d "cart_total=50&code=SAVE10" | jq .total)
+  [ "$result" = "45" ] && exit 0 || exit 1
+'
+```
+
+**The fix, once the actual commit is identified:** the shared currency-formatting function needs to not be reused for a value that must remain unrounded through an intermediate calculation — either a separate function for "format for display" versus "format for internal math," or moving the discount calculation to happen *before* any display-rounding touches the value at all. The deeper lesson for code review, separate from the git-mechanics one: **a utility function's blast radius isn't visible from its own diff** — finding every caller before changing shared logic (a basic "find references" check) would have caught this before it ever shipped.
+
+**The transferable rule:** when a bug's suspect window is large and the bug's *description* doesn't obviously match any commit's *description*, stop reading diffs by eye and start testing behavior with bisect — it finds causal commits regardless of how misleadingly narrow or accurate their stated scope was, because it never reads the description at all.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"I need to find which commit introduced this bug: [describe the symptom and a reliable way to reproduce it — a command, a test, a manual sequence]. Help me turn the reproduction into a script that exits 0 when the bug is ABSENT and non-zero when it's PRESENT, then walk me through git bisect start and git bisect run with it."}>
+The exit-code direction is the detail people get backwards (0 = good/absent, non-zero = bad/present) — verify the script's logic matches that convention exactly, or bisect will confidently report the wrong commit. Test the script manually against one known-good and one known-bad commit before trusting bisect to run it unattended.
+</AgentTask>
+
+<AgentTask prompt={"Review this merge conflict: [paste the conflicted file with markers]. Explain what each side (HEAD and the incoming branch) was actually trying to accomplish, and propose a resolution — but show me both original versions clearly rather than just presenting your merged result, so I can verify you didn't silently drop something important from either side."}>
+Insist on seeing both original intents stated separately before accepting a resolution — the risk with letting an agent 'just resolve' a conflict is exactly the risk of accepting an editor's one-click resolution without reading: something from one side can be silently dropped, and a resolution that compiles isn't the same as a resolution that's correct.
+</AgentTask>
+
+<AgentTask prompt={"I'm about to rebase this branch onto main. Has this branch, or any commit on it, already been pushed anywhere others might have pulled from or built on? If so, explain exactly what problem that would cause and recommend merge instead."}>
+This question should block the rebase if the answer is yes — verify the agent actually treats 'already pushed and possibly pulled by others' as a hard stop rather than a minor caveat, since rewriting shared history is the specific, real danger M2.1 and this lesson both flag.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before combining two branches:
+
+- Merge or rebase? Has either branch already been pushed/shared? (If yes to sharing on the branch being rewritten, use merge, never rebase.)
+- When resolving a conflict: have you read BOTH sides' intent, not just picked whichever looks more complete?
+
+When hunting for a bug's origin commit:
+
+- Do you have a reliable, scriptable reproduction? If yes, `git bisect run` beats reading diffs, every time, for any suspect window larger than a handful of commits.
+- Are you reasoning from commit *descriptions* (unreliable — a narrowly-described change can have a wide blast radius) or from tested *behavior* (what bisect actually checks)?
+
+What good looks like: a 40-commit regression is found in about 6 automated test runs, not an hour of multi-person diff review; nobody rebases a branch that's already been shared.
+
+Red flags: rebasing a branch other people have already pulled; resolving a conflict without reading what's on both sides of the markers; reading commit messages to guess at causation instead of testing behavior when a reliable reproduction already exists.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l02"
+  questions={[
+    {
+      q: "Why must you never rebase a branch that's already been pushed and possibly pulled by someone else?",
+      options: [
+        "Rebase is slower than merge on large repositories",
+        "Rebase creates new commits with different hashes representing the same changes — anyone who already has the old commits now has history that conflicts with the rewritten version",
+        "Rebase requires special permissions on shared branches",
+        "Rebase only works on branches with fewer than a certain number of commits"
+      ],
+      answer: 1,
+      explain: "This is the same class of danger as M2.1's reset --hard warning: rewriting history that others have already built on creates a reconciliation mess. Rebase is for cleaning up your OWN unshared work."
+    },
+    {
+      q: "Why does git bisect find a bug-introducing commit faster than reading diffs in order?",
+      options: [
+        "Bisect reads commit descriptions to identify likely suspects",
+        "Bisect performs a binary search, halving the remaining range with each test — finding one commit among 40 in about 6 steps (log base 2) rather than checking all 40 sequentially",
+        "Bisect only works on commits made in the last week",
+        "Bisect automatically fixes the bug once found"
+      ],
+      answer: 1,
+      explain: "Verified directly: a planted bug among 8 commits was found in exactly 3 automated steps. The mechanism tests BEHAVIOR at each candidate, not descriptions — which is exactly why it found a commit whose description gave no hint of the actual bug."
+    },
+    {
+      q: "In the break-fix, why did careful manual diff review by multiple people miss the actual bug-introducing commit?",
+      options: [
+        "The reviewers didn't have enough git experience",
+        "The commit's description accurately described a narrow, unrelated-sounding change (currency display formatting) with no hint that the same function was also called from the discount calculation path — a connection invisible from the diff alone",
+        "The commit was hidden using git's rebase feature",
+        "The bug was introduced by a merge commit, which diff tools display differently"
+      ],
+      answer: 1,
+      explain: "A utility function's blast radius isn't visible from its own diff — bisect doesn't need to understand WHY a commit is bad, only that testing shows it is, which is why it succeeds where description-based reasoning fails."
+    },
+    {
+      q: "What's the practical difference between what `git blame` and `git bisect` each tell you?",
+      options: [
+        "They are interchangeable tools for the same question",
+        "blame tells you who last touched a specific LINE (not necessarily who introduced a bug); bisect tells you which commit is the first one where a tested CONDITION becomes true — a causal, behavioral answer",
+        "blame only works on the current branch, bisect works across all branches",
+        "bisect requires a GUI tool while blame is command-line only"
+      ],
+      answer: 1,
+      explain: "A line can be touched by an unrelated formatting commit long after the real bug-introducing change — blame would point at the formatting commit; bisect, testing actual behavior, finds the true cause regardless of which line last changed."
+    },
+    {
+      q: "When reading a merge conflict with `<<<<<<< HEAD` / `=======` / `>>>>>>> branch-name` markers, what does each section represent?",
+      options: [
+        "The top section is always the correct version to keep",
+        "Between <<<<<<< HEAD and ======= is your current branch's version; between ======= and >>>>>>> branch-name is the incoming branch's version — git has no opinion on which is right, only that it can't choose for you",
+        "The markers indicate which lines have syntax errors",
+        "Everything between the markers should always be deleted"
+      ],
+      answer: 1,
+      explain: "Resolving a conflict means actually reading both alternatives and deciding — not pattern-matching a one-click 'accept' button without understanding what each side was trying to accomplish."
+    }
+  ]}
+/>
+
+</Section>

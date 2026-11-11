@@ -11,7 +11,8 @@ diagnose production failures themselves. Full scope, curriculum and build order 
 Phase 1, build-order steps 1–4 complete:
 
 - Next.js (App Router) + MDX content pipeline, Tailwind, light/dark theme.
-- **41 lessons across M0, M1, M4, M6, M7 and M8**, each with all 9 anatomy sections
+- **54 lessons across M0, M1, M2, M4, M5, M6, M7 and M8** — content wave 2 is now fully
+  complete per PLAN §6 — each lesson with all 9 anatomy sections
   (story, what-you-already-did, mental model + theme-aware SVG diagram, tools, hands-on
   against the demo app, break-fix with evidence + reveal, three ask-your-agent prompts
   with verification steps, checklist, 5-question quiz):
@@ -20,6 +21,17 @@ Phase 1, build-order steps 1–4 complete:
   - **M1 The server is just a computer** — PaaS/serverless/VPS and the process-vs-function
     shape, SSH and lockout prevention, commands taught by question, processes/ports/
     permissions, environment variables and precedence, supervision and crash loops.
+  - **M2 Git and shipping** (wave 2) — git's snapshot model and the 15 commands, merge vs
+    rebase with `bisect` as a debugging tool, reading a diff you didn't write, CI/CD
+    anatomy, build-vs-runtime and staging-vs-prod, rollback-first incident response.
+    Verified on this repo's own real history and a disposable clone: `git bisect run`
+    finding a planted bug in 3 steps out of 8; a real merge conflict's markers; a real
+    `git revert` + re-revert preserving history; a genuine `docker compose up --build`
+    downtime gap (~0.5–1s of failed requests) measured with a polling loop; build-time
+    vs runtime failure (a syntax error fails the build; a bad `DATABASE_URL` builds fine
+    and fails only at request time). Added a real `.github/workflows/ci.yml` to this
+    project (lint + build on every push/PR) — every command in it verified to run
+    cleanly locally; not yet pushed to trigger a live Actions run.
   - **M4 Config, secrets and keys** (wave 2) — env files and leaks, secret managers and
     rotation, third-party key scopes, usage quotas and bills, config vs secrets vs flags.
   - **M6 Data: databases, cache, storage, queues** (wave 2) — relational fundamentals and
@@ -40,6 +52,16 @@ Phase 1, build-order steps 1–4 complete:
     UTC/DST/clock skew. Every lesson's mechanics were verified against the running
     demo app — deadlock detection, serialization failures, `pg_blocking_pids`,
     advisory locks, `SKIP LOCKED`, exclusion constraints and DST arithmetic.
+  - **M5 Networking: DNS, HTTP, TLS** (wave 2) — DNS and why "propagation" is really many
+    independent caches honoring their own TTL, HTTP methods as promises, TLS/certificates,
+    reverse proxies, CDN caching, CORS/cookies, firewalls/open ports. Added a real nginx
+    reverse proxy as a permanent demo-app service (`demo-app/nginx/`, port 8080) — verified
+    a genuine 502 (connection refused, ~2.6ms) and 504 (upstream hangs, fails at exactly the
+    configured 5s timeout) through it; verified a real CORS fix (allowlisted origin gets
+    `Access-Control-Allow-Origin`, others don't) on the live app, then reverted; verified
+    DNS/TLS tooling (`dig`, `openssl s_client`) and real CDN cache headers against stable
+    public targets; verified the `0.0.0.0` vs `127.0.0.1` bind distinction with throwaway
+    containers.
   - **M8 Observability and the debugging method** — four signals, where logs live,
     structured logging and request IDs, golden signals and dashboards, error tracking and
     tracing, **the debugging method** (`/lessons/m08-l06`, the template lesson), building a
@@ -60,7 +82,7 @@ Phase 1, build-order steps 1–4 complete:
   plus `scripts/break/*` and `scripts/load/*` to trigger each one — see
   `demo-app/README.md` for the full map. These are drill material for the lessons and
   Phase 2 scenarios.
-- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **41 scenario definitions** in
+- Phase 2 hooks: `scenario_ids` + `lab` frontmatter, **54 scenario definitions** in
   `/content/scenarios/*.yaml` rendered read-only at `/scenarios` (one per break-fix,
   each with breakage, agent bias, probes, root-cause vs symptom-only markers, hint
   ladder and scoring), Drizzle schema includes `scenario_attempts`.
@@ -114,10 +136,16 @@ copy `.env.example` → `.env`, then `npm run db:push`.
 
 ## Next (per PLAN §6)
 
-5. Rest of content wave 2: M5 (networking), M2 (git/shipping).
+Content wave 2 is complete (M7, M6, M4, M5, M2 — every module PLAN §6 lists for it).
+
 6. Content wave 3: M11 (decision pages), M9, M10, M13, M14.
 7. Content wave 4: M3, M12.
 8. Personal map editor and decision records; then auth + server-side progress.
+
+One repo-level item from this wave not yet done: `.github/workflows/ci.yml` exists and
+every command in it has been verified to run cleanly locally, but it hasn't been pushed to
+trigger a live GitHub Actions run — that's a deliberate choice (pushing wasn't requested),
+not an oversight. Push it whenever you're ready to see a real run.
 
 The demo app's planted anti-patterns now have lessons that fix them properly: the
 double-booking race (M7.2), single-cell notes (M7.6), the non-idempotent webhook

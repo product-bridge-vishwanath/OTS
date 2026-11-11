@@ -1,0 +1,45 @@
+id: sc-agent-pr-review-01
+module: M2
+lesson: m02-l03
+title: "Approved retry logic that double-charges customers"
+difficulty: realistic
+symptom: "Three days after approving a PR titled 'Add retry logic for flaky payment provider calls,' customers report being charged multiple times for a single booking."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: code
+      apply: scripts/break/retry-without-idempotency-key.patch
+    - type: provider
+      apply: scripts/break/provider-intermittent-errors.sh
+evidence:
+  logs: true
+  metrics: [payments.created, payments.duplicate_charges]
+  db_console: true
+  notes: "The merged PR diff and its approval comment praising the retry logic are both available for review."
+agent:
+  context: "You approved this PR and the retry logic itself is correctly implemented — three attempts, proper backoff, correct error propagation."
+  bias: "re-examines the retry loop's control flow for bugs rather than questioning whether retrying this specific call is safe at all"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - no-duplicate-charges-under-retry
+    - idempotency-key-present
+  root_cause_markers:
+    - learner identifies that the operation being retried lacks an idempotency key
+    - learner distinguishes "is the retry loop correctly coded" from "is retrying this operation safe"
+    - idempotency key added, derived deterministically from the booking
+  symptom_only_markers:
+    - retry count reduced or backoff lengthened with no idempotency key added
+    - retries removed entirely, reintroducing the original flaky-provider problem
+hints:
+  - "Read the retry loop's code. Is it correctly written? Now ask a different question: is what it's retrying safe to repeat?"
+  - "What happens if the first attempt actually succeeded, but the response was slow or dropped before the retry loop saw it?"
+  - "Does the payment provider call anywhere pass something that would let it recognize a retry of an already-processed charge?"
+  - "Reveal: no idempotency key. The retry logic is correct code wrapped around an unsafe-to-retry operation. Add a deterministic key."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

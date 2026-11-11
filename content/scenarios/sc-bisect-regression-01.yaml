@@ -1,0 +1,43 @@
+id: sc-bisect-regression-01
+module: M2
+lesson: m02-l02
+title: "Discount codes silently stopped working somewhere in 40 commits"
+difficulty: realistic
+symptom: "Checkout discount codes compute to $0 off. The bug was introduced somewhere in the last 40 deploys; no commit description mentions anything that looks like the cause."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: git
+      apply: scripts/break/plant-regression-in-history.sh   # plants a real bad commit N deep, mislabeled
+evidence:
+  logs: false
+  metrics: []
+  db_console: true
+  notes: "A reliable manual reproduction (apply a known code, check the resulting total) is available as a shell one-liner."
+agent:
+  context: "You've read through commit descriptions looking for anything discount-related."
+  bias: "keeps re-reading commit messages for clues rather than testing behavior directly"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - exact-commit-identified
+    - fix-applied-without-full-diff-review
+  root_cause_markers:
+    - learner turns the manual reproduction into a scriptable test
+    - git bisect run used to find the exact commit
+    - learner explains why the commit's description didn't suggest the cause
+  symptom_only_markers:
+    - all 40 diffs read manually before any fix attempted
+    - a plausible-looking but wrong commit blamed without verification
+hints:
+  - "Do you have a reliable way to reproduce this with one command? Can it become a script that exits 0 or 1?"
+  - "Commit descriptions describe INTENT, not blast radius. Is there a tool that tests BEHAVIOR instead?"
+  - "git bisect halves the remaining range each time — how many tests for 40 commits?"
+  - "Reveal: a commit with an accurate but narrow description touched a shared function that also affected discount math. Bisect finds it without reading any diffs."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20

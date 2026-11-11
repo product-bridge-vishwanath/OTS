@@ -1,0 +1,361 @@
+---
+id: m02-l04
+module: M2
+title: "CI/CD: what actually runs between your push and your deploy"
+order: 4
+difficulty: 2
+depth: both
+platforms: [github-actions, vercel]
+concepts: [ci-cd]
+prerequisites: [m02-l01, m01-l06]
+lab: demo-repo
+scenario_ids: [sc-ci-secret-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A team's deploy pipeline had one job: run tests, then deploy if they pass. For four months it worked exactly as described. Then a deploy went out with a test suite that had been silently failing for two weeks — the pipeline's status checks showed green the entire time.
+
+The cause, once found, was almost funny: a dependency update had changed how their test runner reported its exit code on a specific kind of failure, so the test process was crashing *before* it finished running — and the CI step that ran it was written as `npm test || true`, added eight months earlier by someone fixing an unrelated flaky-test annoyance, which swallowed every possible failure from that command, forever, silently, including the kind nobody intended to suppress.
+
+Nobody had read that line in eight months because it had never been the subject of an incident. The pipeline wasn't broken; it was doing exactly what `|| true` says: "no matter what happens here, report success." Green had stopped meaning "tests passed" and started meaning "the step ran," and nobody had updated their trust in the color to match.
+
+</Section>
+
+<Section kind="already-did">
+
+You've pushed code and watched a little status indicator — a spinner, then a green check or a red X — without necessarily knowing what ran in between, or where. If you've set up a project on Vercel, Render or similar, you've almost certainly triggered a build-and-deploy pipeline without writing a single line of CI configuration yourself, because the platform wired up its own default version the moment you connected a repo.
+
+This lesson is about the version you *do* configure — the one with a file you can read, that runs exactly the steps it says and no others, which is both more powerful and more capable of quietly lying to you than a platform's built-in default.
+
+</Section>
+
+<Section kind="mental-model">
+
+### What CI/CD actually is: scripted steps, on someone else's computer, triggered by git
+
+<Term k="ci-cd">CI/CD</Term> is not a product — it's a **pipeline**: a sequence of commands, run automatically on a trigger (usually a push or a pull request), on a machine you don't own, that reports back pass or fail. Continuous Integration is the "run tests/checks on every change" half; Continuous Deployment is the "and then ship it" half. Plenty of real setups do CI without CD — tests run automatically, deploys stay manual — and that's a legitimate, common choice, not a half-finished pipeline.
+
+<svg viewBox="0 0 780 200" role="img" aria-label="A CI/CD pipeline triggers on a push or pull request, checks out the code on a fresh runner, installs dependencies, runs the defined steps in order, and reports pass or fail back to the commit" className="diagram">
+  <defs>
+    <marker id="arrci" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <rect x="8" y="80" width="130" height="40" rx="6" />
+  <text x="73" y="105" textAnchor="middle" className="sub">git push</text>
+  <rect x="180" y="80" width="150" height="40" rx="6" />
+  <text x="255" y="105" textAnchor="middle" className="sub">fresh runner spins up</text>
+  <rect x="372" y="80" width="150" height="40" rx="6" />
+  <text x="447" y="105" textAnchor="middle" className="sub">your YAML's steps, in order</text>
+  <rect x="564" y="80" width="208" height="40" rx="6" />
+  <text x="668" y="105" textAnchor="middle" className="sub">pass/fail reported to the commit</text>
+
+  <path d="M 138 100 L 176 100" className="arrow" markerEnd="url(#arrci)" />
+  <path d="M 330 100 L 368 100" className="arrow" markerEnd="url(#arrci)" />
+  <path d="M 522 100 L 560 100" className="arrow" markerEnd="url(#arrci)" />
+
+  <text x="12" y="30" className="sub">Every run starts from NOTHING — a brand-new machine with no files, no cached state unless you explicitly cache it.</text>
+  <text x="12" y="160" className="sub">"Green" means every step's exit code was 0 — including a step someone wrote as `command || true`, which is ALWAYS 0.</text>
+</svg>
+
+### Anatomy of a real workflow file
+
+```yaml
+# .github/workflows/ci.yml — this exact file exists in this project's repo.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint content
+        run: npm run lint:content
+      - name: Build
+        run: npm run build
+```
+
+| Part | Means |
+|---|---|
+| `on:` | What triggers this — here, every push to `main` and every PR targeting it |
+| `jobs:` | One or more independent units of work (can run in parallel) |
+| `runs-on:` | What machine — a fresh, ephemeral VM every single run |
+| `steps:` | Run in order, top to bottom; any non-zero exit stops the job as failed |
+| `uses:` | A pre-built, reusable action (checkout, setup-node) rather than a raw shell command |
+| `run:` | A literal shell command — this is where `|| true` or any other exit-code manipulation hides |
+
+<Callout type="key">
+**Every CI run starts from nothing.** No files from your last run, no installed dependencies, no cached anything — unless you explicitly fetch/install/cache them in the workflow itself. This is *why* `actions/checkout` and `npm ci` (not `npm install`) are the first real steps: the runner genuinely has none of your code or dependencies until those steps put them there. `npm ci` specifically installs exactly what the lockfile says, failing loudly if the lockfile and `package.json` disagree — the correct choice for CI, where reproducibility matters more than convenience.
+</Callout>
+
+### `npm ci` vs `npm install`, and why it matters here specifically
+
+`npm install` can *update* the lockfile to satisfy `package.json`; `npm ci` refuses to and fails instead if they're out of sync, then installs from the lockfile exactly as written. In CI, that difference is the entire point: you want the build to fail loudly if someone's dependency change wasn't properly locked, not to silently resolve it differently on every run.
+
+### Secrets in CI: a different trust boundary than your laptop
+
+A CI runner needs credentials to do real things (deploy, call an API) without those credentials ever appearing in your repo's files. GitHub Actions' `secrets` context exists for exactly this: values stored encrypted on the platform, injected as environment variables at runtime, and — critically — **masked in logs**, so even an accidental `echo $SECRET` prints `***` rather than the real value in the visible output (though it's still technically present in the runner's environment, which is why a step that deliberately exfiltrates it, e.g. by sending it to an external URL, is a different and real risk category).
+
+```yaml
+steps:
+  - name: Deploy
+    env:
+      DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+    run: ./deploy.sh
+```
+
+This is M1.5's environment-variable precedence lesson, one more layer out: the CI platform's secret store is simply another source in the chain, and — as M1.2's break-fix already showed — a renamed secret becomes an **empty string**, not an error, in exactly the same way here.
+
+<Operator>
+
+```bash
+cd /Users/vishwanathsingh/Downloads/Project/OTS   # this project's own repo
+
+# ── Read the real workflow file this lesson is built on ───────────────
+cat .github/workflows/ci.yml
+
+# ── Validate its YAML structure (catches real syntax errors cheaply) ──
+node -e "
+const yaml = require('js-yaml'); const fs = require('fs');
+const d = yaml.load(fs.readFileSync('.github/workflows/ci.yml', 'utf8'));
+console.log('jobs:', Object.keys(d.jobs));
+console.log('steps:', d.jobs['build-and-lint'].steps.map(s => s.name || s.uses));
+"
+#   Verified: parses cleanly, 5 steps in the expected order.
+
+# ── Run the exact commands the workflow runs, locally, in order ───────
+#   This is the single most useful CI debugging habit: if a step fails
+#   in CI, run the EXACT same command locally first, before assuming
+#   it's a CI-environment-specific problem.
+npm ci              # verified: installs cleanly from the lockfile
+npm run lint:content
+npm run build
+
+# ── Find the story's exact failure pattern, in any CI config ──────────
+grep -rn "|| true\||| exit 0\| continue-on-error: true" \
+  .github/workflows/ 2>/dev/null
+#   Any hit here is a step whose failure is being deliberately or
+#   accidentally swallowed — know WHY, for every single one that exists.
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| CI/CD on GitHub | **GitHub Actions** (what this project uses) |
+| CI/CD elsewhere | GitLab CI, CircleCI, Buildkite — same mental model, different YAML |
+| Validate workflow syntax before pushing | `js-yaml`/any YAML parser for basic structure; `actionlint` for GitHub-Actions-specific checks |
+| Reproduce a CI failure locally | Run the exact same commands from the workflow file, in order, on your own machine first |
+| See secret usage without exposing values | The platform's run logs — masked automatically for anything registered as a secret |
+
+What good looks like: every `run:` step's exit code genuinely reflects whether that step succeeded — no silent `|| true` without a deliberate, documented reason; and "CI is green" is trusted precisely as much as the steps it actually runs, not more.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd /Users/vishwanathsingh/Downloads/Project/OTS
+```
+
+1. **Read the real workflow file** in this repo (`.github/workflows/ci.yml`) end to end. For each step, say in one sentence what it does and what would make it fail.
+
+2. **Validate the YAML and run every command locally**, exactly as the Operator block does. Confirm all three pass before considering the pipeline trustworthy.
+
+3. **Deliberately break one step** and watch it fail the way CI would: temporarily rename `lib/content.ts` to something else, run `npm run build`, and read the actual failure. Rename it back.
+
+4. **Search for the story's exact anti-pattern** (`|| true`, `continue-on-error: true`) across any CI config you have access to — this project's own, or a real one you work on. For every hit, can you state *why* it's there, or is it an eight-months-forgotten line like the story's?
+
+5. **Write down what "green" actually verifies** for this project's pipeline, in plain language: "a successful build means the content lint passed AND the production build succeeded — it does NOT mean [anything the pipeline doesn't check, e.g., the demo app itself still builds, or any manual QA]." Naming what green *doesn't* cover is as valuable as naming what it does.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A deploy goes out with a broken feature. CI was green on the merge commit. The developer insists "the pipeline passed, so how could this happen" — and is right that it passed, and wrong that passing meant what they assumed.
+
+<Evidence title="the actual CI config">
+
+```yaml
+jobs:
+  test:
+    steps:
+      - run: npm ci
+      - run: npm test || true    # added 8 months ago, see commit a1b2c3d
+      - run: npm run build
+  deploy:
+    needs: test
+    steps:
+      - run: ./deploy.sh
+```
+
+</Evidence>
+
+<Evidence title="the commit that added the problematic line, found via `git log -S`">
+
+```text
+commit a1b2c3d
+    "fix flaky test suite blocking deploys — one test intermittently
+     times out on the CI runner, not a real failure. Temporary
+     workaround until we fix the underlying flakiness."
+```
+
+</Evidence>
+
+<Evidence title="test output from the failing run, buried in the logs">
+
+```text
+FAIL  src/checkout.test.js
+  ✕ applies discount correctly (12 ms)
+    Expected: 45
+    Received: 50
+
+Tests: 1 failed, 23 passed, 24 total
+```
+
+(exit code from `npm test`: 1 — but the step shows green, because of `|| true`)
+
+</Evidence>
+
+A real test genuinely failed, with a clear, specific, correct failure message sitting in the logs. Why did the pipeline report success anyway, and whose decision, eight months ago, is actually responsible?
+
+<Reveal label="Reveal the cause">
+
+**`npm test || true` makes this step's exit code always 0, regardless of what `npm test` itself reports — the pipeline is not lying or malfunctioning; it is executing exactly the instruction it was given, which happens to mean "ignore every test failure, forever," not the narrower "ignore one specific flaky test" that the commit message describes.**
+
+**The gap between intent and implementation is the entire story.** The commit message says "one test intermittently times out" — a specific, scoped problem. The fix applied is `|| true` on the *entire test command* — an unscoped, total suppression of every test's result, forever, including the real, correct, specific discount-calculation failure that appeared eight months later. The author solved today's specific annoyance with a tool broad enough to also solve (by silencing) every future test failure of any kind, and nobody revisited the line since nothing had gone wrong with it — which is exactly the problem: it couldn't *visibly* go wrong, by construction.
+
+**Why "the pipeline passed, so how could this happen" is both an understandable and a wrong inference:** it conflates "the pipeline reported success" with "the thing the pipeline is supposed to verify (tests passing) is true." Those were the same fact for eight months, until the day they weren't, and nothing about the pipeline's *output* (green) distinguished the two days from each other — the distinction only existed in the actual logs, which nobody was reading because green meant "no need to look."
+
+**The fix, correctly scoped this time:**
+```yaml
+- run: npm test -- --testPathIgnorePatterns="specific-flaky-test.test.js"
+# or, better: fix the actual flakiness (often a timing/retry issue in
+# the test itself), or mark that ONE test as .skip with a tracking
+# issue — never silence the whole suite for one test's problem.
+```
+
+And separately, as a structural fix regardless of this specific incident: **audit every `|| true` / `continue-on-error: true` in any CI config**, on a recurring basis, and require each one to carry a comment explaining exactly what it's suppressing and why — a line with no stated reason is a line nobody can tell apart from this exact failure mode until it's already caused one.
+
+**The transferable rule:** **a CI check's color only means what its underlying commands actually verify — not what its name or history implies.** "Green" is a claim about exit codes, and exit codes can be overridden by anyone with write access to the workflow file, for a reason that seemed narrow and scoped at the time and silently widened into "ignore everything" the moment it was written broadly instead of specifically.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Audit every CI/CD workflow file in this repository for exit-code suppression: || true, || exit 0, continue-on-error: true, or any flag that would make a step report success regardless of the command's actual result. For each one found, show me the commit that introduced it and its stated reason, and tell me whether the suppression's actual SCOPE matches that stated reason."}>
+The scope-matching check is the one that catches this lesson's exact failure — a narrowly-intended fix implemented broadly. Verify it actually traces back to the introducing commit (via `git log -S` or blame) rather than just flagging the line's current existence without context.
+</AgentTask>
+
+<AgentTask prompt={"Write a CI workflow for this project that runs [the specific checks you need — lint, tests, build], using npm ci (not npm install), with each step's failure genuinely blocking the pipeline. Explicitly do not add any exit-code suppression unless I ask for it, and if a flaky test is a real problem, suggest fixing or explicitly skipping that ONE test rather than suppressing the whole suite's result."}>
+This is the preventive version of the break-fix — stating the constraint up front rather than discovering a suppression eight months later. Verify the generated workflow genuinely has no `|| true` anywhere, and that it correctly uses `npm ci` rather than defaulting to the more familiar `npm install`.
+</AgentTask>
+
+<AgentTask prompt={"I need to add a secret to this CI pipeline (a deploy token, an API key). Walk me through adding it as a GitHub Actions secret, referencing it correctly in the workflow YAML, and verifying it's masked in the logs if a step accidentally echoes it. Also tell me what happens if the secret's name is misspelled in the workflow file versus in the secrets store."}>
+The misspelling question connects directly to M1.2/M1.5's empty-string-not-error lesson, now in a CI context — verify the agent names that a mismatched secret name produces an empty value silently, not a build failure pointing at the actual cause.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+For any CI/CD pipeline you rely on:
+
+- Does every step's reported pass/fail genuinely reflect the underlying command's real exit code?
+- Search explicitly for `|| true`, `|| exit 0`, `continue-on-error: true` — for every hit, is there a clear, current, correctly-scoped reason?
+- Does the pipeline use `npm ci` (or your language's equivalent reproducible-install command), not a convenience install that can silently drift from the lockfile?
+- Are secrets referenced through the platform's secret store, never hardcoded in the workflow file itself?
+- Can you reproduce any CI failure by running the exact same commands locally?
+
+What good looks like: "CI is green" is trusted exactly as much as the specific steps it runs — no more, no less — and everyone on the team could state, precisely, what green does and does not verify for this specific pipeline.
+
+Red flags: an exit-code suppression with no comment explaining why; "the pipeline passed" treated as proof of correctness beyond what the pipeline's own steps actually check; a CI failure nobody can reproduce locally.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l04"
+  questions={[
+    {
+      q: "Why does every CI run start completely fresh, with no cached files or dependencies by default?",
+      options: [
+        "This is a limitation of GitHub Actions specifically",
+        "CI runners are ephemeral, newly-provisioned machines with none of your project's state unless you explicitly fetch it (checkout) and install it (npm ci) within the workflow itself",
+        "Caching is disabled for security reasons on all CI platforms",
+        "Only paid CI plans support persistent runners"
+      ],
+      answer: 1,
+      explain: "This is exactly why `actions/checkout` and `npm ci` are the first real steps in almost every workflow — without them, the runner has none of your code or dependencies at all."
+    },
+    {
+      q: "Why does `npm ci` matter specifically for CI, as opposed to `npm install`?",
+      options: [
+        "npm ci is simply a faster alias for npm install",
+        "npm ci refuses to proceed and fails loudly if the lockfile and package.json disagree, installing exactly what's locked — npm install can silently update the lockfile to resolve a mismatch, which is the wrong behavior for reproducible builds",
+        "npm ci only works with Node version 20 or higher",
+        "npm ci automatically runs tests after installing"
+      ],
+      answer: 1,
+      explain: "In CI, you want a lockfile mismatch to be a loud failure pointing at the actual problem, not a silent resolution that makes the build non-reproducible across runs."
+    },
+    {
+      q: "In the break-fix, what did `npm test || true` actually do, and how does that differ from what the original commit intended?",
+      options: [
+        "It ran the tests twice to confirm the result",
+        "It made the step's exit code always 0 regardless of ANY test's result — the commit's stated intent was to ignore one specific flaky test, but the implementation suppressed every test's failure, forever, including a real, unrelated bug eight months later",
+        "It only suppressed failures in test files matching a specific pattern",
+        "It converted test failures into warnings visible in the CI summary"
+      ],
+      answer: 1,
+      explain: "The gap between a narrowly-scoped intent (one flaky test) and a broadly-scoped implementation (the whole command) is the entire mechanism — and that gap is invisible until a DIFFERENT failure happens to fall into it."
+    },
+    {
+      q: "Why is \"the pipeline passed, so this couldn't have happened\" a flawed inference, even when the pipeline genuinely did report success?",
+      options: [
+        "CI pipelines are inherently unreliable and shouldn't be trusted at all",
+        "It conflates 'the pipeline reported success' with 'the thing the pipeline is SUPPOSED to verify is actually true' — those are only the same fact if every step's exit code genuinely reflects what it claims to check, which an exit-code suppression breaks",
+        "Pipelines can only verify syntax, never logic",
+        "The pipeline's report is only valid for 24 hours after running"
+      ],
+      answer: 1,
+      explain: "Green is a claim about exit codes specifically. Anyone with write access to the workflow file can make a step's exit code diverge from its command's real result, for a reason that seemed scoped and reasonable at the time."
+    },
+    {
+      q: "Why should a CI secret never be hardcoded directly in a workflow YAML file, even a private repo's?",
+      options: [
+        "YAML files cannot store string values longer than a certain length",
+        "The platform's secrets context provides encrypted storage, runtime-only injection as environment variables, and automatic masking in logs — none of which a hardcoded value in the file gets, and the file itself may end up more widely readable than intended",
+        "Workflow files are automatically made public regardless of repo visibility",
+        "Secrets hardcoded in YAML cause the workflow to fail to parse"
+      ],
+      answer: 1,
+      explain: "This connects to M1.5/M4's broader secrets lesson: a secret's home should be a system built for secrets (with masking, rotation, and access control), not a config file that happens to currently be private."
+    }
+  ]}
+/>
+
+</Section>

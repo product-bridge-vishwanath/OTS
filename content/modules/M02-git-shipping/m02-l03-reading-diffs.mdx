@@ -1,0 +1,320 @@
+---
+id: m02-l03
+module: M2
+title: "Reading a diff you didn't write: reviewing an agent's PR"
+order: 3
+difficulty: 2
+depth: both
+platforms: [github-actions]
+concepts: [diff-reading]
+prerequisites: [m02-l01]
+lab: self
+scenario_ids: [sc-agent-pr-review-01]
+estimated_minutes: 35
+---
+
+<Section kind="story">
+
+A founder asked his agent to "fix the slow dashboard query." It came back with a diff: twelve lines changed, one new index added, one query rewritten. He read the top three lines, saw `CREATE INDEX`, recognized it from M6.1, and approved it — the dashboard was noticeably faster in his own testing within the hour.
+
+He hadn't read line nine, which quietly removed a `WHERE user_id = $1` clause from the rewritten query "because it was redundant with the new index" — a claim that was true for *performance* and catastrophically false for *correctness*: that clause was the only thing scoping the dashboard's results to the logged-in user. Every user who loaded their dashboard for the next six days saw every other user's data, mixed in with their own, sorted by whatever the new index happened to prefer.
+
+Nobody had reviewed the diff as a whole — a twelve-line change had been approved as "the three lines I recognized," and the other nine lines got the credibility of the three without anyone actually reading them.
+
+</Section>
+
+<Section kind="already-did">
+
+You've approved a pull request — your own agent's, or a human contributor's — by skimming the summary, glancing at the file names, and clicking merge. You've probably done this specifically *because* reading unfamiliar code line by line feels slow and the summary sounded reasonable. M2.2 gave you the tools to find a bug once it exists; this lesson is about catching it before it ships, in a diff someone else (or something else) wrote.
+
+</Section>
+
+<Section kind="mental-model">
+
+### A diff has a scope, and the scope is the first thing to check — not the content
+
+Before reading a single changed line, answer three questions from the diff's *shape*:
+
+<svg viewBox="0 0 780 210" role="img" aria-label="Before reading diff content, check its scope: which files changed, whether any dependency or config file is among them, and whether the change is as small as its description implies" className="diagram">
+  <rect x="8" y="16" width="246" height="80" rx="10" />
+  <text x="131" y="42" textAnchor="middle">1 · WHICH FILES?</text>
+  <text x="131" y="64" textAnchor="middle" className="sub">does this match what was</text>
+  <text x="131" y="82" textAnchor="middle" className="sub">actually asked for?</text>
+
+  <rect x="267" y="16" width="246" height="80" rx="10" />
+  <text x="390" y="42" textAnchor="middle">2 · ANYTHING UNEXPECTED?</text>
+  <text x="390" y="64" textAnchor="middle" className="sub">a dependency, a config file,</text>
+  <text x="390" y="82" textAnchor="middle" className="sub">a migration, alongside the "fix"</text>
+
+  <rect x="526" y="16" width="246" height="80" rx="10" />
+  <text x="649" y="42" textAnchor="middle">3 · AS SMALL AS DESCRIBED?</text>
+  <text x="649" y="64" textAnchor="middle" className="sub">"fix a typo" touching 200</text>
+  <text x="649" y="82" textAnchor="middle" className="sub">lines is a red flag by itself</text>
+
+  <text x="12" y="140" className="sub">Only AFTER these three checks does reading individual changed lines become the useful next step —</text>
+  <text x="12" y="162" className="sub">a diff whose SHAPE doesn't match its description deserves scrutiny before its CONTENT does.</text>
+</svg>
+
+### Reading a real diff, line by line, as evidence
+
+```diff
+-      - "3000:3000"
++      - "3001:3000"
+```
+
+Read this exactly as it's written: a line was **removed** (`-`), a line was **added** (`+`), and together they say "the host port changed from 3000 to 3001; the container's own port, 3000, is unchanged." Every diff is this same grammar — `-` is "no longer true," `+` is "now true," and unmarked context lines are "unchanged, shown so you can see where you are."
+
+<Callout type="key">
+**Read every removed line as carefully as every added one.** The story's bug was in a `-` line, not a `+` line — people instinctively scrutinize what's being *added* as the "new, risky part" and skim what's being *removed* as presumably safe to lose. A removed `WHERE` clause, a removed validation check, a removed `await` — deletions are exactly as capable of introducing a bug as additions, and they get systematically less attention.
+</Callout>
+
+### The checklist that would have caught the story's bug
+
+| Check | What it would have shown |
+|---|---|
+| Does the diff's scope match the request? | "Fix the slow query" touching the query's WHERE clause, not just adding an index — worth a second look |
+| Is every REMOVED line's purpose understood, not just every added one? | The `WHERE user_id = $1` deletion, read carefully, removes authorization scoping, not just a redundant filter |
+| Does any claim in the PR description ("redundant with the index") hold up to checking? | An index can make a lookup fast; it cannot make a `WHERE` clause's *authorization* role redundant — those are different jobs that happened to share one line of SQL |
+| Would this pass the demo app's existing tests, if any exist for this path? | A test asserting "user A cannot see user B's dashboard data" would have failed immediately — its absence is itself a finding |
+
+### Red flags, specifically for agent-generated diffs
+
+- **A fix for symptom X that also touches authorization, validation, or error handling** "while I was in there" — scope creep is a review risk regardless of who wrote it, and agents do it readily when asked to "also clean up nearby code."
+- **A confident claim in the description that isn't actually checkable from the diff** — "this is safe because X" is a claim to verify, not a reason to skip verifying.
+- **New dependencies added for a change that didn't obviously need one.**
+- **Any `.env`, secrets, or CI config file touched** when the request was about application logic.
+
+<Operator>
+
+```bash
+# ── Read a REAL commit from this repo's own history ───────────────────
+git log --oneline | tail -4                # find an early, small commit
+git show --stat 72c5395                    # scope first: which file(s), how many lines
+git show 72c5395                           # now the content
+
+# ── Practice the three-question scope check on it ──────────────────────
+#   1. Which files? (one: demo-app/compose.yaml)
+#   2. Anything unexpected? (no — exactly what the message implies)
+#   3. As small as described? ("adding one more port" — yes, one line)
+#   This one passes all three checks before you've even read the diff
+#   content closely — which is correct; it's a genuinely small, honest commit.
+
+# ── Now generate a diff with deliberately mixed scope, to feel the red flag ─
+mkdir -p /tmp/diff-practice && cd /tmp/diff-practice && git init -q \
+  && git config user.email "you@example.com" && git config user.name "You"
+printf 'function getUserData(userId) {\n  return db.query("SELECT * FROM data WHERE user_id = ?", [userId]);\n}\n' > app.js
+git add . && git commit -q -m "baseline"
+printf 'function getUserData(userId) {\n  // removed the filter — turns out the index covers it\n  return db.query("SELECT * FROM data");\n}\n' > app.js
+git diff
+#   Read the removed line as carefully as the added ones. What did
+#   this diff actually just do to who can see what?
+cd /tmp && rm -rf diff-practice
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| Read a diff's shape before its content | `git show --stat`, or a PR's "Files changed" summary tab before the line-by-line view |
+| Side-by-side diff view | GitHub/GitLab's PR interface, or `git difftool` |
+| Find every caller of a function before trusting "this is safe to change" | Your editor's "find references," or `grep -rn "functionName("` |
+| Verify a specific claim in a PR description | Actually run the code, or write the test the description implies should pass |
+
+What good looks like: every merged diff's scope was checked against its stated purpose before the content was read; every removed line got read as carefully as every added one; and a confident claim in a description ("this is safe because...") was verified, not trusted.
+
+</Section>
+
+<Section kind="hands-on">
+
+1. **Pick a real commit from a repo you have** (this project's own history works) and run the three-question scope check *before* reading the diff's content line by line. Write down your answers.
+
+2. **Then read the content**, including every removed line, as carefully as the added ones.
+
+3. **Reproduce the story's bug pattern yourself.** Write a tiny function with a `WHERE`-clause-style authorization check, then write a "fix" that removes it under a plausible-sounding comment (as in the Operator block). Read your own diff as if you hadn't written it — does the removed line's real effect jump out, or does the comment's claim almost talk you out of looking closely?
+
+4. **Find one agent-generated diff you've actually approved recently** (your own project, or recall one). Apply the checklist retroactively: did its scope match its description? Did you read every removed line? Would you catch the same issue today?
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A code reviewer approves an agent-generated PR titled "Add retry logic for flaky payment provider calls." Three days later, customers report being charged multiple times for a single booking.
+
+<Evidence title="the diff, as reviewed and approved">
+
+```diff
+ async function chargeCustomer(bookingId, amount) {
++  for (let attempt = 0; attempt < 3; attempt++) {
++    try {
+       const result = await paymentProvider.charge({
+         booking_id: bookingId,
+         amount: amount,
+       });
++      return result;
++    } catch (err) {
++      if (attempt === 2) throw err;
++      await sleep(500);
++    }
++  }
+ }
+```
+
+</Evidence>
+
+<Evidence title="the reviewer's actual review comment, left on the PR">
+
+```text
+"Looks good, this is exactly what we needed for the flaky provider
+issue. The exponential-sounding backoff and max-3-retries logic are
+solid."
+```
+
+</Evidence>
+
+<Evidence title="what's missing from the diff entirely">
+
+```text
+No idempotency key is passed to paymentProvider.charge() anywhere in
+this diff, before or after the change. No unique constraint exists
+on a payment identifier in the database (this product's planted
+anti-pattern AP6, if you've worked through M7.2).
+```
+
+</Evidence>
+
+The reviewer's comment specifically praises the retry logic as "solid." Is it? And what did the scope-check that was never run miss?
+
+<Reveal label="Reveal the cause">
+
+**The retry logic itself is correctly written — three attempts, backoff between them, re-throwing after exhausting attempts — and is simultaneously the entire mechanism of the bug, because retrying a payment charge without an idempotency key means every retry after a slow-but-eventually-successful first attempt is a NEW, SEPARATE charge, not a safe re-check of the first one.**
+
+**This is M7.7's idempotency lesson, and the diff is a textbook illustration of why review must go beyond "does this code do what the title says."** The title says "add retry logic," and the diff does add retry logic, correctly, as code — three attempts, a sleep, proper error propagation. Read purely as "is this a correct implementation of retries," it passes. The question the reviewer never asked is the one M7.7 opens with: **is the thing being retried safe to repeat?** A payment charge is not, by default — and nothing in this diff makes it safe. If the first attempt's charge actually succeeded but the response was slow or dropped before the retry loop saw it (a real, common failure mode for exactly the "flaky provider" this PR describes), the second attempt charges the customer again.
+
+**What the scope check from this lesson's mental model would have surfaced, if run:** "does this diff's scope match its stated purpose?" — adding retry logic to a payment call is, inherently, a scope that *should* include an idempotency key, because the two are not separable concerns once you understand what retrying a non-idempotent operation means. A reviewer who'd internalized M7.7 would read "retry logic for payment calls" and immediately ask "where's the idempotency key" as a checklist item, the same reflex as checking a new `*_id` column for a foreign key (M6.8).
+
+**The fix:**
+```diff
+ async function chargeCustomer(bookingId, amount) {
++  const idempotencyKey = `charge:booking:${bookingId}`;
+   for (let attempt = 0; attempt < 3; attempt++) {
+     try {
+       const result = await paymentProvider.charge({
+         booking_id: bookingId,
+         amount: amount,
++        idempotency_key: idempotencyKey,
+       });
+       return result;
+     } catch (err) {
+       if (attempt === 2) throw err;
+       await sleep(500);
+     }
+   }
+ }
+```
+One added line turns the retry loop safe: the provider, given the same key across all three attempts, will recognize a retry of an already-processed charge and return the original result instead of charging again.
+
+**The transferable rule:** **"the code does what it says" and "what it says is safe" are two different review questions, and a confidently-written, individually-correct piece of code (the retry loop) can be the exact mechanism of a bug when the *concept* it implements (retrying a non-idempotent operation) has a missing prerequisite the diff never mentions.** Reviewing a diff's logic in isolation misses exactly this class of bug — the review needs the broader question "is retrying *this specific thing* safe at all," which M7.7 is the lesson that supplies.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Here's a diff: [paste it]. Before telling me whether the implementation is correct, answer: does the diff's scope match its stated purpose exactly, or does it touch anything beyond that (authorization, validation, config, dependencies)? Then walk me through every REMOVED line specifically and what capability or check is lost by removing it."}>
+Insist on the removed-lines pass happening explicitly and separately — an agent asked generally to review a diff will often focus on what's added (the 'new' code) and give deletions less scrutiny, exactly the human bias this lesson warns about.
+</AgentTask>
+
+<AgentTask prompt={"This diff adds retry logic (or any other resilience pattern — caching, a queue, a lock) around this operation: [paste it]. Before approving, check: is the operation being wrapped actually safe to repeat/retry/cache/queue, or does this pattern require a prerequisite (an idempotency key, a cache invalidation path, a lock scope) that the diff doesn't include?"}>
+This directly targets the break-fix's failure mode — a correctly-implemented pattern wrapped around an operation that doesn't meet the pattern's actual precondition. Verify it names the SPECIFIC missing prerequisite rather than a generic 'looks fine' — for retries on a payment call, that's an idempotency key, by name.
+</AgentTask>
+
+<AgentTask prompt={"Verify this specific claim made in a PR description: '[paste the exact claim, e.g. this filter is redundant with the new index]'. Is it actually true, and under what conditions might it stop being true? Check the claim against what the code actually does, not just whether it sounds plausible."}>
+A claim like 'X is redundant with Y' conflates two things that happen to look similar (a performance optimization and an authorization/correctness guarantee) in exactly the way the story's dashboard bug did. Verify the agent's answer actually distinguishes the TWO DIFFERENT JOBS a piece of code might be doing, rather than accepting the claim because the code still "works" in casual testing.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before approving any diff, yours or someone else's, human or agent-written:
+
+- Does the SCOPE (which files, how many lines) match the stated purpose?
+- Have you read every REMOVED line as carefully as every added one?
+- Does any claim in the description ("this is redundant," "this is safe because...") actually hold up when checked, not just when it sounds plausible?
+- If the diff wraps an operation in a resilience pattern (retry, cache, queue, lock), does the operation actually meet that pattern's prerequisite (idempotency, invalidation, safe concurrency)?
+
+What good looks like: a twelve-line diff gets twelve lines of actual attention, not three lines of recognition and nine lines of trust by association; removed lines are a review focus, not an afterthought.
+
+Red flags: approving based on a summary or title alone; scrutinizing additions while skimming deletions; accepting "this is safe because X" without checking whether X is actually true.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l03"
+  questions={[
+    {
+      q: "In the story, why did reviewing \"the three lines I recognized\" out of twelve fail to catch the bug?",
+      options: [
+        "The bug was in a part of the file that wasn't shown in the diff",
+        "The bug was in one of the other nine lines (a removed WHERE clause) that borrowed credibility from the three recognized lines without being read itself",
+        "The diff tool displayed the lines in the wrong order",
+        "The agent hid the problematic line using a comment"
+      ],
+      answer: 1,
+      explain: "Recognizing part of a diff as familiar and safe doesn't make the REST of the diff safe. A twelve-line change needs twelve lines of attention, not three."
+    },
+    {
+      q: "Why do removed lines in a diff deserve exactly as much scrutiny as added lines?",
+      options: [
+        "Removed lines are harder for diff tools to display correctly",
+        "People instinctively scrutinize additions as 'new and risky' while skimming deletions as presumably safe to lose — but a removed WHERE clause, validation check, or await is exactly as capable of introducing a bug as new code",
+        "Removed lines are always more dangerous than added lines",
+        "Git displays removed lines less clearly than added lines"
+      ],
+      answer: 1,
+      explain: "The story's bug WAS a removed line. This asymmetric attention is a real, documented human review bias, not a hypothetical concern."
+    },
+    {
+      q: "In the retry-logic break-fix, why was the reviewer's praise for 'solid' retry logic both true and insufficient?",
+      options: [
+        "The retry logic had a syntax error the reviewer missed",
+        "The retry implementation was correctly written as CODE, but retrying a payment charge without an idempotency key means a slow-but-successful first attempt gets charged again by the retry — the bug is in what's being retried, not how the retry loop is written",
+        "The reviewer should have rejected the PR for being too large",
+        "The backoff timing was too aggressive for the payment provider's rate limits"
+      ],
+      answer: 1,
+      explain: "\"Does this code do what the title says\" and \"is what the title describes actually safe to do\" are different review questions. The retry loop passes the first; it fails the second, because retrying a non-idempotent operation needs a prerequisite (an idempotency key) the diff never added."
+    },
+    {
+      q: "What are the three questions to ask about a diff's SHAPE before reading its content?",
+      options: [
+        "Who wrote it, when was it written, and how long did it take",
+        "Which files changed (matching the request?), is anything unexpected included (config, dependencies), and is it as small as its description implies",
+        "How many tests does it include, how many reviewers approved it, and what branch is it merging into",
+        "What programming language is used, how many functions are defined, and what the commit message length is"
+      ],
+      answer: 1,
+      explain: "These three checks, run BEFORE reading line-by-line content, catch scope mismatches that are themselves red flags — a 'fix a typo' touching 200 lines deserves scrutiny before you've read a single changed character."
+    },
+    {
+      q: "Why is \"this filter is redundant with the new index\" a claim that needs verification rather than acceptance?",
+      options: [
+        "Indexes and filters are unrelated database concepts",
+        "A filter in a WHERE clause can serve two different jobs — performance (which an index can genuinely make redundant) and authorization/correctness (which an index cannot substitute for) — and the claim conflates the two",
+        "The claim is always false regardless of context",
+        "Indexes cannot coexist with WHERE clauses in the same query"
+      ],
+      answer: 1,
+      explain: "This is exactly the story's dashboard bug: the removed WHERE clause was redundant for SPEED (the index covered that) and essential for CORRECTNESS (it scoped results to the logged-in user) — two different properties that happened to share one line of SQL."
+    }
+  ]}
+/>
+
+</Section>

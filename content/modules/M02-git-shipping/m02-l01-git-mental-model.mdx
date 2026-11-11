@@ -1,0 +1,332 @@
+---
+id: m02-l01
+module: M2
+title: "Git's mental model: snapshots, not diffs"
+order: 1
+difficulty: 1
+depth: both
+platforms: [github-actions]
+concepts: [git-model]
+prerequisites: [m01-l01]
+lab: self
+scenario_ids: [sc-detached-head-01]
+estimated_minutes: 30
+---
+
+<Section kind="story">
+
+A founder's agent said "let me just quickly check something on a different branch" mid-session, ran `git checkout abc1234` to look at an old version of a file, made an edit to test something, and then got distracted by the next task. Twenty minutes later, a `git status` showed a cryptic warning about being in a "detached HEAD" state that neither the founder nor, apparently, the agent fully explained before moving on.
+
+She committed her test edit anyway, following the agent's suggestion. The commit succeeded — git accepted it without complaint. Then she switched back to `main` to keep working, and the commit she'd just made **vanished**. Not reverted, not visible in any log she could find — just gone, as far as she could tell. She assumed she'd broken git itself and spent an hour trying to "fix" it before asking for help.
+
+Nothing was broken. She'd committed onto a floating, unnamed point in git's history that nothing pointed to — exactly what "detached HEAD" means, stated plainly, which nobody had stated plainly to her in the moment. The commit still existed, findable with the right command, for a limited time. But git's model has a specific concept for "which commits are safe from garbage collection," and she'd stepped outside it without knowing the concept existed.
+
+</Section>
+
+<Section kind="already-did">
+
+You've run `git add`, `git commit`, `git push` — the trio an agent walks you through dozens of times before you've thought about what any of them actually store. You've probably also hit *some* version of git telling you something confusing (a merge conflict, a detached HEAD warning, "your branch has diverged") and resolved it by pattern-matching to whatever command an agent suggested, without the underlying model ever clicking.
+
+This lesson is that model, in the form that actually explains the confusing moments rather than just the happy path.
+
+</Section>
+
+<Section kind="mental-model">
+
+### The one sentence that unlocks everything else
+
+<Callout type="key">
+**A commit is a complete snapshot of your entire project at one moment — not a diff, not a patch, not a change relative to the last commit.** Git calculates diffs for *you to read*, as a convenience; what it actually stores, every time, is the whole tree of files as they existed at that instant. Once this is true in your head, branches, merges, and "detached HEAD" all become one simple picture instead of separate rules to memorize.
+</Callout>
+
+### The picture
+
+<svg viewBox="0 0 780 240" role="img" aria-label="A sequence of commits, each a full snapshot, with branches as labels pointing at a commit and HEAD as a label pointing at whichever branch (or commit) you currently have checked out" className="diagram">
+  <defs>
+    <marker id="arrgit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" className="arrowhead" />
+    </marker>
+  </defs>
+  <circle cx="60" cy="100" r="28" />
+  <text x="60" y="105" textAnchor="middle" className="sub">C1</text>
+  <circle cx="200" cy="100" r="28" />
+  <text x="200" y="105" textAnchor="middle" className="sub">C2</text>
+  <circle cx="340" cy="100" r="28" />
+  <text x="340" y="105" textAnchor="middle" className="sub">C3</text>
+  <circle cx="480" cy="40" r="28" />
+  <text x="480" y="45" textAnchor="middle" className="sub">C4</text>
+
+  <path d="M 88 100 L 172 100" className="arrow" markerEnd="url(#arrgit)" />
+  <path d="M 228 100 L 312 100" className="arrow" markerEnd="url(#arrgit)" />
+  <path d="M 362 85 L 458 50" className="arrow" markerEnd="url(#arrgit)" />
+
+  <rect x="312" y="150" width="80" height="30" rx="6" />
+  <text x="352" y="170" textAnchor="middle" className="sub">main</text>
+  <path d="M 352 150 L 340 128" className="arrow" markerEnd="url(#arrgit)" />
+
+  <rect x="452" y="90" width="110" height="30" rx="6" />
+  <text x="507" y="110" textAnchor="middle" className="sub">feature-x</text>
+  <path d="M 507 90 L 480 68" className="arrow" markerEnd="url(#arrgit)" />
+
+  <rect x="480" y="10" width="90" height="26" rx="6" style={{fill: "var(--accent-soft)", stroke: "var(--accent)"}} />
+  <text x="525" y="28" textAnchor="middle" className="sub">HEAD</text>
+  <path d="M 525 36 L 507 56" className="arrow" markerEnd="url(#arrgit)" />
+
+  <text x="12" y="218" className="sub">A branch is just a movable LABEL pointing at one commit. HEAD is a label pointing at whichever branch (or commit) you have checked out right now.</text>
+</svg>
+
+Four facts, in order of how much confusion each one resolves:
+
+1. **Each circle (commit) is a complete snapshot**, identified by a hash (`72c5395`) — content-addressed, meaning the hash is derived from the content itself, which is why two identical snapshots always get the same hash.
+2. **A branch is a label, nothing more** — `main` is just a name that currently points at one specific commit. "Creating a branch" is instant precisely because it's creating a label, not copying any files.
+3. **`HEAD` is a label pointing at whichever branch you're on** — or, critically, pointing directly at a commit with no branch in between, which is "detached HEAD."
+4. **A commit with no branch label pointing at it, and nothing else pointing at it either, is eventually garbage-collected.** This is exactly the story's trap: she committed while `HEAD` pointed directly at a commit (detached), never created a branch label there, switched away, and the new commit was left with nothing pointing at it.
+
+### The 15 commands, grouped by what they actually do
+
+| Group | Commands | What they share |
+|---|---|---|
+| **Inspect** | `status`, `log`, `diff`, `show` | Read-only — look without changing anything |
+| **Snapshot** | `add`, `commit` | Build and seal one new snapshot |
+| **Move around** | `checkout`/`switch`, `branch` | Change what `HEAD` points at, or create a new label |
+| **Combine** | `merge`, `rebase` | Bring two histories together (L2.2) |
+| **Talk to a remote** | `fetch`, `pull`, `push`, `clone` | Sync snapshots with another copy of the repo |
+| **Undo** | `reset`, `revert`, `stash` | Different kinds of "take that back" (very different safety profiles) |
+
+<Callout type="warn">
+**`reset` and `revert` are not synonyms, and confusing them is a real, common incident cause.** `git revert` creates a *new* commit that undoes a previous one — history-preserving, safe to do on a shared branch, the normal choice. `git reset` *moves the branch label itself* to point at an earlier commit — if used with `--hard` on a branch others have already pulled, it rewrites what `main` means out from under them, which is the kind of thing that genuinely breaks a team's shared history. Reach for `revert` by default; reach for `reset --hard` only on your own unshared local work.
+</Callout>
+
+<Operator>
+
+```bash
+# ── See the model directly: commits, branches, and HEAD ───────────────
+git log --oneline -5
+git log --oneline --graph --all -10        # branches as visible divergence
+cat .git/HEAD                              # literally: "ref: refs/heads/main"
+git symbolic-ref HEAD                      # same fact, via git itself
+git rev-parse HEAD                         # the actual commit hash HEAD resolves to
+
+# ── Prove a branch is just a label ────────────────────────────────────
+git branch test-label                      # instant — no files touched
+git log --oneline -1 test-label            # points at the SAME commit as HEAD
+git branch -d test-label                   # delete the label; the commit is unaffected
+
+# ── Reproduce the story's trap, safely, and see the warning explained ─
+git log --oneline -3                       # note a commit hash from recent history
+git checkout <that-hash>                   # HEAD now points DIRECTLY at a commit
+git status                                 # read the "detached HEAD" message in full —
+                                            #   it tells you exactly what to do next
+git checkout main                          # return to safety — AND confirm it:
+git status                                 # should show a clean tree on `main`
+#   Checking out an old commit doesn't just move a pointer — it REWRITES
+#   your actual working files to match that old snapshot, for every
+#   file that differs. Verified directly while writing this lesson:
+#   checking out a 3-commit-old hash silently reverted several real
+#   files (a database init script, a lint rule, a compose config) to
+#   their state from before recent work — invisible until `git status`
+#   after returning to `main` confirmed everything was back. If you
+#   have uncommitted changes before checking out an old commit, git
+#   will usually refuse and warn you; if you don't, it won't, and the
+#   files on disk simply become the old version until you switch back.
+
+# ── Inspect a real commit as a complete snapshot ──────────────────────
+git show --stat HEAD                       # files changed, not the whole tree —
+                                            #   git STORES the whole tree but DISPLAYS a diff
+git cat-file -p HEAD^{tree} | head -5      # the actual tree object, if you want to see it raw
+
+# ── The undo commands, and their real difference ──────────────────────
+git revert --no-edit HEAD                  # creates a NEW commit undoing the last one
+git log --oneline -3                       # see both commits — history preserved
+git reset --hard HEAD~1                    # moves the branch label back — history REWRITTEN
+                                            #   (only ever do this on commits nobody else has)
+```
+
+</Operator>
+
+</Section>
+
+<Section kind="tools">
+
+| Need | Tool |
+|---|---|
+| The commands themselves | Plain `git` — learn these before any GUI |
+| Visualize branches and commits | `git log --graph`, or a GUI (GitKraken, GitHub Desktop, VS Code's built-in view) |
+| See exactly what a command will do before running it | `git status` before anything destructive; `--dry-run` where supported |
+| Recover a commit you thought was lost | `git reflog` — git's own safety net, logging every place `HEAD` has pointed recently |
+
+The single most valuable habit from this lesson: **when git prints a warning you don't fully understand, read the whole message before running the next command an agent suggests.** Git's own warnings (including the detached-HEAD one) are usually more precise and more complete than a summarized explanation, and they often name the exact command to fix the situation.
+
+</Section>
+
+<Section kind="hands-on">
+
+```bash
+cd /path/to/this/repo    # or any git repo you have
+```
+
+1. **Confirm the snapshot model directly**: run `cat .git/HEAD`, then `git log --oneline -3`, and connect the hash `HEAD` resolves to with the top of your log.
+
+2. **Prove a branch is just a label**: create one, confirm it points at the same commit as your current `HEAD`, delete it, confirm nothing else changed.
+
+3. **Reproduce detached HEAD deliberately and read the warning in full.** Check out an old commit by hash, run `git status`, and read every line of git's own explanation before doing anything else. Return to `main`.
+
+4. **Try `git revert` on a scratch commit** (make a trivial change, commit it, revert it) and confirm both commits are visible in `git log` afterward — nothing was erased, a new commit was added.
+
+5. **Find `git reflog` on your own machine** and locate a commit from earlier today, even one you've since moved away from — this is the safety net that would have let the founder in the story recover her "lost" commit, had she known to look.
+
+</Section>
+
+<Section kind="break-fix">
+
+**Symptom:** A developer following an agent's multi-step instructions ends up with what they describe as "git is broken" — `git status` shows no branch name at all, just a commit hash, and a warning they don't fully read before pasting it into a new chat asking for help.
+
+<Evidence title="the agent's instructions, as given">
+
+```text
+1. "Let's check what this looked like before the refactor."
+   → git checkout a91f3c2
+2. "Now let's see if this fixes the bug."
+   → (edits a file)
+   → git add . && git commit -m "test fix"
+3. "Great, that works! Let's go back to main and apply it there."
+   → git checkout main
+```
+
+</Evidence>
+
+<Evidence title="what the developer sees now">
+
+```text
+$ git log --oneline -3
+7c1e9aa (HEAD -> main) some earlier commit
+...
+
+$ git branch --all
+* main
+  (the "test fix" commit is nowhere in this list)
+```
+
+</Evidence>
+
+The developer insists the commit succeeded — they saw git confirm it. Where did it go, and is it actually gone?
+
+<Reveal label="Reveal the cause">
+
+**It's not gone. Step 1 put `HEAD` directly on a commit with no branch label (detached HEAD) — exactly the story's trap — and step 2's commit was built on top of that detached position, with nothing pointing at it once step 3 moved away.**
+
+**Walk the mental model through each step:** `git checkout a91f3c2` moves `HEAD` to point *directly* at that commit, bypassing any branch label — this is what "detached HEAD" names. Step 2's commit is real and valid; it's a genuine new snapshot in git's object database, with `a91f3c2` as its parent. But nothing — no branch, no tag — points at this new commit; only `HEAD` does, transiently, while you're sitting on it. Step 3, `git checkout main`, moves `HEAD` to point at the `main` branch instead. The "test fix" commit still physically exists in git's storage, but as of that moment, literally nothing in the repository's branch/tag structure references it, which is exactly why `git branch --all` and `git log` (which by default only walks from branches) don't show it.
+
+**Why the agent's instructions were individually reasonable and still produced this:** each step made sense in isolation — checking out an old commit to test something is completely normal. The missing piece was step 1 should have been `git checkout -b test-branch a91f3c2` (creating a named branch *at* that commit) rather than a bare checkout — one extra word, and the commit in step 2 would have had a permanent home.
+
+**Recovery, which works precisely because "gone" isn't the same as "deleted":**
+```bash
+git reflog                    # shows every commit HEAD has recently pointed at,
+                               # including the orphaned "test fix" one, by hash
+git checkout -b recovered-fix <that-hash>   # give it a branch label NOW
+```
+`git reflog` is git's own local safety net — commits reachable only through it are still subject to eventual garbage collection (typically after 30-90 days by default), but "eventual" is not "immediate," which is exactly the window that makes this recoverable if caught in time.
+
+**The transferable rule:** **before committing anything, check what `HEAD` currently points at** (`git status` names it on the first line) — if it says "detached HEAD" rather than a branch name, create a branch *before* committing, not after. And when an agent walks you through several git commands in sequence, running `git status` between steps costs nothing and would have caught this immediately, at step 1, rather than three steps later.
+
+</Reveal>
+
+</Section>
+
+<Section kind="ask-agent">
+
+<AgentTask prompt={"Before you run any git commands that check out a specific commit or an old branch, tell me explicitly: will this put me in detached HEAD state, and if I commit while there, what do I need to do to not lose that commit? Walk through the exact sequence with that safety step included."}>
+This is a standing instruction worth giving before any multi-step git walkthrough, not a one-time question. Verify the agent actually names detached HEAD explicitly when it applies, rather than only mentioning it if you ask — the story and break-fix both happened because nobody flagged it in the moment.
+</AgentTask>
+
+<AgentTask prompt={"I think I lost a commit — [describe what happened]. Walk me through using git reflog to find it, and the exact command to give it a permanent branch name so it's safe. Do not suggest anything destructive (reset --hard, or re-doing the work from scratch) until we've confirmed via reflog whether the commit still exists."}>
+The "do not suggest anything destructive first" constraint matters — reflog recovery is safe and should always be tried before anyone concludes work needs to be redone. Verify it actually runs or asks you to run `git reflog` as the first diagnostic step, not as an afterthought.
+</AgentTask>
+
+<AgentTask prompt={"Explain the difference between git revert and git reset --hard for this specific situation: [describe what you're trying to undo, and whether this branch has already been pushed/shared]. Tell me which one is safe here and why the other one would cause a problem for anyone else working on this branch."}>
+A good answer names the specific risk of `reset --hard` on shared history (rewriting what the branch means for everyone who's already pulled it) rather than giving a generic definition of each command — the risk is situational, tied to whether the history has been shared, which the prompt specifically asks about.
+</AgentTask>
+
+</Section>
+
+<Section kind="checklist">
+
+Before committing:
+
+- What does `git status`'s first line say — a branch name, or "detached HEAD"? If detached and you want to keep this work, create a branch first.
+- Are you about to use `reset --hard`? Has this branch been pushed/shared with anyone? If yes, use `revert` instead.
+
+When something seems to have vanished:
+
+- Check `git reflog` before assuming anything is lost — "not reachable from a branch" and "deleted" are different states, and the gap between them (until garbage collection) is your recovery window.
+
+What good looks like: you can explain, to someone else, what a commit, a branch, and `HEAD` each actually are — as the same simple picture, not three separate memorized rules — and git's warnings read as information rather than as errors to route around.
+
+Red flags: checking out a bare commit hash with any intention of committing there, without immediately creating a branch; `reset --hard` used on a branch other people have already pulled; git warnings pasted into a chat without reading them first.
+
+</Section>
+
+<Section kind="check">
+
+<Quiz
+  lessonId="m02-l01"
+  questions={[
+    {
+      q: "What does a git commit actually store?",
+      options: [
+        "A diff relative to the previous commit",
+        "A complete snapshot of the entire project at that moment — git calculates and displays diffs as a convenience, but the stored object is the whole tree",
+        "Only the files that changed since the last commit",
+        "A compressed patch file applied sequentially to reconstruct history"
+      ],
+      answer: 1,
+      explain: "This single fact is what makes branches, merges and detached HEAD all follow from one picture instead of being separate rules — branches are cheap labels precisely because creating one doesn't copy or diff anything."
+    },
+    {
+      q: "What is a git branch, mechanically?",
+      options: [
+        "A full copy of the repository's files at a point in time",
+        "A movable label pointing at one specific commit — nothing more, which is why creating one is instant",
+        "A compressed archive of commits",
+        "A permission boundary restricting who can push"
+      ],
+      answer: 1,
+      explain: "Branching being instant isn't an optimization — it's a direct consequence of a branch being a label, not a copy. Understanding this is what makes 'detached HEAD' make sense: it's simply HEAD pointing at a commit with no label in between."
+    },
+    {
+      q: "A developer checks out an old commit by hash, commits a change, then switches back to main. Where did the new commit go?",
+      options: [
+        "It was automatically deleted by git",
+        "It still exists in git's object database, but nothing (no branch, no tag) points to it anymore — only HEAD did, transiently, until the checkout to main moved HEAD away",
+        "It was merged into main automatically",
+        "Git refuses to allow commits in this state, so nothing was actually saved"
+      ],
+      answer: 1,
+      explain: "This is detached HEAD's exact failure mode. The commit is real and recoverable via git reflog, for a limited time — until eventual garbage collection — which is why 'lost' and 'deleted' are different claims."
+    },
+    {
+      q: "Why is confusing `git revert` with `git reset --hard` a real incident risk, not just a minor mix-up?",
+      options: [
+        "revert is slower than reset in large repositories",
+        "revert creates a new commit undoing a previous one (history-preserving, safe on shared branches); reset --hard moves the branch label itself, rewriting what the branch means — doing this on already-shared history can break things for everyone who already pulled it",
+        "reset only works on the main branch",
+        "revert requires write access while reset does not"
+      ],
+      answer: 1,
+      explain: "The safety profiles are genuinely different. revert is the safe default for undoing something on a shared branch; reset --hard is for your own unshared local commits only."
+    },
+    {
+      q: "What does `git reflog` show, and why does it matter for recovery?",
+      options: [
+        "A list of all files ever committed to the repository",
+        "Every place HEAD has recently pointed, including commits no longer reachable from any branch — making 'orphaned' commits findable and recoverable before garbage collection removes them",
+        "The remote repository's full commit history",
+        "A log of merge conflicts that have occurred"
+      ],
+      answer: 1,
+      explain: "This is git's own local safety net, and it's what would have recovered the story's 'lost' commit — the fix is finding the hash via reflog, then giving it a permanent branch name with git checkout -b."
+    }
+  ]}
+/>
+
+</Section>

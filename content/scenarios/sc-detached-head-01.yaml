@@ -1,0 +1,43 @@
+id: sc-detached-head-01
+module: M2
+lesson: m02-l01
+title: "The commit that vanished after checking out main"
+difficulty: guided
+symptom: "A developer committed a test fix while exploring an old commit, switched back to main, and the commit is nowhere in git log or git branch --all."
+environment:
+  base: demo-app@v1
+  breakage:
+    - type: git
+      apply: scripts/break/detached-head-orphan-commit.sh   # leaves a real orphaned commit, findable via reflog
+evidence:
+  logs: false
+  metrics: []
+  db_console: false
+  notes: "The learner has a real git repository with the orphaned commit present in the object database but unreachable from any branch."
+agent:
+  context: "You followed a sequence of checkout, commit, checkout main and believe the commit succeeded."
+  bias: "concludes the work must be redone from scratch rather than checking for recoverability"
+  tools: [read, edit, shell]
+  denied: []
+grading:
+  probes:
+    - orphaned-commit-recovered
+    - given-permanent-branch-name
+  root_cause_markers:
+    - learner identifies detached HEAD as the cause via git status history
+    - learner uses git reflog to locate the orphaned commit, not reset or redoing work
+    - commit given a permanent branch name
+  symptom_only_markers:
+    - work redone from scratch assuming the commit was deleted
+    - git reset --hard attempted as a first response
+hints:
+  - "Is 'not visible in git log' the same as 'deleted'? What does git log walk by default?"
+  - "What did `git status` say right after the checkout, before the commit was made?"
+  - "git reflog shows everywhere HEAD has recently pointed, including commits no branch points to."
+  - "Reveal: the commit exists, orphaned by detached HEAD. Find it via reflog and give it a branch name."
+scoring:
+  time_to_diagnose: true
+  hints_used: true
+  root_cause: 60
+  stability: 20
+  agent_verification: 20
